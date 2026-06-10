@@ -60,6 +60,7 @@ function(ConfigureTest CMAKE_TEST_NAME)
         GTest::gmock_main
         GTest::gtest
         GTest::gtest_main
+        SuiteSparse::AMD
         ${CUOPT_PRIVATE_CUDA_LIBS}
     )
     if(NOT DEFINED INSTALL_TARGET OR "${INSTALL_TARGET}" STREQUAL "")

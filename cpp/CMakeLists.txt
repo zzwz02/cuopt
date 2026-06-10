@@ -205,6 +205,10 @@ endif ()
 find_package(OpenMP REQUIRED)
 message(VERBOSE "cuOpt: OpenMP found in ${OpenMP_CXX_INCLUDE_DIRS}")
 
+# SuiteSparse AMD provides the fill-reducing ordering for the barrier solver's
+# built-in sparse LDL^T factorization
+find_package(AMD REQUIRED)
+
 # MPS/QPS parser supports compressed inputs via bzip2 and zlib
 option(CUOPT_PARSER_WITH_BZIP2 "Build MPS parser with bzip2 decompression" ON)
 option(CUOPT_PARSER_WITH_ZLIB "Build MPS parser with zlib decompression" ON)
@@ -589,6 +593,7 @@ target_link_libraries(cuopt
         CCCL::CCCL
         raft::raft
         PRIVATE
+        SuiteSparse::AMD
         ${CUOPT_PRIVATE_CUDA_LIBS}
         $<$<BOOL:${CUOPT_ENABLE_GRPC}>:protobuf::libprotobuf>
         $<$<BOOL:${CUOPT_ENABLE_GRPC}>:gRPC::grpc++>

@@ -19,6 +19,8 @@
 
 #include <raft/core/nvtx.hpp>
 
+#include <amd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -183,16 +185,32 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   }
 
   // Fill-reducing ordering. perm_[k] = original index of the k-th pivot.
-  // Identity ordering for now; replaced by AMD in the symbolic analysis stack.
-  void compute_ordering(const std::vector<std::vector<i_t>>& upper_cols)
+  // Uses SuiteSparse AMD (approximate minimum degree) on the full symmetric
+  // pattern; the ordering only affects fill-in, never correctness, so any
+  // failure falls back to the natural ordering.
+  void compute_ordering()
   {
     perm_.resize(n_);
     perm_inv_.resize(n_);
     for (i_t k = 0; k < n_; k++) {
-      perm_[k]     = k;
-      perm_inv_[k] = k;
+      perm_[k] = k;
     }
-    (void)upper_cols;
+
+    static_assert(std::is_same_v<i_t, int>, "amd_order requires int32 indices");
+    if (n_ > 1) {
+      i_t status = amd_order(n_, a_rowptr_host_.data(), a_colidx_host_.data(), perm_.data(),
+                             nullptr, nullptr);
+      if (status != AMD_OK && status != AMD_OK_BUT_JUMBLED) {
+        settings_.log.printf("AMD ordering failed (%d); using natural ordering\n", status);
+        for (i_t k = 0; k < n_; k++) {
+          perm_[k] = k;
+        }
+      }
+    }
+
+    for (i_t k = 0; k < n_; k++) {
+      perm_inv_[perm_[k]] = k;
+    }
   }
 
   // Symbolic analysis on the full-view symmetric pattern in
@@ -206,21 +224,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
 
     if (halted()) { return CONCURRENT_HALT_RETURN; }
 
-    // Build the strict upper-triangular pattern by column of the *unpermuted*
-    // matrix once: upper_cols[c] holds rows r < c with A(r, c) != 0.
-    // (The pattern is symmetric, so direction does not matter; these adjacency
-    // lists are also what the ordering uses.)
-    std::vector<std::vector<i_t>> upper_cols(n_);
-    for (i_t r = 0; r < n_; r++) {
-      for (i_t p = a_rowptr_host_[r]; p < a_rowptr_host_[r + 1]; p++) {
-        i_t c = a_colidx_host_[p];
-        if (r < c) {
-          upper_cols[c].push_back(r);
-        }
-      }
-    }
-
-    compute_ordering(upper_cols);
+    compute_ordering();
 
     f_t reorder_time = toc(start_time);
     settings_.log.printf("Reordering time             : %.2fs\n", reorder_time);
@@ -229,9 +233,13 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
 
     // Permuted strict upper pattern by permuted column k:
     // uc[k] = sorted unique permuted rows i < k with (PAP^T)(i, k) != 0.
+    // The input pattern is symmetric, so visiting each strict upper entry
+    // (r < c) once covers every off-diagonal pair.
     std::vector<std::vector<i_t>> uc(n_);
-    for (i_t c = 0; c < n_; c++) {
-      for (i_t r : upper_cols[c]) {
+    for (i_t r = 0; r < n_; r++) {
+      for (i_t p = a_rowptr_host_[r]; p < a_rowptr_host_[r + 1]; p++) {
+        i_t c = a_colidx_host_[p];
+        if (r >= c) { continue; }
         i_t pi = perm_inv_[r];
         i_t pk = perm_inv_[c];
         if (pi > pk) { std::swap(pi, pk); }
