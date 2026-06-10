@@ -315,15 +315,16 @@ TEST(sparse_ldlt, device_numeric_matches_host_reference)
   EXPECT_LT(max_rel, 1e-12);
 }
 
-TEST(sparse_ldlt, singular_matrix_fails)
+TEST(sparse_ldlt, singular_matrix_static_pivoting)
 {
   raft::handle_t handle{};
   simplex_solver_settings_t<int, double> settings;
 
   const int n = 3;
   // Rank-deficient matrix: third row/col is zero except a structural diagonal 0.
-  std::vector<double> dense = {2.0, 1.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0};
-  // Add explicit structural zero on the diagonal so the pattern is valid.
+  // Static pivoting perturbs the zero pivot so the factorization succeeds and
+  // produces a finite (regularized) solution; the caller's iterative
+  // refinement / adaptive regularization deals with the perturbation.
   csc_matrix_t<int, double> A(n, n, 5);
   A.col_start = {0, 2, 4, 5};
   A.i         = {0, 1, 0, 1, 2};
@@ -332,7 +333,19 @@ TEST(sparse_ldlt, singular_matrix_fails)
   sparse_cholesky_ldlt_t<int, double> chol(&handle, settings, n);
   chol.set_positive_definite(false);
   ASSERT_EQ(chol.analyze(A), 0);
-  EXPECT_EQ(chol.factorize(A), -1);
+  ASSERT_EQ(chol.factorize(A), 0);
+
+  // RHS in the range of the nonsingular block: the solution of that block
+  // must still be accurate.
+  dense_vector_t<int, double> b(n);
+  b[0] = 3.0;
+  b[1] = 3.0;
+  b[2] = 0.0;
+  dense_vector_t<int, double> x(n);
+  ASSERT_EQ(chol.solve(b, x), 0);
+  EXPECT_NEAR(x[0], 1.0, 1e-9);
+  EXPECT_NEAR(x[1], 1.0, 1e-9);
+  EXPECT_TRUE(std::isfinite(x[2]));
 }
 
 }  // namespace cuopt::linear_programming::dual_simplex::test

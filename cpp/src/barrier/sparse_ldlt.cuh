@@ -21,6 +21,10 @@
 
 #include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/exec_policy.hpp>
+
+#include <thrust/functional.h>
+#include <thrust/transform_reduce.h>
 
 #include <amd.h>
 
@@ -35,6 +39,11 @@ namespace cuopt::linear_programming::dual_simplex {
 namespace ldlt_detail {
 
 constexpr int factor_block_dim = 128;
+
+template <typename f_t>
+struct abs_op {
+  __host__ __device__ f_t operator()(f_t v) const { return v < f_t(0) ? -v : v; }
+};
 
 // Scatters the values of the analyzed matrix into the factor storage.
 // Lx and D must be zeroed beforehand: slots that receive no A entry are
@@ -71,6 +80,8 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
                                          f_t* Lx,
                                          f_t* D,
                                          i_t* fail_flag,
+                                         i_t* static_pivot_count,
+                                         f_t static_pivot_tol,
                                          bool positive_definite)
 {
   const i_t j       = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
@@ -104,10 +115,22 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
     __syncthreads();
   }
 
-  const f_t dj = D[j];
-  if (!isfinite(dj) || fabs(dj) < f_t(1e-300) || (positive_definite && dj <= f_t(0))) {
+  f_t dj = D[j];
+  if (!isfinite(dj) || (positive_definite && dj <= f_t(0))) {
     if (threadIdx.x == 0) { atomicCAS(fail_flag, i_t(0), j + 1); }
     return;
+  }
+  if (fabs(dj) < static_pivot_tol) {
+    // Static pivoting: a (near-)zero pivot means the matrix is numerically
+    // rank deficient at this column (e.g. redundant rows in A*Dinv*A^T).
+    // Continue with a perturbed pivot; iterative refinement at the call site
+    // absorbs the perturbation.
+    dj = (dj < f_t(0)) ? -static_pivot_tol : static_pivot_tol;
+    if (threadIdx.x == 0) {
+      D[j] = dj;
+      atomicAdd(static_pivot_count, i_t(1));
+    }
+    __syncthreads();
   }
   for (i_t p = col_beg + static_cast<i_t>(threadIdx.x); p < col_end;
        p += static_cast<i_t>(blockDim.x)) {
@@ -251,7 +274,8 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_D_(0, handle_ptr->get_stream()),
       d_a_values_(0, handle_ptr->get_stream()),
       d_work_(0, handle_ptr->get_stream()),
-      d_fail_(handle_ptr->get_stream())
+      d_fail_(handle_ptr->get_stream()),
+      d_static_pivots_(handle_ptr->get_stream())
   {
     settings_.log.printf("Sparse LDLT solver          : cuOpt built-in (%s numeric)\n",
                          use_host_numeric_ ? "host" : "device");
@@ -398,6 +422,17 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   bool halted() const
   {
     return settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1;
+  }
+
+  // Threshold below which a pivot is replaced rather than divided by:
+  // numerically rank-deficient systems (e.g. A*Dinv*A^T with redundant rows)
+  // produce (near-)zero pivots that pivoting factorizations absorb; we
+  // perturb instead and let iterative refinement clean up the solution.
+  static f_t compute_static_pivot_tol(f_t max_abs_diag)
+  {
+    constexpr f_t rel_tol       = 1e-14;
+    constexpr f_t abs_tol_floor = 1e-30;
+    return std::max(rel_tol * max_abs_diag, abs_tol_floor);
   }
 
   // Fill-reducing ordering. perm_[k] = original index of the k-th pivot.
@@ -653,6 +688,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     RAFT_CUDA_TRY(cudaMemsetAsync(d_Lx_.data(), 0, sizeof(f_t) * nnz_L_, stream));
     RAFT_CUDA_TRY(cudaMemsetAsync(d_D_.data(), 0, sizeof(f_t) * n_, stream));
     d_fail_.set_value_to_zero_async(stream);
+    d_static_pivots_.set_value_to_zero_async(stream);
 
     constexpr int block_dim = ldlt_detail::factor_block_dim;
     if (nnz_A_ > 0) {
@@ -661,6 +697,16 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         <<<grid, block_dim, 0, stream>>>(a_values, d_a2l_.data(), nnz_A_, d_Lx_.data(), d_D_.data());
       RAFT_CHECK_CUDA(stream);
     }
+
+    // Static pivoting threshold relative to the largest diagonal magnitude of
+    // the (permuted) input.
+    const f_t max_abs_diag = thrust::transform_reduce(rmm::exec_policy(stream),
+                                                      d_D_.data(),
+                                                      d_D_.data() + n_,
+                                                      ldlt_detail::abs_op<f_t>{},
+                                                      f_t(0),
+                                                      thrust::maximum<f_t>{});
+    const f_t static_pivot_tol = compute_static_pivot_tol(max_abs_diag);
 
     for (i_t l = 0; l < n_levels_; l++) {
       const i_t level_start = level_ptr_[l];
@@ -676,6 +722,8 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                                d_Lx_.data(),
                                                d_D_.data(),
                                                d_fail_.data(),
+                                               d_static_pivots_.data(),
+                                               static_pivot_tol,
                                                positive_definite_);
       RAFT_CHECK_CUDA(stream);
       if ((l & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
@@ -684,8 +732,14 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     i_t fail = d_fail_.value(stream);
     if (halted()) { return CONCURRENT_HALT_RETURN; }
     if (fail != 0) {
-      settings_.log.printf("Factorization failed: zero or invalid pivot at column %d\n", fail - 1);
+      settings_.log.printf("Factorization failed: invalid pivot at column %d\n", fail - 1);
       return -1;
+    }
+    i_t static_pivots = d_static_pivots_.value(stream);
+    if (static_pivots > 0) {
+      settings_.log.debug("Static pivoting perturbed %d pivots (tol %.2e)\n",
+                          static_pivots,
+                          static_pivot_tol);
     }
 
     if (first_factor_) {
@@ -716,7 +770,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       }
     }
 
-    constexpr f_t zero_pivot_tol = 1e-300;
+    f_t max_abs_diag = f_t(0);
+    for (i_t j = 0; j < n_; j++) {
+      max_abs_diag = std::max(max_abs_diag, std::abs(D_[j]));
+    }
+    const f_t static_pivot_tol = compute_static_pivot_tol(max_abs_diag);
+    i_t static_pivots          = 0;
 
     for (i_t j = 0; j < n_; j++) {
       // Apply updates from all columns k with L(j, k) != 0.
@@ -737,15 +796,24 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       }
       // Pivot.
       f_t dj = D_[j];
-      if (!std::isfinite(dj) || std::abs(dj) < zero_pivot_tol ||
-          (positive_definite_ && dj <= f_t(0))) {
+      if (!std::isfinite(dj) || (positive_definite_ && dj <= f_t(0))) {
         settings_.log.printf("Factorization failed: pivot %e at column %d\n", dj, j);
         return -1;
+      }
+      if (std::abs(dj) < static_pivot_tol) {
+        // Static pivoting, see ldlt_factor_level_kernel.
+        dj    = (dj < f_t(0)) ? -static_pivot_tol : static_pivot_tol;
+        D_[j] = dj;
+        static_pivots++;
       }
       for (i_t p = Lp_[j]; p < Lp_[j + 1]; p++) {
         Lx_[p] /= dj;
       }
       if ((j & 1023) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
+    }
+    if (static_pivots > 0) {
+      settings_.log.debug(
+        "Static pivoting perturbed %d pivots (tol %.2e)\n", static_pivots, static_pivot_tol);
     }
 
     if (first_factor_) {
@@ -911,6 +979,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   rmm::device_uvector<f_t> d_a_values_;
   rmm::device_uvector<f_t> d_work_;
   rmm::device_scalar<i_t> d_fail_;
+  rmm::device_scalar<i_t> d_static_pivots_;
 };
 
 }  // namespace cuopt::linear_programming::dual_simplex
