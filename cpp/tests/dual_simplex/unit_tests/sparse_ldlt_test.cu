@@ -68,7 +68,7 @@ double residual_inf_norm(int n,
 
 // Random sparse symmetric quasi-definite KKT matrix
 // [[-H, A^T], [A, eps I]] with H diagonally dominant positive definite.
-std::vector<double> random_kkt_dense(int n_primal, int m_dual, unsigned seed)
+std::vector<double> random_kkt_dense(int n_primal, int m_dual, unsigned seed, double eps = 1e-8)
 {
   const int n = n_primal + m_dual;
   std::vector<double> dense(n * n, 0.0);
@@ -103,7 +103,7 @@ std::vector<double> random_kkt_dense(int n_primal, int m_dual, unsigned seed)
     }
   }
   for (int i = 0; i < m_dual; i++) {
-    dense[(n_primal + i) * n + (n_primal + i)] = 1e-8;
+    dense[(n_primal + i) * n + (n_primal + i)] = eps;
   }
   return dense;
 }
@@ -262,6 +262,57 @@ TEST(sparse_ldlt, arrow_matrix_reordering)
   dense_vector_t<int, double> x(n);
   ASSERT_EQ(chol.solve(b, x), 0);
   EXPECT_LT(residual_inf_norm(n, dense, x, b), 1e-9);
+}
+
+TEST(sparse_ldlt, device_numeric_matches_host_reference)
+{
+  raft::handle_t handle{};
+  simplex_solver_settings_t<int, double> settings;
+
+  const int n_primal = 60;
+  const int m_dual   = 35;
+  const int n = n_primal + m_dual;
+  // Well-conditioned dual block: rounding differences between the host and
+  // device paths (FMA contraction) stay at machine-epsilon level instead of
+  // being amplified by the condition number.
+  std::vector<double> dense   = random_kkt_dense(n_primal, m_dual, 7, 1.0);
+  csc_matrix_t<int, double> A = dense_to_full_csc(n, dense);
+
+  dense_vector_t<int, double> b(n);
+  for (int i = 0; i < n; i++) {
+    b[i] = std::sin(1.3 * i) - 0.4;
+  }
+
+  // Host reference numeric path.
+  setenv("CUOPT_LDLT_HOST", "1", 1);
+  dense_vector_t<int, double> x_host(n);
+  {
+    sparse_cholesky_ldlt_t<int, double> chol(&handle, settings, n);
+    chol.set_positive_definite(false);
+    ASSERT_EQ(chol.analyze(A), 0);
+    ASSERT_EQ(chol.factorize(A), 0);
+    ASSERT_EQ(chol.solve(b, x_host), 0);
+  }
+  unsetenv("CUOPT_LDLT_HOST");
+
+  // Device numeric path.
+  dense_vector_t<int, double> x_dev(n);
+  {
+    sparse_cholesky_ldlt_t<int, double> chol(&handle, settings, n);
+    chol.set_positive_definite(false);
+    ASSERT_EQ(chol.analyze(A), 0);
+    ASSERT_EQ(chol.factorize(A), 0);
+    ASSERT_EQ(chol.solve(b, x_dev), 0);
+  }
+
+  // Same elimination order and accumulation order on both paths; only FMA
+  // contraction may differ.
+  double max_rel = 0.0;
+  for (int i = 0; i < n; i++) {
+    double denom = std::max(1.0, std::abs(x_host[i]));
+    max_rel      = std::max(max_rel, std::abs(x_host[i] - x_dev[i]) / denom);
+  }
+  EXPECT_LT(max_rel, 1e-12);
 }
 
 TEST(sparse_ldlt, singular_matrix_fails)

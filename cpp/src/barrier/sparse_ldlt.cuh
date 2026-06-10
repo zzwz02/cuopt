@@ -19,14 +19,103 @@
 
 #include <raft/core/nvtx.hpp>
 
+#include <rmm/device_scalar.hpp>
+#include <rmm/device_uvector.hpp>
+
 #include <amd.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace cuopt::linear_programming::dual_simplex {
+
+namespace ldlt_detail {
+
+constexpr int factor_block_dim = 128;
+
+// Scatters the values of the analyzed matrix into the factor storage.
+// Lx and D must be zeroed beforehand: slots that receive no A entry are
+// structural fill. Both halves of a symmetric off-diagonal pair map to the
+// same slot and write the same value, so the race is benign.
+template <typename i_t, typename f_t>
+__global__ void ldlt_scatter_kernel(
+  const f_t* a_values, const i_t* a2l, i_t nnz_A, f_t* Lx, f_t* D)
+{
+  const i_t e = static_cast<i_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (e >= nnz_A) { return; }
+  const i_t m = a2l[e];
+  if (m >= 0) {
+    Lx[m] = a_values[e];
+  } else if (m <= -2) {
+    D[-(m + 2)] = a_values[e];
+  }
+}
+
+// Left-looking factorization of one level: every block owns one column j of
+// the level and applies the updates of all columns k with L(j, k) != 0, which
+// are complete because they live in lower levels. The k loop is sequential
+// within the block (deterministic accumulation order, identical to the host
+// reference); threads parallelize over the entries of column k and scatter
+// into column j via binary search in its sorted row indices.
+template <typename i_t, typename f_t>
+__global__ void ldlt_factor_level_kernel(const i_t* level_cols,
+                                         i_t level_start,
+                                         const i_t* Lp,
+                                         const i_t* Li,
+                                         const i_t* rp_ptr,
+                                         const i_t* rp_col,
+                                         const i_t* rp_pos,
+                                         f_t* Lx,
+                                         f_t* D,
+                                         i_t* fail_flag,
+                                         bool positive_definite)
+{
+  const i_t j       = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
+  const i_t col_beg = Lp[j];
+  const i_t col_end = Lp[j + 1];
+
+  for (i_t t = rp_ptr[j]; t < rp_ptr[j + 1]; t++) {
+    const i_t k    = rp_col[t];
+    const i_t p_jk = rp_pos[t];
+    const f_t ljk  = Lx[p_jk];
+    const f_t c    = ljk * D[k];
+    if (threadIdx.x == 0) { D[j] -= c * ljk; }
+    const i_t k_end = Lp[k + 1];
+    for (i_t p = p_jk + 1 + static_cast<i_t>(threadIdx.x); p < k_end;
+         p += static_cast<i_t>(blockDim.x)) {
+      const i_t i = Li[p];
+      i_t lo      = col_beg;
+      i_t hi      = col_end;
+      while (lo < hi) {
+        const i_t mid = lo + (hi - lo) / 2;
+        if (Li[mid] < i) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      Lx[lo] -= c * Lx[p];
+    }
+    // The next k iteration scatters into the same column; updates of distinct
+    // k may target the same entry, so the block must advance in lockstep.
+    __syncthreads();
+  }
+
+  const f_t dj = D[j];
+  if (!isfinite(dj) || fabs(dj) < f_t(1e-300) || (positive_definite && dj <= f_t(0))) {
+    if (threadIdx.x == 0) { atomicCAS(fail_flag, i_t(0), j + 1); }
+    return;
+  }
+  for (i_t p = col_beg + static_cast<i_t>(threadIdx.x); p < col_end;
+       p += static_cast<i_t>(blockDim.x)) {
+    Lx[p] /= dj;
+  }
+}
+
+}  // namespace ldlt_detail
 
 // Sparse LDL^T factorization of a symmetric matrix A (stored with both triangles,
 // i.e. a full symmetric view) without numerical pivoting.
@@ -42,9 +131,11 @@ namespace cuopt::linear_programming::dual_simplex {
 // conditioning is handled by the caller via adaptive regularization and
 // iterative refinement.
 //
-// The symbolic analysis (ordering, elimination tree, symbolic factorization,
-// level schedule) runs on the host. The numeric phases run either on the host
-// (reference implementation) or on the device with custom kernels.
+// The symbolic analysis (AMD ordering, elimination tree, symbolic
+// factorization, level schedule) runs on the host. The numeric factorization
+// runs on the device with custom level-scheduled kernels (deterministic by
+// construction); setting CUOPT_LDLT_HOST=1 in the environment switches to the
+// host reference implementation of the numeric phases.
 template <typename i_t, typename f_t>
 class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
  public:
@@ -60,9 +151,22 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       analyzed_(false),
       factorized_(false),
       first_factor_(true),
-      positive_definite_(true)
+      positive_definite_(true),
+      use_host_numeric_(std::getenv("CUOPT_LDLT_HOST") != nullptr),
+      d_Lp_(0, handle_ptr->get_stream()),
+      d_Li_(0, handle_ptr->get_stream()),
+      d_rp_ptr_(0, handle_ptr->get_stream()),
+      d_rp_col_(0, handle_ptr->get_stream()),
+      d_rp_pos_(0, handle_ptr->get_stream()),
+      d_a2l_(0, handle_ptr->get_stream()),
+      d_level_cols_(0, handle_ptr->get_stream()),
+      d_Lx_(0, handle_ptr->get_stream()),
+      d_D_(0, handle_ptr->get_stream()),
+      d_a_values_(0, handle_ptr->get_stream()),
+      d_fail_(handle_ptr->get_stream())
   {
-    settings_.log.printf("Sparse LDLT solver          : cuOpt built-in\n");
+    settings_.log.printf("Sparse LDLT solver          : cuOpt built-in (%s numeric)\n",
+                         use_host_numeric_ ? "host" : "device");
   }
 
   ~sparse_cholesky_ldlt_t() override = default;
@@ -118,10 +222,13 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       settings_.log.printf("Error: nnz %d != analyzed nnz %d\n", nnz, nnz_A_);
       return -1;
     }
-    a_values_host_ = cuopt::host_copy(Arow.x.data(), nnz, stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
 
-    return factorize_values();
+    if (use_host_numeric_) {
+      a_values_host_ = cuopt::host_copy(Arow.x.data(), nnz, stream);
+      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+      return factorize_values_host();
+    }
+    return factorize_values_device(Arow.x.data());
   }
 
   i_t factorize(const csc_matrix_t<i_t, f_t>& A_in) override
@@ -136,9 +243,15 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         "Error: nnz %d != A_in.col_start[A_in.n] %d\n", nnz_A_, A_in.col_start[A_in.n]);
       return -1;
     }
-    a_values_host_.assign(A_in.x.begin(), A_in.x.begin() + nnz_A_);
 
-    return factorize_values();
+    if (use_host_numeric_) {
+      a_values_host_.assign(A_in.x.begin(), A_in.x.begin() + nnz_A_);
+      return factorize_values_host();
+    }
+    auto stream = handle_ptr_->get_stream();
+    d_a_values_.resize(nnz_A_, stream);
+    raft::copy(d_a_values_.data(), A_in.x.data(), nnz_A_, stream);
+    return factorize_values_device(d_a_values_.data());
   }
 
   i_t solve(const dense_vector_t<i_t, f_t>& b, dense_vector_t<i_t, f_t>& x) override
@@ -198,8 +311,8 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
 
     static_assert(std::is_same_v<i_t, int>, "amd_order requires int32 indices");
     if (n_ > 1) {
-      i_t status = amd_order(n_, a_rowptr_host_.data(), a_colidx_host_.data(), perm_.data(),
-                             nullptr, nullptr);
+      i_t status = amd_order(
+        n_, a_rowptr_host_.data(), a_colidx_host_.data(), perm_.data(), nullptr, nullptr);
       if (status != AMD_OK && status != AMD_OK_BUT_JUMBLED) {
         settings_.log.printf("AMD ordering failed (%d); using natural ordering\n", status);
         for (i_t k = 0; k < n_; k++) {
@@ -319,10 +432,10 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       for (i_t j = 0; j < n_; j++) {
         rp_ptr_[j] = t;
         for (i_t k : rows[j]) {
-          i_t pos      = fill_ptr[k]++;
-          Li_[pos]     = j;
-          rp_col_[t]   = k;
-          rp_pos_[t]   = pos;
+          i_t pos    = fill_ptr[k]++;
+          Li_[pos]   = j;
+          rp_col_[t] = k;
+          rp_pos_[t] = pos;
           t++;
         }
       }
@@ -374,13 +487,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
           continue;
         }
         if (pi < pk) { std::swap(pi, pk); }  // entry (row pi, col pk) of L, pi > pk
-        i_t lo = Lp_[pk];
-        i_t hi = Lp_[pk + 1];
+        i_t lo  = Lp_[pk];
+        i_t hi  = Lp_[pk + 1];
         auto it = std::lower_bound(Li_.begin() + lo, Li_.begin() + hi, pi);
         if (it == Li_.begin() + hi || *it != pi) {
-          settings_.log.printf("Internal error: A entry (%d, %d) missing from factor pattern\n",
-                               r,
-                               c);
+          settings_.log.printf(
+            "Internal error: A entry (%d, %d) missing from factor pattern\n", r, c);
           return -1;
         }
         a2l_[p] = static_cast<i_t>(it - Li_.begin());
@@ -390,6 +502,28 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     Lx_.assign(nnz_L_, f_t(0));
     D_.assign(n_, f_t(0));
     work_.assign(n_, f_t(0));
+
+    // Upload the symbolic structures for the device numeric phases.
+    if (!use_host_numeric_) {
+      auto stream = handle_ptr_->get_stream();
+      d_Lp_.resize(n_ + 1, stream);
+      d_Li_.resize(nnz_L_, stream);
+      d_rp_ptr_.resize(n_ + 1, stream);
+      d_rp_col_.resize(nnz_L_, stream);
+      d_rp_pos_.resize(nnz_L_, stream);
+      d_a2l_.resize(nnz_A_, stream);
+      d_level_cols_.resize(n_, stream);
+      d_Lx_.resize(nnz_L_, stream);
+      d_D_.resize(n_, stream);
+      raft::copy(d_Lp_.data(), Lp_.data(), Lp_.size(), stream);
+      raft::copy(d_Li_.data(), Li_.data(), Li_.size(), stream);
+      raft::copy(d_rp_ptr_.data(), rp_ptr_.data(), rp_ptr_.size(), stream);
+      raft::copy(d_rp_col_.data(), rp_col_.data(), rp_col_.size(), stream);
+      raft::copy(d_rp_pos_.data(), rp_pos_.data(), rp_pos_.size(), stream);
+      raft::copy(d_a2l_.data(), a2l_.data(), a2l_.size(), stream);
+      raft::copy(d_level_cols_.data(), level_cols_.data(), level_cols_.size(), stream);
+      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+    }
 
     f_t symbolic_time = toc(start_symbolic);
     settings_.log.printf("Symbolic factorization time : %.2fs\n", symbolic_time);
@@ -401,10 +535,71 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     return 0;
   }
 
+  // Numeric factorization on the device with level-scheduled kernels.
+  // a_values is a device pointer holding the nnz_A_ values of the analyzed
+  // matrix in its original entry order.
+  i_t factorize_values_device(const f_t* a_values)
+  {
+    f_t start_numeric = tic();
+    factorized_       = false;
+    auto stream       = handle_ptr_->get_stream();
+
+    RAFT_CUDA_TRY(cudaMemsetAsync(d_Lx_.data(), 0, sizeof(f_t) * nnz_L_, stream));
+    RAFT_CUDA_TRY(cudaMemsetAsync(d_D_.data(), 0, sizeof(f_t) * n_, stream));
+    d_fail_.set_value_to_zero_async(stream);
+
+    constexpr int block_dim = ldlt_detail::factor_block_dim;
+    if (nnz_A_ > 0) {
+      const int grid = (nnz_A_ + block_dim - 1) / block_dim;
+      ldlt_detail::ldlt_scatter_kernel<i_t, f_t>
+        <<<grid, block_dim, 0, stream>>>(a_values, d_a2l_.data(), nnz_A_, d_Lx_.data(), d_D_.data());
+      RAFT_CHECK_CUDA(stream);
+    }
+
+    for (i_t l = 0; l < n_levels_; l++) {
+      const i_t level_start = level_ptr_[l];
+      const i_t level_size  = level_ptr_[l + 1] - level_start;
+      ldlt_detail::ldlt_factor_level_kernel<i_t, f_t>
+        <<<level_size, block_dim, 0, stream>>>(d_level_cols_.data(),
+                                               level_start,
+                                               d_Lp_.data(),
+                                               d_Li_.data(),
+                                               d_rp_ptr_.data(),
+                                               d_rp_col_.data(),
+                                               d_rp_pos_.data(),
+                                               d_Lx_.data(),
+                                               d_D_.data(),
+                                               d_fail_.data(),
+                                               positive_definite_);
+      RAFT_CHECK_CUDA(stream);
+      if ((l & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
+    }
+
+    i_t fail = d_fail_.value(stream);
+    if (halted()) { return CONCURRENT_HALT_RETURN; }
+    if (fail != 0) {
+      settings_.log.printf("Factorization failed: zero or invalid pivot at column %d\n", fail - 1);
+      return -1;
+    }
+
+    // The triangular solves still run on the host; mirror the factor there.
+    // This copy disappears once the device solve kernels land.
+    Lx_ = cuopt::host_copy(d_Lx_.data(), nnz_L_, stream);
+    D_  = cuopt::host_copy(d_D_.data(), n_, stream);
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+
+    if (first_factor_) {
+      settings_.log.debug("Factorization time          : %.2fs\n", toc(start_numeric));
+      first_factor_ = false;
+    }
+    factorized_ = true;
+    return 0;
+  }
+
   // Numeric factorization (host reference implementation).
   // Left-looking by column: for each column j (ascending), apply the updates
   // of all columns k with L(j, k) != 0, then scale by the pivot d_j.
-  i_t factorize_values()
+  i_t factorize_values_host()
   {
     f_t start_numeric = tic();
     factorized_       = false;
@@ -433,9 +628,9 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         D_[j] -= c * ljk;
         // Entries of column k strictly below row j update column j.
         for (i_t p = p_jk + 1; p < Lp_[k + 1]; p++) {
-          i_t i  = Li_[p];
-          i_t lo = Lp_[j];
-          i_t hi = Lp_[j + 1];
+          i_t i   = Li_[p];
+          i_t lo  = Lp_[j];
+          i_t hi  = Lp_[j + 1];
           auto it = std::lower_bound(Li_.begin() + lo, Li_.begin() + hi, i);
           Lx_[it - Li_.begin()] -= c * Lx_[p];
         }
@@ -511,6 +706,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   bool factorized_;
   bool first_factor_;
   bool positive_definite_;
+  bool use_host_numeric_;
 
   // Permutation: perm_[k] = original index of the k-th pivot.
   std::vector<i_t> perm_;
@@ -535,7 +731,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   // Scatter map from A entries to factor slots (see analyze_pattern).
   std::vector<i_t> a2l_;
 
-  // Numeric values.
+  // Numeric values (host mirror; the device factor lives in d_Lx_/d_D_).
   std::vector<f_t> Lx_;
   std::vector<f_t> D_;
   std::vector<f_t> work_;
@@ -544,6 +740,19 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   std::vector<i_t> a_rowptr_host_;
   std::vector<i_t> a_colidx_host_;
   std::vector<f_t> a_values_host_;
+
+  // Device symbolic structures and factor storage.
+  rmm::device_uvector<i_t> d_Lp_;
+  rmm::device_uvector<i_t> d_Li_;
+  rmm::device_uvector<i_t> d_rp_ptr_;
+  rmm::device_uvector<i_t> d_rp_col_;
+  rmm::device_uvector<i_t> d_rp_pos_;
+  rmm::device_uvector<i_t> d_a2l_;
+  rmm::device_uvector<i_t> d_level_cols_;
+  rmm::device_uvector<f_t> d_Lx_;
+  rmm::device_uvector<f_t> d_D_;
+  rmm::device_uvector<f_t> d_a_values_;
+  rmm::device_scalar<i_t> d_fail_;
 };
 
 }  // namespace cuopt::linear_programming::dual_simplex
