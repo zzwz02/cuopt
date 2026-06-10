@@ -13,8 +13,8 @@ if command -v dnf &> /dev/null; then
     bash ci/utils/update_rockylinux_repo.sh
 fi
 
-# Install cudss
-bash ci/utils/install_cudss.sh
+# Install SuiteSparse (AMD ordering for the barrier solver)
+bash ci/utils/install_suitesparse.sh
 
 package_dir="python/cuopt"
 export SKBUILD_CMAKE_ARGS="-DCUOPT_BUILD_WHEELS=ON;-DDISABLE_DEPRECATION_WARNINGS=ON";
@@ -36,7 +36,6 @@ EXCLUDE_ARGS=(
   --exclude "libcublas.so.*"
   --exclude "libcublasLt.so.*"
   --exclude "libcuda.so.1"
-  --exclude "libcudss.so.*"
   --exclude "libcurand.so.*"
   --exclude "libcusolver.so.*"
   --exclude "libcusparse.so.*"

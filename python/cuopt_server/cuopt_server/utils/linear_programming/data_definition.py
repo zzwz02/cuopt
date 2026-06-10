@@ -494,7 +494,7 @@ class SolverConfig(BaseModel):
     ordering: Optional[int] = Field(
         default=-1,
         description="Set the type of ordering to use for the barrier solver."
-        "-1 for automatic, 0 to use cuDSS default ordering, 1 to use AMD",
+        "-1 for automatic, 0 for the default ordering, 1 to use AMD",
     )
     barrier_dual_initial_point: Optional[int] = Field(
         default=-1,
@@ -511,7 +511,7 @@ class SolverConfig(BaseModel):
     )
     cudss_deterministic: Optional[bool] = Field(
         default=False,
-        description="Set if cuDSS should use deterministic mode. "
+        description="Kept for backward compatibility: the sparse direct solver is always deterministic. "
         "True to use deterministic mode, False to not use deterministic mode",
     )
     crossover: Optional[bool] = Field(

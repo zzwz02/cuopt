@@ -30,7 +30,6 @@ dependencies:
 - jsonref==1.1.0
 - libabseil
 - libboost-devel
-- libcudss-dev >=0.7,<0.8
 - libcurand-dev
 - libcusolver-dev
 - libcusparse-dev
@@ -77,6 +76,7 @@ dependencies:
 - sphinx_rtd_theme
 - sphinxcontrib-openapi
 - sphinxcontrib-websupport
+- suitesparse
 - sysroot_linux-aarch64==2.28
 - tbb-devel
 - uvicorn==0.34.*

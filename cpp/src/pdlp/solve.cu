@@ -1565,7 +1565,7 @@ optimization_problem_solution_t<i_t, f_t> run_concurrent(
   // globally forbidden while any stream is in graph capture mode. Construction happens inside
   // the barrier task body below: capture invalidation caused by another thread's first-use
   // library init is now recovered by manual_cuda_graph_t::run, so the previous main-thread
-  // preflight (eager handle construction + cuDSS warmup) is no longer needed.
+  // preflight (eager handle construction + factorization warmup) is no longer needed.
   std::unique_ptr<raft::handle_t> barrier_handle_ptr;
   if (!enable_barrier) {
     CUOPT_LOG_DEBUG("MIP: skipping concurrent barrier, %d threads available < %d required.",

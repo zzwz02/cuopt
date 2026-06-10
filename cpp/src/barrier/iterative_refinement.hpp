@@ -224,7 +224,7 @@ f_t iterative_refinement_gmres(T& op,
       // Z[k] = M^{-1} V[k], i.e., apply right preconditioner and store
       op.solve(V[k], Z[k]);
 
-      // Check if solve produced NaN (indicates cuDSS failure)
+      // Check if solve produced NaN (indicates a factorization/solve failure)
       f_t z_norm = vector_norm_inf<f_t>(Z[k]);
       if (!std::isfinite(z_norm)) {
         CUOPT_LOG_INFO("GMRES IR: solve at k=%d produced NaN, terminating", k);

@@ -53,8 +53,8 @@ else
     echo "Building in release mode"
 fi
 
-# Install cudss
-bash ci/utils/install_cudss.sh
+# Install SuiteSparse (AMD ordering for the barrier solver)
+bash ci/utils/install_suitesparse.sh
 
 rapids-logger "Generating build requirements"
 
@@ -81,7 +81,6 @@ EXCLUDE_ARGS=(
   --exclude "libcublas.so.*"
   --exclude "libcublasLt.so.*"
   --exclude "libcuda.so.1"
-  --exclude "libcudss.so.*"
   --exclude "libcurand.so.*"
   --exclude "libcusolver.so.*"
   --exclude "libcusparse.so.*"
