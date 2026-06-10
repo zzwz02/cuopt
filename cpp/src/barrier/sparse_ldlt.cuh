@@ -115,6 +115,92 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
   }
 }
 
+// y[k] = b[perm[k]]
+template <typename i_t, typename f_t>
+__global__ void ldlt_perm_gather_kernel(const f_t* b, const i_t* perm, i_t n, f_t* y)
+{
+  const i_t k = static_cast<i_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (k < n) { y[k] = b[perm[k]]; }
+}
+
+// x[perm[k]] = y[k]
+template <typename i_t, typename f_t>
+__global__ void ldlt_perm_scatter_kernel(const f_t* y, const i_t* perm, i_t n, f_t* x)
+{
+  const i_t k = static_cast<i_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (k < n) { x[perm[k]] = y[k]; }
+}
+
+// y[j] /= D[j]
+template <typename i_t, typename f_t>
+__global__ void ldlt_diag_scale_kernel(const f_t* D, i_t n, f_t* y)
+{
+  const i_t j = static_cast<i_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j < n) { y[j] /= D[j]; }
+}
+
+// Fixed-order tree reduction over the block: deterministic for a fixed block
+// size. sdata must hold blockDim.x elements.
+template <typename f_t>
+__device__ inline f_t ldlt_block_reduce(f_t partial, f_t* sdata)
+{
+  sdata[threadIdx.x] = partial;
+  __syncthreads();
+  for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) { sdata[threadIdx.x] += sdata[threadIdx.x + s]; }
+    __syncthreads();
+  }
+  return sdata[0];
+}
+
+// Forward substitution L y = b for one level, row form (unit diagonal):
+// y_j -= sum_{k < j, L(j,k) != 0} L(j,k) * y_k. Every k in the row pattern is
+// a proper etree descendant of j, hence in a lower level and already final.
+template <typename i_t, typename f_t>
+__global__ void ldlt_forward_level_kernel(const i_t* level_cols,
+                                          i_t level_start,
+                                          const i_t* rp_ptr,
+                                          const i_t* rp_col,
+                                          const i_t* rp_pos,
+                                          const f_t* Lx,
+                                          f_t* y)
+{
+  __shared__ f_t sdata[factor_block_dim];
+  const i_t j   = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
+  const i_t beg = rp_ptr[j];
+  const i_t end = rp_ptr[j + 1];
+  f_t partial   = f_t(0);
+  for (i_t t = beg + static_cast<i_t>(threadIdx.x); t < end; t += static_cast<i_t>(blockDim.x)) {
+    partial += Lx[rp_pos[t]] * y[rp_col[t]];
+  }
+  const f_t s = ldlt_block_reduce(partial, sdata);
+  if (threadIdx.x == 0) { y[j] -= s; }
+}
+
+// Backward substitution L^T x = y for one level, column form:
+// x_j -= sum_{i > j, L(i,j) != 0} L(i,j) * x_i. Every i in the column pattern
+// is a proper etree ancestor of j, hence in a higher level; levels run in
+// reverse order.
+template <typename i_t, typename f_t>
+__global__ void ldlt_backward_level_kernel(const i_t* level_cols,
+                                           i_t level_start,
+                                           const i_t* Lp,
+                                           const i_t* Li,
+                                           const f_t* Lx,
+                                           f_t* y)
+{
+  __shared__ f_t sdata[factor_block_dim];
+  const i_t j   = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
+  const i_t beg = Lp[j];
+  const i_t end = Lp[j + 1];
+  f_t partial   = f_t(0);
+  for (i_t p = beg + static_cast<i_t>(threadIdx.x); p < end; p += static_cast<i_t>(blockDim.x)) {
+    partial += Lx[p] * y[Li[p]];
+  }
+  const f_t s = ldlt_block_reduce(partial, sdata);
+  if (threadIdx.x == 0) { y[j] -= s; }
+}
+
 }  // namespace ldlt_detail
 
 // Sparse LDL^T factorization of a symmetric matrix A (stored with both triangles,
@@ -160,9 +246,11 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_rp_pos_(0, handle_ptr->get_stream()),
       d_a2l_(0, handle_ptr->get_stream()),
       d_level_cols_(0, handle_ptr->get_stream()),
+      d_perm_(0, handle_ptr->get_stream()),
       d_Lx_(0, handle_ptr->get_stream()),
       d_D_(0, handle_ptr->get_stream()),
       d_a_values_(0, handle_ptr->get_stream()),
+      d_work_(0, handle_ptr->get_stream()),
       d_fail_(handle_ptr->get_stream())
   {
     settings_.log.printf("Sparse LDLT solver          : cuOpt built-in (%s numeric)\n",
@@ -260,7 +348,20 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       settings_.log.printf("Error: solve size mismatch\n");
       return -1;
     }
-    i_t status = solve_values(b.data(), x.data());
+    i_t status;
+    if (use_host_numeric_) {
+      status = solve_values_host(b.data(), x.data());
+    } else {
+      auto stream = handle_ptr_->get_stream();
+      rmm::device_uvector<f_t> d_b(n_, stream);
+      rmm::device_uvector<f_t> d_x(n_, stream);
+      raft::copy(d_b.data(), b.data(), n_, stream);
+      status = solve_values_device(d_b.data(), d_x.data(), stream);
+      if (status == 0) {
+        raft::copy(x.data(), d_x.data(), n_, stream);
+        RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+      }
+    }
     if (status != 0) { return status; }
     for (i_t i = 0; i < n_; i++) {
       if (x[i] != x[i]) { return -1; }
@@ -279,11 +380,13 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       return -1;
     }
     auto stream = b.stream();
+    if (!use_host_numeric_) { return solve_values_device(b.data(), x.data(), stream); }
+
     auto b_host = cuopt::host_copy(b.data(), n_, stream);
     std::vector<f_t> x_host(n_);
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
 
-    i_t status = solve_values(b_host.data(), x_host.data());
+    i_t status = solve_values_host(b_host.data(), x_host.data());
     if (status != 0) { return status; }
 
     raft::copy(x.data(), x_host.data(), n_, stream);
@@ -513,8 +616,10 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_rp_pos_.resize(nnz_L_, stream);
       d_a2l_.resize(nnz_A_, stream);
       d_level_cols_.resize(n_, stream);
+      d_perm_.resize(n_, stream);
       d_Lx_.resize(nnz_L_, stream);
       d_D_.resize(n_, stream);
+      d_work_.resize(n_, stream);
       raft::copy(d_Lp_.data(), Lp_.data(), Lp_.size(), stream);
       raft::copy(d_Li_.data(), Li_.data(), Li_.size(), stream);
       raft::copy(d_rp_ptr_.data(), rp_ptr_.data(), rp_ptr_.size(), stream);
@@ -522,6 +627,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       raft::copy(d_rp_pos_.data(), rp_pos_.data(), rp_pos_.size(), stream);
       raft::copy(d_a2l_.data(), a2l_.data(), a2l_.size(), stream);
       raft::copy(d_level_cols_.data(), level_cols_.data(), level_cols_.size(), stream);
+      raft::copy(d_perm_.data(), perm_.data(), perm_.size(), stream);
       RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
     }
 
@@ -581,12 +687,6 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       settings_.log.printf("Factorization failed: zero or invalid pivot at column %d\n", fail - 1);
       return -1;
     }
-
-    // The triangular solves still run on the host; mirror the factor there.
-    // This copy disappears once the device solve kernels land.
-    Lx_ = cuopt::host_copy(d_Lx_.data(), nnz_L_, stream);
-    D_  = cuopt::host_copy(d_D_.data(), n_, stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
 
     if (first_factor_) {
       settings_.log.debug("Factorization time          : %.2fs\n", toc(start_numeric));
@@ -656,9 +756,65 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     return 0;
   }
 
+  // Triangular solves on the device with level-scheduled kernels:
+  // x = P^T L^{-T} D^{-1} L^{-1} P b. d_b and d_x are device pointers; d_b is
+  // left untouched (the work vector carries the intermediate states).
+  i_t solve_values_device(const f_t* d_b, f_t* d_x, rmm::cuda_stream_view stream)
+  {
+    if (!factorized_) {
+      settings_.log.printf("Solve called before factorize\n");
+      return -1;
+    }
+    constexpr int block_dim = ldlt_detail::factor_block_dim;
+    const int grid_n        = (n_ + block_dim - 1) / block_dim;
+
+    ldlt_detail::ldlt_perm_gather_kernel<i_t, f_t>
+      <<<grid_n, block_dim, 0, stream>>>(d_b, d_perm_.data(), n_, d_work_.data());
+    RAFT_CHECK_CUDA(stream);
+
+    for (i_t l = 0; l < n_levels_; l++) {
+      const i_t level_start = level_ptr_[l];
+      const i_t level_size  = level_ptr_[l + 1] - level_start;
+      ldlt_detail::ldlt_forward_level_kernel<i_t, f_t>
+        <<<level_size, block_dim, 0, stream>>>(d_level_cols_.data(),
+                                               level_start,
+                                               d_rp_ptr_.data(),
+                                               d_rp_col_.data(),
+                                               d_rp_pos_.data(),
+                                               d_Lx_.data(),
+                                               d_work_.data());
+      RAFT_CHECK_CUDA(stream);
+    }
+
+    ldlt_detail::ldlt_diag_scale_kernel<i_t, f_t>
+      <<<grid_n, block_dim, 0, stream>>>(d_D_.data(), n_, d_work_.data());
+    RAFT_CHECK_CUDA(stream);
+
+    for (i_t l = n_levels_ - 1; l >= 0; l--) {
+      const i_t level_start = level_ptr_[l];
+      const i_t level_size  = level_ptr_[l + 1] - level_start;
+      ldlt_detail::ldlt_backward_level_kernel<i_t, f_t>
+        <<<level_size, block_dim, 0, stream>>>(d_level_cols_.data(),
+                                               level_start,
+                                               d_Lp_.data(),
+                                               d_Li_.data(),
+                                               d_Lx_.data(),
+                                               d_work_.data());
+      RAFT_CHECK_CUDA(stream);
+    }
+
+    ldlt_detail::ldlt_perm_scatter_kernel<i_t, f_t>
+      <<<grid_n, block_dim, 0, stream>>>(d_work_.data(), d_perm_.data(), n_, d_x);
+    RAFT_CHECK_CUDA(stream);
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+
+    if (halted()) { return CONCURRENT_HALT_RETURN; }
+    return 0;
+  }
+
   // Triangular solves (host reference implementation):
   // x = P^T L^{-T} D^{-1} L^{-1} P b.
-  i_t solve_values(const f_t* b, f_t* x)
+  i_t solve_values_host(const f_t* b, f_t* x)
   {
     if (!factorized_) {
       settings_.log.printf("Solve called before factorize\n");
@@ -749,9 +905,11 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   rmm::device_uvector<i_t> d_rp_pos_;
   rmm::device_uvector<i_t> d_a2l_;
   rmm::device_uvector<i_t> d_level_cols_;
+  rmm::device_uvector<i_t> d_perm_;
   rmm::device_uvector<f_t> d_Lx_;
   rmm::device_uvector<f_t> d_D_;
   rmm::device_uvector<f_t> d_a_values_;
+  rmm::device_uvector<f_t> d_work_;
   rmm::device_scalar<i_t> d_fail_;
 };
 
