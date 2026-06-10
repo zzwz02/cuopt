@@ -119,3 +119,85 @@ cuOpt 的 Barrier(内点法)求解器(LP / QP / QCQP / SOCP 路径)目前依赖 
 - **AMD(SuiteSparse)集成**:成熟开源代码,风险低;只损性能不损正确性,可随时回退自然排序。
 - **Level 串行化极端情形**(etree 退化为链):仅慢不错;本阶段接受。
 - **数据集下载失败**:验证降级为"编译通过 + 新单测 + 不依赖数据集的 barrier 单测",如实说明。
+
+---
+
+# 实施结果(附录,2026-06-10)
+
+## 最终状态
+
+cuDSS 已完全移除,barrier 求解器改用自研 `sparse_cholesky_ldlt_t`
+(`cpp/src/barrier/sparse_ldlt.cuh`):
+
+- **符号分析(host)**:SuiteSparse AMD 排序(系统 `libamd`,apt
+  `libsuitesparse-dev` / conda `suitesparse`)+ 消去树 + 行模式 + level 调度
+  + A→L 散射映射。
+- **数值分解(GPU)**:level 调度的 left-looking LDLᵀ kernel;块内 k 循环顺序
+  执行,确定性;NaN/Inf 主元报错,近零主元做静态选主元
+  (τ = 1e-14·max|diag|,PARDISO/MA57 风格),扰动由调用方 GMRES 精化吸收。
+- **三角求解(GPU)**:排列 gather → 前代(L 的 CSR 行视图,level 升序)→
+  对角缩放 → 回代(CSC 列视图,level 降序)→ 排列 scatter;固定序块内归约,
+  确定性。
+- `CUOPT_LDLT_HOST=1` 环境变量切换到全 host 参考实现(调试用)。
+- 公开参数 `cudss_deterministic`、`ordering` 等保留(兼容),新实现天然确定。
+
+与计划的偏差:
+- AMD 改为链接系统 SuiteSparse(用户要求),不内嵌源码;新增
+  `cpp/cmake/thirdparty/FindAMD.cmake`。
+- 修复了两个被新工具链暴露的上游潜在 bug:
+  `mps_data_model_t::maximize_` 未初始化(UB);
+  LP-only+tests 构建的 fj_cpu 符号缺失改用完整构建绕开(未修)。
+
+## 本容器的构建环境(CUDA 12.1 / gcc 11.4)
+
+仓库不可用系统 cmake 3.30.3(rapids-cmake 26.06 要求 ≥3.30.4),工作区
+`.toolchain/` 放置了免安装工具(不进版本库):cmake 3.30.8、oneTBB 2021.13、
+Boost 1.84(b2 最小安装:headers + iostreams/program_options/serialization)。
+
+构建命令:
+
+```bash
+export PATH=$PWD/.toolchain/cmake-3.30.8-linux-x86_64/bin:$PATH
+export CPATH=$PWD/.toolchain/boost-install/include
+cmake cpp -B cpp/build \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=NATIVE \
+  -DFETCH_RAPIDS=ON -DBUILD_TESTS=1 \
+  -DSKIP_ROUTING_BUILD=1 -DSKIP_GRPC_BUILD=1 -DSKIP_C_PYTHON_ADAPTERS=1 \
+  -DBZIP2_ROOT=/opt/conda \
+  -DTBB_INCLUDE_DIR=$PWD/.toolchain/oneapi-tbb-2021.13.0/include \
+  -DTBB_LIBRARY=$PWD/.toolchain/oneapi-tbb-2021.13.0/lib/intel64/gcc4.8/libtbb.so \
+  -DBoost_DIR=$PWD/.toolchain/boost-install/lib/cmake/Boost-1.84.0
+cmake --build cpp/build -j48
+```
+
+CUDA 12.1 兼容性修复(均已提交,自动按版本门控):
+- CCCL `[[no_unique_address]]` 在 nvcc<12.4 触发 ICE → configure 时对拉取的
+  CCCL 打补丁,**对所有编译器一致禁用**(librmm 与 .cu TU 的 ABI 必须一致);
+- raft `nvtx_range_stack.hpp` NSDMI 被旧 cudafe++ 误解析 → 改写为显式构造;
+- 扩展 device lambda 的返回类型查询(nvcc<12.3)→ `cuda::proclaim_return_type`;
+- gcc<13:`omp atomic compare`→`__atomic` CAS、`omp masked`→`master`、
+  新 CPU 名守卫;gcc<12:去掉 `omp task affinity` 提示子句。
+
+## 验证结果(A100,CUDA 12.1)
+
+- `ctest -L numopt` 22 个测试套件全部通过(串行;含 DUAL_SIMPLEX/BARRIER、
+  QP、SOCP、PDLP、LP、MIP、CUTS、确定性测试等)。
+- sparse_ldlt 单测 6 个:SPD、拟正定 KKT、device 路径+同模式重分解、
+  箭头矩阵(非平凡排列)、GPU=host 参考一致性(良态系统 1e-12)、
+  奇异矩阵静态选主元。
+- CLI 冒烟:afiro 上 method 0/1/2/3 目标一致(barrier -464.753135 vs
+  dual simplex -464.753143);QP_Test_1.qps 最优 -99.96,残差 1e-10 量级;
+  Concurrent 模式 barrier 正常参与、halt 不挂死。
+- woodlands09(11.4 万约束,因子 1.16e7 非零,3401 层消去树):IPM 残差
+  单调收敛(primal 2e+01→2e-04 / 10 迭代),静态选主元生效。
+
+## 已知限制
+
+- **性能**:level 调度逐层启动 kernel,每次分解/求解需 O(层数) 次 launch;
+  woodlands09 约 78s/迭代(cuDSS 亚秒级)。计划内取舍("先不考虑性能");
+  后续可做:层内多列融合、launch graph 化、supernodal 化、块状求解。
+- 无数值选主元:依赖拟正定性 + 静态选主元 + 调用方自适应正则化与 GMRES 精化。
+- Python / server 级测试未在本容器运行(无 conda 环境;按 skill 政策不安装
+  包),需在标准开发环境补跑:
+  `pytest python/cuopt/cuopt/tests/{quadratic_programming,socp}`、
+  `python/cuopt_server/.../test_lp.py::test_barrier_solver_options`。
