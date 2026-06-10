@@ -149,27 +149,40 @@ cmake --build cpp/build -j48
 | `barrier:` | 静态选主元(秩亏系统) |
 | `docs:` | 实施记录与验证结果(本次修订) |
 
-## 8. 验证(A100,CUDA 12.1,驱动 12.9)
+## 8. 验证(A100,驱动 12.9)
 
-> 全量验证(完整构建:routing + C API;C/C++/Python;benchmark)结果在
-> 实施分支最终验证提交中更新。已完成的核心回归:
+**C++(系统 CUDA 12.1 工具链构建,完整构建:routing + C API,gRPC 因容器缺
+libgrpc 未构建)**
 
-- **C++ ctest**:numopt 标签 22/22 通过(barrier、QP、SOCP、PDLP、LP、
-  dual simplex、MIP、cuts、确定性等);全量(无标签过滤,含 routing 与
-  C API)见最终记录。
-- **sparse_ldlt 单测 6 个**:SPD;拟正定 KKT;device 路径 + 同模式重分解;
+- 全量 `ctest`(无标签过滤)**137 项:136 通过**;唯一失败
+  `WAYPOINT_MATRIXTEST` 是上游测试硬编码相对路径 `datasets/...`(ctest 的
+  cwd 在构建目录)所致,与本工作无关——在测试 cwd 放置 datasets 符号链接后
+  通过,即实际 **137/137**。
+- sparse_ldlt 单测 6 个:SPD;拟正定 KKT;device 路径 + 同模式重分解;
   箭头矩阵(非平凡排列);GPU 与 host 参考一致性(良态系统 1e-12);
   奇异矩阵静态选主元(非奇异块解仍准确)。
-- **CLI 冒烟**:afiro 上 method 0/1/2/3 目标一致(barrier -464.753135 vs
-  dual simplex -464.753143);QP_Test_1.qps 最优 -99.96(残差 1e-10 量级);
-  Concurrent 模式 barrier 正常参与、halt 中断不挂死。
-- **规模压力**:woodlands09(114k 约束,因子 1.16e7 非零,3401 层消去树)
-  IPM 残差单调收敛(primal 2e+01→2e-04 / 10 迭代),静态选主元生效。
-- **Python**:在文档化 conda 开发环境(all_cuda-129)中构建 python 包并运行
-  全部 pytest(cuopt / cuopt_server / self_hosted),结果见最终记录。
-- **Benchmark**:LP(Mittelmann/PDLP 测试集)上 barrier vs dual simplex vs
-  PDLP 的功能与耗时对比、QP(Maros-Mészáros 子集)barrier 基准,
-  结果见最终记录。
+- C API:`C_API_TEST` 通过。
+- gRPC(conda 构建,见下):`GRPC_CLIENT_TEST` 67、`GRPC_INTEGRATION_TEST`
+  54、`GRPC_PIPE_SERIALIZATION_TEST` 19 —— 全部通过。
+
+**Python(文档化 conda 环境 all_cuda-129 构建,nvcc 12.9/gcc 14 ——
+顺带验证标准工具链下编译干净)**
+
+- `python/cuopt/cuopt/tests`:**108/108 通过**(LP/MILP/QP/SOCP/routing/
+  gRPC 远程执行;需 `no_proxy=localhost,127.0.0.1,0.0.0.0`——容器代理会劫持
+  localhost gRPC/HTTP 连接,与代码无关)。
+- `python/cuopt_server`:**94 通过 + 7 跳过**;7 个跳过全部是上游因
+  NVIDIA/cuopt#519 主动禁用的 `test_barrier_solver_options`——临时去掉
+  skip 实跑 **7/7 通过**(新实现下该上游问题不复现)。
+- `python/cuopt_self_hosted`:**3/3 通过**(需先启动 cuopt_server)。
+- `python/libcuopt`:无测试用例。
+
+**与 cuDSS 基准版对比(官方 26.06 wheel,cuDSS 0.7.1)**
+
+详见 `docs/dev/cudss_replacement_benchmark.md`。摘要:双方都解出的实例
+目标值一致(LP 逐位、QP ≤1e-9;afiro 双方同为 12 次迭代);QP 12/12 双方
+最优且 ours 略快;大型稀疏 LP 上 cuDSS 1–4s vs ours 600s 时限
+(性能取舍,见 §9)。Dual Simplex/PDLP 双方行为一致(无意外回归)。
 
 ## 9. 已知限制与后续方向
 
@@ -179,4 +192,5 @@ cmake --build cpp/build -j48
   求解阶段多 RHS 批处理。
 - 无数值选主元:依赖拟正定性 + 静态选主元 + 调用方自适应正则化与 GMRES 精化;
   极端病态问题可能比 cuDSS 早进入 suboptimal 终止。
-- gRPC 组件在本容器未构建(无 libgrpc/protobuf),`grpc_client_test` 未运行。
+- gRPC 组件在系统 CUDA 12.1 构建中跳过(容器系统层无 libgrpc/protobuf);
+  已在 conda 构建中编译并全部通过(C++ 140 项 + Python 远程执行 11 项)。
