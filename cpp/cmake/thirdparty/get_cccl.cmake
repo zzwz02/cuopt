@@ -10,9 +10,11 @@ function(find_and_configure_cccl)
         # nvcc < 12.4 (cudafe++) fails with "Internal Compiler Error (codegen):
         # internal error during structure layout!" on [[no_unique_address]]
         # members of class templates (e.g. cuda::mr::__shared_control_block).
-        # Disable the attribute inside the fetched CCCL for those compilers.
-        # CCCL is header-only and the change is applied to every TU of this
-        # build, so struct layouts stay consistent.
+        # Disable the attribute inside the fetched CCCL for those toolchains.
+        # The disable must be unconditional (not gated on the compiler doing
+        # the current pass): types such as cuda::mr::any_resource cross the
+        # ABI boundary between gcc-compiled librmm and nvcc-compiled cuOpt
+        # TUs, so every TU of the build has to agree on the layout.
         if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.4 AND DEFINED CCCL_SOURCE_DIR)
                 set(_cccl_attr_h "${CCCL_SOURCE_DIR}/libcudacxx/include/cuda/std/__cccl/attributes.h")
                 if (EXISTS "${_cccl_attr_h}")
@@ -22,13 +24,12 @@ function(find_and_configure_cccl)
 "${_anchor}
 
 // cuOpt workaround: nvcc < 12.4 crashes (\"internal error during structure
-// layout\") on [[no_unique_address]] members of class templates.
-#if _CCCL_HAS_ATTRIBUTE_NO_UNIQUE_ADDRESS() && _CCCL_CUDA_COMPILER(NVCC, <, 12, 4)
-#  undef _CCCL_HAS_ATTRIBUTE_NO_UNIQUE_ADDRESS
-#  undef _CCCL_NO_UNIQUE_ADDRESS
-#  define _CCCL_HAS_ATTRIBUTE_NO_UNIQUE_ADDRESS() 0
-#  define _CCCL_NO_UNIQUE_ADDRESS
-#endif // _CCCL_HAS_ATTRIBUTE_NO_UNIQUE_ADDRESS() && _CCCL_CUDA_COMPILER(NVCC, <, 12, 4)")
+// layout\") on [[no_unique_address]] members of class templates. Disabled for
+// all compilers so layouts stay consistent across gcc/nvcc TUs.
+#undef _CCCL_HAS_ATTRIBUTE_NO_UNIQUE_ADDRESS
+#undef _CCCL_NO_UNIQUE_ADDRESS
+#define _CCCL_HAS_ATTRIBUTE_NO_UNIQUE_ADDRESS() 0
+#define _CCCL_NO_UNIQUE_ADDRESS")
                         if (NOT _cccl_attr_content MATCHES "cuOpt workaround")
                                 string(REPLACE "${_anchor}" "${_nvcc_workaround}" _cccl_attr_content "${_cccl_attr_content}")
                                 file(WRITE "${_cccl_attr_h}" "${_cccl_attr_content}")
