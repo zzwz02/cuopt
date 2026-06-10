@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # cmake-format: on
 
-cmake_minimum_required(VERSION 4.0 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.30 FATAL_ERROR)
 
 # Add our custom Find modules to the module path
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/thirdparty")
@@ -312,8 +312,6 @@ include(${rapids-cmake-dir}/cpm/rapids_logger.cmake)
 rapids_cpm_rapids_logger(BUILD_EXPORT_SET cuopt-exports INSTALL_EXPORT_SET cuopt-exports)
 create_logger_macros(CUOPT "cuopt::default_logger()" include/cuopt)
 
-find_package(CUDSS REQUIRED)
-
 # ##################################################################################################
 # - gRPC and Protobuf setup -----------------------------------------------------------------------
 
@@ -513,7 +511,6 @@ endif ()
 add_library(cuopt::cuopt ALIAS cuopt)
 # ##################################################################################################
 # - include paths ---------------------------------------------------------------------------------
-message(STATUS "target include directories CUDSS_INCLUDES = ${CUDSS_INCLUDE}")
 
 # Adding Papilo as a system include messes up clang's include resolution if papilo is already installed as a conda package
 target_include_directories(cuopt PRIVATE
@@ -535,7 +532,6 @@ target_include_directories(cuopt
         "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc/client"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/grpc/codegen/generated"
         "${CMAKE_CURRENT_BINARY_DIR}"
-        "${CUDSS_INCLUDE}"
         $<$<BOOL:${CUOPT_PARSER_WITH_BZIP2}>:${BZIP2_INCLUDE_DIRS}>
         $<$<BOOL:${CUOPT_PARSER_WITH_ZLIB}>:${ZLIB_INCLUDE_DIRS}>
         PUBLIC
@@ -543,7 +539,6 @@ target_include_directories(cuopt
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
         INTERFACE
         "$<INSTALL_INTERFACE:include>"
-        ${CUDSS_INCLUDE}
 )
 
 # Link PSLP by file to avoid export dependency tracking
@@ -560,10 +555,6 @@ set(CUOPT_PRIVATE_CUDA_LIBS
         OpenMP::OpenMP_CXX)
 
 list(PREPEND CUOPT_PRIVATE_CUDA_LIBS CUDA::cublasLt)
-
-# Pass CUDSS_MT_LIB_FILE_NAME as a compile definition
-get_filename_component(CUDSS_MT_LIB_FILE_NAME "${CUDSS_MT_LIB_FILE}" NAME)
-target_compile_definitions(cuopt PRIVATE CUDSS_MT_LIB_FILE_NAME="${CUDSS_MT_LIB_FILE_NAME}")
 
 execute_process(
         COMMAND git rev-parse --short HEAD
@@ -597,7 +588,6 @@ target_link_libraries(cuopt
         rapids_logger::rapids_logger
         CCCL::CCCL
         raft::raft
-        ${CUDSS_LIB_FILE}
         PRIVATE
         ${CUOPT_PRIVATE_CUDA_LIBS}
         $<$<BOOL:${CUOPT_ENABLE_GRPC}>:protobuf::libprotobuf>
@@ -734,7 +724,6 @@ if (NOT BUILD_LP_ONLY)
             PUBLIC
             "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
             "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
-            ${CUDSS_INCLUDE}
             "$<INSTALL_INTERFACE:include>"
     )
 
@@ -742,7 +731,6 @@ if (NOT BUILD_LP_ONLY)
             PUBLIC
             cuopt
             OpenMP::OpenMP_CXX
-            ${CUDSS_LIBRARIES}
             TBB::tbb
             PRIVATE
             argparse::argparse

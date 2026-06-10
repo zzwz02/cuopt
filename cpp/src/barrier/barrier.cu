@@ -16,6 +16,7 @@
 #include <barrier/iterative_refinement.hpp>
 #include <barrier/second_order_cone_kernels.cuh>
 #include <barrier/sparse_cholesky.cuh>
+#include <barrier/sparse_ldlt.cuh>
 #include <barrier/sparse_matrix_kernels.cuh>
 
 #include <dual_simplex/presolve.hpp>
@@ -519,6 +520,14 @@ class iteration_data_t {
         use_augmented   = !Q_diagonal;
       }
 
+      if (use_augmented && dual_perturb == f_t(0)) {
+        // The built-in LDL^T factorization does not pivot numerically, so the
+        // augmented system must be quasi-definite: the (1,1)-block diagonal has
+        // to be strictly negative. Variables with neither a Q diagonal entry
+        // nor a barrier term would otherwise yield an exact zero pivot.
+        dual_perturb = 1e-8;
+      }
+
       if (use_augmented) {
         settings.log.printf("Linear system               : augmented\n");
         const i_t augmented_size = lp.num_cols + lp.num_rows;
@@ -615,7 +624,7 @@ class iteration_data_t {
     {
       raft::common::nvtx::range scope("Barrier: LP Data: Cholesky init");
       i_t factorization_size = use_augmented ? lp.num_rows + lp.num_cols : lp.num_rows;
-      chol                   = std::make_unique<sparse_cholesky_cudss_t<i_t, f_t>>(
+      chol                   = std::make_unique<sparse_cholesky_ldlt_t<i_t, f_t>>(
         handle_ptr, settings, factorization_size);
       chol->set_positive_definite(false);
     }
@@ -2998,8 +3007,8 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         constexpr f_t max_perturb = 1e-1;
         if (solve_err > 1e-2) {
           f_t old_dp     = dual_perturb;
-          dual_perturb   = std::min(max_perturb, dual_perturb * 10.0);
-          primal_perturb = std::min(max_perturb, primal_perturb * 10.0);
+          dual_perturb   = std::min(max_perturb, std::max(min_perturb, dual_perturb * 10.0));
+          primal_perturb = std::min(max_perturb, std::max(min_perturb, primal_perturb * 10.0));
           settings.log.debug(
             "  reg UP: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
         } else if (solve_err < 1e-4) {
@@ -4407,8 +4416,10 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time, lp_solution_t<i_t,
 
     const i_t iteration_limit = settings.iteration_limit;
 
-    // Adaptive regularization for the augmented system.
-    f_t dual_perturb   = data.has_cones() ? 1e-8 : 0;
+    // Adaptive regularization for the augmented system. The augmented path
+    // needs a strictly negative (1,1)-block diagonal (quasi-definiteness) for
+    // the pivot-free LDL^T factorization, hence a nonzero dual perturbation.
+    f_t dual_perturb   = data.use_augmented ? 1e-8 : 0;
     f_t primal_perturb = data.has_cones() ? 1e-8 : 1e-6;
 
     while (iter < iteration_limit) {
@@ -4678,7 +4689,7 @@ template bool validate_barrier_cone_layout<int, double>(
   const lp_problem_t<int, double>& problem, const simplex_solver_settings_t<int, double>& settings);
 template class barrier_solver_t<int, double>;
 template class sparse_cholesky_base_t<int, double>;
-template class sparse_cholesky_cudss_t<int, double>;
+template class sparse_cholesky_ldlt_t<int, double>;
 template class iteration_data_t<int, double>;
 #endif
 
