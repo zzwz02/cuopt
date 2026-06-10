@@ -224,6 +224,37 @@ class omp_atomic_t {
 // Free non-template functions are necessary because of a clang 20 bug
 // when omp atomic compare is used within a templated context.
 // see https://github.com/llvm/llvm-project/issues/127466
+//
+// "#pragma omp atomic compare" is OpenMP 5.1, which GCC only supports from
+// version 13 on; older GCC falls back to a __atomic compare-exchange loop
+// with the same semantics.
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ < 13)
+inline double fetch_min(omp_atomic_t<double>& atomic_var, double other)
+{
+  double old;
+  __atomic_load(&atomic_var.val, &old, __ATOMIC_SEQ_CST);
+  while (other < old) {
+    if (__atomic_compare_exchange(
+          &atomic_var.val, &old, &other, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+      break;
+    }
+  }
+  return old;
+}
+
+inline double fetch_max(omp_atomic_t<double>& atomic_var, double other)
+{
+  double old;
+  __atomic_load(&atomic_var.val, &old, __ATOMIC_SEQ_CST);
+  while (other > old) {
+    if (__atomic_compare_exchange(
+          &atomic_var.val, &old, &other, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+      break;
+    }
+  }
+  return old;
+}
+#else
 inline double fetch_min(omp_atomic_t<double>& atomic_var, double other)
 {
   double old;
@@ -245,6 +276,7 @@ inline double fetch_max(omp_atomic_t<double>& atomic_var, double other)
   }
   return old;
 }
+#endif
 
 #endif
 

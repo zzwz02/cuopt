@@ -793,7 +793,13 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
 #pragma omp parallel num_threads(num_threads) default(none) \
   shared(sol, op_problem, settings_const, exception)
   {
+// GCC < 13 does not know the OpenMP 5.1 'masked' construct; 'master' is its
+// deprecated equivalent (without a filter clause).
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ < 13)
+#pragma omp master
+#else
 #pragma omp masked
+#endif
     {
       try {
         sol = solve_mip_helper<i_t, f_t>(op_problem, settings_const);

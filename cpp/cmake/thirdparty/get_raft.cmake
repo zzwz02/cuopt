@@ -33,6 +33,34 @@ function(find_and_configure_raft)
     else()
         message(VERBOSE "CUOPT: Using RAFT located in ${raft_DIR}")
     endif()
+
+    # nvcc < 12.4 (cudafe++) miscompiles the brace default-member-initializers
+    # in raft's nvtx_range_stack.hpp ("'current_' was not declared in this
+    # scope"). Rewrite them into an explicit default constructor.
+    if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.4 AND DEFINED raft_SOURCE_DIR)
+        set(_raft_nvtx_h "${raft_SOURCE_DIR}/cpp/include/raft/core/detail/nvtx_range_stack.hpp")
+        if (EXISTS "${_raft_nvtx_h}")
+            file(READ "${_raft_nvtx_h}" _raft_nvtx_content)
+            if (NOT _raft_nvtx_content MATCHES "cuOpt workaround")
+                string(REPLACE
+"struct nvtx_range_name_stack {"
+"struct nvtx_range_name_stack {
+  // cuOpt workaround: explicit constructor instead of default member
+  // initializers, which old cudafe++ front ends mis-parse.
+  nvtx_range_name_stack() : stack_(), current_(std::make_shared<current_range>()) {}
+"
+                       _raft_nvtx_content "${_raft_nvtx_content}")
+                string(REPLACE
+"  std::stack<std::string> stack_{};
+  std::shared_ptr<current_range> current_{std::make_shared<current_range>()};"
+"  std::stack<std::string> stack_;
+  std::shared_ptr<current_range> current_;"
+                       _raft_nvtx_content "${_raft_nvtx_content}")
+                file(WRITE "${_raft_nvtx_h}" "${_raft_nvtx_content}")
+                message(STATUS "cuOpt: patched raft nvtx_range_stack.hpp for nvcc ${CMAKE_CUDA_COMPILER_VERSION}")
+            endif ()
+        endif ()
+    endif ()
 endfunction()
 
 # Change pinned tag and fork here to test a commit in CI

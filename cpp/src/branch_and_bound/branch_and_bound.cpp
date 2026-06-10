@@ -1727,8 +1727,13 @@ void branch_and_bound_t<i_t, f_t>::launch_bfs_worker(bfs_worker_t<i_t, f_t>* wor
   // If the idle worker is set to active (i.e., its node queue has a valid node),
   // launch a openmp task to run the best-first search for that worker
   if (success) {
+// GCC < 12 does not parse the OpenMP 5.0 'affinity' task clause (a scheduling hint only)
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ < 12)
+#pragma omp task priority(CUOPT_CRITICAL_TASK_PRIORITY) default(none) firstprivate(idle_worker)
+#else
 #pragma omp task affinity(*idle_worker) priority(CUOPT_CRITICAL_TASK_PRIORITY) default(none) \
   firstprivate(idle_worker)
+#endif
     best_first_search_with(idle_worker);
   } else {
     // The idle worker was not successfully initialized. This should occur
@@ -1970,8 +1975,13 @@ bool branch_and_bound_t<i_t, f_t>::launch_diving_worker(bfs_worker_t<i_t, f_t>* 
       assert(bfs_worker->total_active_diving_workers.load() <=
              bfs_worker->total_max_diving_workers);
 
+// GCC < 12 does not parse the OpenMP 5.0 'affinity' task clause (a scheduling hint only)
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ < 12)
+#pragma omp task priority(CUOPT_DEFAULT_TASK_PRIORITY) default(none) firstprivate(diving_worker)
+#else
 #pragma omp task affinity(*diving_worker) priority(CUOPT_DEFAULT_TASK_PRIORITY) default(none) \
   firstprivate(diving_worker)
+#endif
       dive_with(diving_worker);
 
       return true;

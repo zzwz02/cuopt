@@ -103,15 +103,21 @@ static std::string get_cpu_model_builtin()
          : __builtin_cpu_is("sapphirerapids")  ? "Intel Core i7 sapphirerapids CPU"
          : __builtin_cpu_is("alderlake")       ? "Intel Core i7 Alderlake CPU"
          : __builtin_cpu_is("rocketlake")      ? "Intel Core i7 Rocketlake CPU"
+// GCC only knows these CPU names from version 13 on
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 13)
          : __builtin_cpu_is("graniterapids")   ? "Intel Core i7 graniterapids CPU"
          : __builtin_cpu_is("graniterapids-d") ? "Intel Core i7 graniterapids D CPU"
+#endif
          : __builtin_cpu_is("bonnell")         ? "Intel Atom Bonnell CPU"
          : __builtin_cpu_is("silvermont")      ? "Intel Atom Silvermont CPU"
          : __builtin_cpu_is("goldmont")        ? "Intel Atom Goldmont CPU"
          : __builtin_cpu_is("goldmont-plus")   ? "Intel Atom Goldmont Plus CPU"
          : __builtin_cpu_is("tremont")         ? "Intel Atom Tremont CPU"
+// GCC only knows these CPU names from version 13 on
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 13)
          : __builtin_cpu_is("sierraforest")    ? "Intel Atom Sierra Forest CPU"
          : __builtin_cpu_is("grandridge")      ? "Intel Atom Grand Ridge CPU"
+#endif
          : __builtin_cpu_is("amdfam10h")       ? "AMD Family 10h CPU"
          : __builtin_cpu_is("barcelona")       ? "AMD Family 10h Barcelona CPU"
          : __builtin_cpu_is("shanghai")        ? "AMD Family 10h Shanghai CPU"

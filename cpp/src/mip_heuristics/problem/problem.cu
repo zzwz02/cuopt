@@ -862,10 +862,10 @@ void problem_t<i_t, f_t>::compute_auxiliary_data()
                         handle_ptr->get_thrust_policy(),
                         d_nnz_per_row.begin(),
                         d_nnz_per_row.end(),
-                        [mean] __device__(i_t x) -> double {
+                        cuda::proclaim_return_type<double>([mean] __device__(i_t x) -> double {
                           double diff = static_cast<double>(x) - mean;
                           return diff * diff;
-                        },
+                        }),
                         0.0,
                         thrust::plus<double>()) /
                       n_constraints;
@@ -1582,7 +1582,7 @@ void problem_t<i_t, f_t>::substitute_variables(const std::vector<i_t>& var_indic
 
   auto input_transform_it = thrust::make_transform_iterator(
     thrust::make_counting_iterator(0),
-    [coefficients           = make_span(coefficients),
+    cuda::proclaim_return_type<f_t>([coefficients           = make_span(coefficients),
      variables              = make_span(variables),
      variable_fix_mask      = make_span(fixing_helpers.variable_fix_mask),
      substitute_coefficient = make_span(d_coefficient_values),
@@ -1603,7 +1603,7 @@ void problem_t<i_t, f_t>::substitute_variables(const std::vector<i_t>& var_indic
       } else {
         return 0.;
       }
-    });
+    }));
   // Determine temporary device storage requirements
   void* d_temp_storage      = nullptr;
   size_t temp_storage_bytes = 0;
@@ -1708,7 +1708,7 @@ void problem_t<i_t, f_t>::fix_given_variables(problem_t<i_t, f_t>& original_prob
 
   auto input_transform_it = thrust::make_transform_iterator(
     thrust::make_counting_iterator(0),
-    [coefficients      = make_span(original_problem.coefficients),
+    cuda::proclaim_return_type<f_t>([coefficients      = make_span(original_problem.coefficients),
      variables         = make_span(original_problem.variables),
      variable_fix_mask = make_span(fixing_helpers.variable_fix_mask),
      assignment        = make_span(assignment),
@@ -1720,7 +1720,7 @@ void problem_t<i_t, f_t>::fix_given_variables(problem_t<i_t, f_t>& original_prob
       } else {
         return 0.;
       }
-    });
+    }));
   // Determine temporary device storage requirements
   void* d_temp_storage      = nullptr;
   size_t temp_storage_bytes = 0;

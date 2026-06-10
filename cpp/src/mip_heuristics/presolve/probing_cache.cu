@@ -12,6 +12,8 @@
 #include <mip_heuristics/utilities/work_unit_ordered_queue.cuh>
 #include <mip_heuristics/utils.cuh>
 
+#include <cuda/functional>
+
 #include <omp.h>
 #include <thrust/binary_search.h>
 #include <thrust/iterator/transform_iterator.h>
@@ -745,10 +747,11 @@ std::vector<i_t> compute_priority_indices_by_implied_integers(problem_t<i_t, f_t
 {
   void* d_temp_storage      = nullptr;
   size_t temp_storage_bytes = 0;
-  auto input_transform_it   = thrust::make_transform_iterator(
-    thrust::make_counting_iterator(0), [view = problem.view()] __device__(i_t idx) -> i_t {
+  auto input_transform_it = thrust::make_transform_iterator(
+    thrust::make_counting_iterator(0),
+    cuda::proclaim_return_type<i_t>([view = problem.view()] __device__(i_t idx) -> i_t {
       return view.is_integer_var(view.variables[idx]);
-    });
+    }));
   // keeps the number of constraints that contain integer variables
   rmm::device_uvector<i_t> num_int_vars_per_constraint(problem.n_constraints,
                                                        problem.handle_ptr->get_stream());
@@ -783,10 +786,11 @@ std::vector<i_t> compute_priority_indices_by_implied_integers(problem_t<i_t, f_t
                                               problem.handle_ptr->get_stream());
   auto input_transform_it_2 = thrust::make_transform_iterator(
     thrust::make_counting_iterator(0),
-    [num_int_vars_per_constraint = make_span(num_int_vars_per_constraint),
-     view                        = problem.view()] __device__(i_t idx) -> i_t {
-      return num_int_vars_per_constraint[view.reverse_constraints[idx]];
-    });
+    cuda::proclaim_return_type<i_t>(
+      [num_int_vars_per_constraint = make_span(num_int_vars_per_constraint),
+       view                        = problem.view()] __device__(i_t idx) -> i_t {
+        return num_int_vars_per_constraint[view.reverse_constraints[idx]];
+      }));
   // run second reduction operation, reset sizes so query works correctly
   d_temp_storage     = nullptr;
   temp_storage_bytes = 0;

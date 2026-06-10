@@ -13,6 +13,7 @@
 #include <raft/util/cudart_utils.hpp>
 
 #include <cub/cub.cuh>
+#include <cuda/functional>
 
 #include <thrust/binary_search.h>
 #include <thrust/count.h>
@@ -386,9 +387,10 @@ void assert_integer_coefficient_integrality(
     post_scaling_gcd.begin(),
     i_t(0),
     thrust::plus<i_t>{},
-    [] __device__(std::int64_t pre_gcd, std::int64_t post_gcd) -> i_t {
-      return (pre_gcd > std::int64_t{0} && post_gcd == std::int64_t{0}) ? i_t(1) : i_t(0);
-    });
+    cuda::proclaim_return_type<i_t>(
+      [] __device__(std::int64_t pre_gcd, std::int64_t post_gcd) -> i_t {
+        return (pre_gcd > std::int64_t{0} && post_gcd == std::int64_t{0}) ? i_t(1) : i_t(0);
+      }));
 
   if (broken_rows > 0) {
     CUOPT_LOG_WARN("MIP row scaling: %d rows lost integer coefficient integrality after scaling",
@@ -590,7 +592,7 @@ void mip_scaling_strategy_t<i_t, f_t>::scale_problem(bool do_objective_scaling)
       handle_ptr_->get_thrust_policy(),
       row_inf_norm.begin(),
       row_inf_norm.end(),
-      [] __device__(f_t row_norm) -> row_stats_t {
+      cuda::proclaim_return_type<row_stats_t>([] __device__(f_t row_norm) -> row_stats_t {
         if (row_norm == f_t(0)) {
           return {0.0,
                   0.0,
@@ -599,17 +601,18 @@ void mip_scaling_strategy_t<i_t, f_t>::scale_problem(bool do_objective_scaling)
         }
         const double row_log2 = log2(static_cast<double>(row_norm));
         return {row_log2, 1.0, row_log2, row_log2};
-      },
+      }),
       row_stats_t{0.0,
                   0.0,
                   std::numeric_limits<double>::infinity(),
                   -std::numeric_limits<double>::infinity()},
-      [] __device__(row_stats_t a, row_stats_t b) -> row_stats_t {
-        return {thrust::get<0>(a) + thrust::get<0>(b),
-                thrust::get<1>(a) + thrust::get<1>(b),
-                min_op_t<double>{}(thrust::get<2>(a), thrust::get<2>(b)),
-                max_op_t<double>{}(thrust::get<3>(a), thrust::get<3>(b))};
-      });
+      cuda::proclaim_return_type<row_stats_t>(
+        [] __device__(row_stats_t a, row_stats_t b) -> row_stats_t {
+          return {thrust::get<0>(a) + thrust::get<0>(b),
+                  thrust::get<1>(a) + thrust::get<1>(b),
+                  min_op_t<double>{}(thrust::get<2>(a), thrust::get<2>(b)),
+                  max_op_t<double>{}(thrust::get<3>(a), thrust::get<3>(b))};
+        }));
     const i_t active_row_count = static_cast<i_t>(thrust::get<1>(row_norm_log2_stats));
     if (active_row_count == 0) { break; }
     const double row_log2_spread =
@@ -770,7 +773,8 @@ void mip_scaling_strategy_t<i_t, f_t>::scale_problem(bool do_objective_scaling)
       thrust::count_if(handle_ptr_->get_thrust_policy(),
                        iteration_scaling.begin(),
                        iteration_scaling.end(),
-                       [] __device__(f_t row_scale) -> bool { return row_scale != f_t(1); });
+                       cuda::proclaim_return_type<bool>(
+                         [] __device__(f_t row_scale) -> bool { return row_scale != f_t(1); }));
     CUOPT_LOG_DEBUG(
       "MIP_SCALING_METRICS iteration=%d log2_spread=%g target_norm=%g scaled_rows=%d "
       "valid_rows=%d",
