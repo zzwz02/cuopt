@@ -12,8 +12,13 @@ from libcpp.pair cimport pair
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 
-from pylibraft.common.handle cimport *
-from rmm.librmm.device_buffer cimport device_buffer
+# RAPIDS-free build: declare rmm::device_buffer locally from the vendored shim
+# header instead of cimporting from the rmm wheel. Only data()/size() are needed
+# on the Cython side; ownership is handled via unique_ptr + move().
+cdef extern from "rmm/device_buffer.hpp" namespace "rmm" nogil:
+    cdef cppclass device_buffer:
+        void* data()
+        size_t size()
 
 from cuopt.linear_programming.data_model.data_model cimport data_model_view_t
 from cuopt.linear_programming.solver_settings.solver_settings cimport (

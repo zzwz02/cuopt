@@ -3,8 +3,8 @@
 
 import numpy as np
 
-import cudf
-import pylibcudf as plc
+# cudf / pylibcudf are imported lazily so the LP/MILP path (numpy-in/numpy-out)
+# works without RAPIDS packages installed. Only the routing path needs them.
 
 
 def series_from_buf(buf, dtype):
@@ -22,6 +22,9 @@ def series_from_buf(buf, dtype):
     cudf.Series
         A cudf Series built from the buffer
     """
+    import cudf
+    import pylibcudf as plc
+
     col = plc.column.Column.from_rmm_buffer(
         buf,
         dtype=plc.types.DataType.from_arrow(dtype),
@@ -45,10 +48,14 @@ def get_data_ptr(array):
     int
         Buffer address from ``__cuda_array_interface__`` or ``__array_interface__``.
     """
-    if isinstance(array, cudf.Series):
-        return array.__cuda_array_interface__["data"][0]
     if isinstance(array, np.ndarray):
         return array.__array_interface__["data"][0]
+    try:
+        import cudf
+    except ImportError:
+        cudf = None
+    if cudf is not None and isinstance(array, cudf.Series):
+        return array.__cuda_array_interface__["data"][0]
     raise TypeError(
         "get_data_ptr must be called with cudf.Series or np.ndarray"
     )

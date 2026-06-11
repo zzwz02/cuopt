@@ -5,18 +5,25 @@ import warnings
 
 import numpy as np
 
-import cudf
+# cudf is imported lazily so the LP/MILP path works without RAPIDS installed.
 
 
 def type_cast(cudf_obj, np_type, name):
-    if isinstance(cudf_obj, cudf.Series):
+    if isinstance(cudf_obj, np.ndarray):
         cudf_type = cudf_obj.dtype
-    elif isinstance(cudf_obj, cudf.DataFrame):
-        if all([np.issubdtype(dtype, np.number) for dtype in cudf_obj.dtypes]):
-            cudf_type = cudf_obj.dtypes[0]
-        else:
-            msg = "All columns in " + name + " should be numeric"
-            raise Exception(msg)
+    else:
+        import cudf
+
+        if isinstance(cudf_obj, cudf.Series):
+            cudf_type = cudf_obj.dtype
+        elif isinstance(cudf_obj, cudf.DataFrame):
+            if all(
+                [np.issubdtype(dtype, np.number) for dtype in cudf_obj.dtypes]
+            ):
+                cudf_type = cudf_obj.dtypes[0]
+            else:
+                msg = "All columns in " + name + " should be numeric"
+                raise Exception(msg)
     if (
         (
             np.issubdtype(np_type, np.floating)
