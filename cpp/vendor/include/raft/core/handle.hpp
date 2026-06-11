@@ -17,6 +17,7 @@
 #include <cusparse.h>
 
 #include <memory>
+#include <type_traits>
 
 namespace raft {
 
@@ -29,7 +30,11 @@ namespace raft {
  */
 class handle_t {
  public:
-  handle_t() : handle_t(rmm::cuda_stream_default) {}
+  // Default to the per-thread default stream, matching raft::handle_t. The
+  // legacy null stream (cuda_stream_default) has global-synchronization
+  // semantics and cannot be the target of CUDA graph capture, which cuOpt's
+  // manual_cuda_graph_t relies on; cudaStreamPerThread is capturable.
+  handle_t() : handle_t(rmm::cuda_stream_per_thread) {}
 
   explicit handle_t(rmm::cuda_stream_view stream)
     : stream_view_{stream},
@@ -37,13 +42,16 @@ class handle_t {
   {
   }
 
-  // Copyable like raft::handle_t: the copy shares the stream but gets a fresh
-  // Thrust policy and lazily creates its own cuBLAS/cuSPARSE handles (copying
-  // the handle pointers would double-free on destruction). Move is deleted,
-  // matching raft.
+  // Copyable like raft::handle_t, which copies SHARE the underlying cuBLAS /
+  // cuSPARSE resources (ref-counted). This preserves handle state — crucially
+  // the device pointer mode cuOpt sets via init_handler — across copies, and
+  // ref-counts destruction so no double-free occurs. The copy gets a fresh
+  // Thrust policy bound to the same stream. Move is deleted, matching raft.
   handle_t(handle_t const& other)
     : stream_view_{other.stream_view_},
-      thrust_policy_{std::make_unique<rmm::exec_policy>(other.stream_view_)}
+      thrust_policy_{std::make_unique<rmm::exec_policy>(other.stream_view_)},
+      cublas_handle_{other.cublas_handle_},
+      cusparse_handle_{other.cusparse_handle_}
   {
   }
   handle_t& operator=(handle_t const&) = delete;
@@ -57,11 +65,7 @@ class handle_t {
   [[nodiscard]] bool comms_initialized() const noexcept { return false; }
   [[nodiscard]] comms_t get_comms() const noexcept { return {}; }
 
-  virtual ~handle_t()
-  {
-    if (cublas_handle_ != nullptr) { cublasDestroy(cublas_handle_); }
-    if (cusparse_handle_ != nullptr) { cusparseDestroy(cusparse_handle_); }
-  }
+  virtual ~handle_t() = default;
 
   [[nodiscard]] rmm::cuda_stream_view get_stream() const noexcept { return stream_view_; }
 
@@ -70,18 +74,33 @@ class handle_t {
   void sync_stream() const { stream_view_.synchronize(); }
   void sync_stream(rmm::cuda_stream_view stream) const { stream.synchronize(); }
 
+  // NOTE: the stream is bound to the cuBLAS/cuSPARSE handle only at creation and
+  // whenever set_cuda_stream() changes it — NOT on every accessor call. cuOpt
+  // captures these calls inside CUDA graphs (manual_cuda_graph_t), and calling
+  // the stateful cublasSetStream/cusparseSetStream during stream capture breaks
+  // the captured graph (cuBLAS execution fails on replay).
   [[nodiscard]] cublasHandle_t get_cublas_handle() const
   {
-    if (cublas_handle_ == nullptr) { RAFT_CUBLAS_TRY(cublasCreate(&cublas_handle_)); }
-    RAFT_CUBLAS_TRY(cublasSetStream(cublas_handle_, stream_view_.value()));
-    return cublas_handle_;
+    if (!cublas_handle_) {
+      cublasHandle_t h{nullptr};
+      RAFT_CUBLAS_TRY(cublasCreate(&h));
+      RAFT_CUBLAS_TRY(cublasSetStream(h, stream_view_.value()));
+      cublas_handle_ = std::shared_ptr<std::remove_pointer_t<cublasHandle_t>>(
+        h, [](cublasHandle_t p) { if (p != nullptr) { cublasDestroy(p); } });
+    }
+    return cublas_handle_.get();
   }
 
   [[nodiscard]] cusparseHandle_t get_cusparse_handle() const
   {
-    if (cusparse_handle_ == nullptr) { RAFT_CUSPARSE_TRY(cusparseCreate(&cusparse_handle_)); }
-    RAFT_CUSPARSE_TRY(cusparseSetStream(cusparse_handle_, stream_view_.value()));
-    return cusparse_handle_;
+    if (!cusparse_handle_) {
+      cusparseHandle_t h{nullptr};
+      RAFT_CUSPARSE_TRY(cusparseCreate(&h));
+      RAFT_CUSPARSE_TRY(cusparseSetStream(h, stream_view_.value()));
+      cusparse_handle_ = std::shared_ptr<std::remove_pointer_t<cusparseHandle_t>>(
+        h, [](cusparseHandle_t p) { if (p != nullptr) { cusparseDestroy(p); } });
+    }
+    return cusparse_handle_.get();
   }
 
   [[nodiscard]] int get_device() const
@@ -104,17 +123,17 @@ class handle_t {
   {
     stream_view_   = stream;
     thrust_policy_ = std::make_unique<rmm::exec_policy>(stream);
-    if (cublas_handle_ != nullptr) { RAFT_CUBLAS_TRY(cublasSetStream(cublas_handle_, stream.value())); }
-    if (cusparse_handle_ != nullptr) {
-      RAFT_CUSPARSE_TRY(cusparseSetStream(cusparse_handle_, stream.value()));
+    if (cublas_handle_) { RAFT_CUBLAS_TRY(cublasSetStream(cublas_handle_.get(), stream.value())); }
+    if (cusparse_handle_) {
+      RAFT_CUSPARSE_TRY(cusparseSetStream(cusparse_handle_.get(), stream.value()));
     }
   }
 
  private:
   rmm::cuda_stream_view stream_view_{rmm::cuda_stream_default};
   mutable std::unique_ptr<rmm::exec_policy> thrust_policy_;
-  mutable cublasHandle_t cublas_handle_{nullptr};
-  mutable cusparseHandle_t cusparse_handle_{nullptr};
+  mutable std::shared_ptr<std::remove_pointer_t<cublasHandle_t>> cublas_handle_;
+  mutable std::shared_ptr<std::remove_pointer_t<cusparseHandle_t>> cusparse_handle_;
   mutable cudaDeviceProp device_prop_{};
   mutable bool device_prop_valid_{false};
 };

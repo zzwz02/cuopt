@@ -78,15 +78,12 @@ inline auto parse_test_options(int argc, char** argv)
 {
   try {
     cxxopts::Options options(argv[0], " - cuOpt tests command line options");
-    // MVP: default to the non-pooled "cuda" resource. The shim's stream-ordered
-    // pool (cudaMallocFromPoolAsync) is correct for single solves (cuopt_cli
-    // benchmarks match the baseline objectives exactly), but its immediate
-    // block reuse — unlike rmm's deferred free-list pool_memory_resource —
-    // surfaces a pre-existing latent use-after-free in the solver when many
-    // tests run back-to-back in one process. Pass --rmm_mode=pool to exercise
-    // the pooled path. See docs/dev/rapids_removal_plan.md.
+    // Default to the stream-ordered async pool: cuOpt captures solver work into
+    // CUDA graphs (manual_cuda_graph_t), and CUDA stream capture forbids the
+    // synchronous cudaMalloc used by the plain "cuda" resource — only the pool's
+    // cudaMallocFromPoolAsync is capturable.
     options.allow_unrecognised_options().add_options()(
-      "rmm_mode", "RMM allocation mode", cxxopts::value<std::string>()->default_value("cuda"));
+      "rmm_mode", "RMM allocation mode", cxxopts::value<std::string>()->default_value("pool"));
 
     return options.parse(argc, argv);
   } catch (const std::exception& e) {
