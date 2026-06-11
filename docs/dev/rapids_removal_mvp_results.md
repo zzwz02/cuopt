@@ -93,17 +93,26 @@ libamd libsuitesparseconfig libtbb libgomp  (+ libc/libstdc++/libm)
   删除后通过。
 
 **真实失败:6 个 routing 测试**(ROUTING_TEST、ROUTING_GES_TEST、VEHICLE_ORDER_TEST、
-VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST、ROUTING_UNIT_TEST),共一个根因:
-- compute-sanitizer 精确定位:`route.cuh:782 get_num_nodes()` 解引用 **NULL 指针** `n_nodes`
-  (`Address 0x0 out of bounds`),调用自 `perform_moves.cu:102 insert_graph_nodes_kernel`,
-  经 `global_route = solution.routes[route_id]` —— 即该 route 的 `n_nodes` device_scalar 指针
-  为空,意味 `route_id` 越界或该 route 未建好。
-- **已排除**:分配器模式(cuda/pool/zeroed 均失败)、未初始化读(zeroing 不修)、对齐(实测池
-  分配 256 对齐)、per-thread 流(routing 经 `data_model.get_handle_ptr()->get_stream()` 已是
-  per-thread)、求解器 RNG(PCGenerator/block_random_sample 逐字移植 bit-exact;手写非
-  bit-exact 的只有 generator.cu 合成数据,不在 local search 路径)。
-- **后续方向**:沿 `route_id = route_node_map.get_route_id(...)` 与初始路由/solution 路由池
-  分配上溯,定位 route_id 为何越界或 route 未分配——是单一 routing 数据建立路径的 bug。
+VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST、ROUTING_UNIT_TEST),共一个根因 —— **GES
+最小代价环(min-cost cycle)构造把 depot(node 0)当作被弹出节点(ejected node)写进 move path**:
+- 现象链(设备侧 printf 实测,`ROUTING_GES_TEST` `double_test_pdp.GES_PDP`):
+  `insert_graph_nodes_kernel`(perform_moves.cu)读 `path[0]`,解出 `ejected_request_id.id()==0`
+  (即 depot);`route_node_map.get_route_id(0) == -1`(depot 本就 unrouted);于是
+  `global_route = solution.routes[-1]` 拿到全零 view,其 `n_nodes==nullptr`,在 route.cuh:782
+  `get_num_nodes()` 解引用 NULL(`Address 0x0`)。实测打印:
+  `ejected blk=0 route_id=-1 n_routes=13 ejected=0 n_orders=101`。
+- move path 的坏边来自上游 `populate_move_path_kernel` 走 `move_candidates.cycles`(GES 找到的
+  环),环里含 node 0;即 **GES 环查找产出了一条包含 depot 的非法环**。
+- **已排除(逐一证伪)**:
+  - 分配器模式 / 未初始化读 —— 新增 `RMM_SHIM_NO_ZERO` 开关,**池清零 ON/OFF 现象完全相同**
+    (`ejected=0` 不变),排除"池脏数据被当索引/代价"假说;清零与 routing 无关。
+  - RNG —— `raft/random/detail/rng_device.cuh` 的 PCGenerator 与 raft 26.06 源 **逐字节相同**
+    (20223B,diff 空);失败**确定性复现**(多次同值),排除 `perform_moves.cu:341` 那条
+    `clock64()` 播种的 cross 路径(那条才是非确定的)。
+  - 对齐、per-thread 流 —— 同前次诊断已排除。
+- **后续方向(单一、隔离的深挖)**:对同一输入 dump shim 与 baseline 的
+  `move_candidates.cycles.paths/offsets`,定位环查找(代价图松弛 / block_reduce 归约序 /
+  thrust scan)在哪一步让 depot 进入环。属 GES 环构造的数值/顺序分歧,非容器或 RNG 问题。
 
 ## 6. 待办
 

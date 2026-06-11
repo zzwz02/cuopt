@@ -12,9 +12,21 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
 
 namespace rmm::mr {
+
+// MVP diagnostic toggle: set RMM_SHIM_NO_ZERO=1 to disable zeroing of pool
+// allocations (default: zero, to mimic rmm's first-touch-zeroed arena).
+inline bool shim_zero_pool_allocations()
+{
+  static bool const disabled = [] {
+    char const* e = std::getenv("RMM_SHIM_NO_ZERO");
+    return e != nullptr && e[0] == '1';
+  }();
+  return !disabled;
+}
 
 /**
  * @brief Device memory resource backed by a CUDA stream-ordered memory pool.
@@ -78,7 +90,7 @@ class cuda_async_memory_resource final : public device_memory_resource {
     // out-of-bounds accesses. Zeroing restores the effectively-zeroed behavior
     // (the proper fix is to initialize those reads in cuOpt). The memset is
     // async on the allocation stream and negligible vs. solve time.
-    cudaMemsetAsync(ptr, 0, bytes, stream.value());
+    if (shim_zero_pool_allocations()) { cudaMemsetAsync(ptr, 0, bytes, stream.value()); }
     return ptr;
   }
 
