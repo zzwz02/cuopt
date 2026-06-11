@@ -8,6 +8,7 @@
 # cython: language_level = 3
 
 from libcpp cimport bool
+from libcpp.memory cimport unique_ptr
 from libcpp.pair cimport pair
 from libcpp.string cimport string
 from libcpp.vector cimport vector
