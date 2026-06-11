@@ -315,6 +315,55 @@ TEST(sparse_ldlt, device_numeric_matches_host_reference)
   EXPECT_LT(max_rel, 1e-12);
 }
 
+TEST(sparse_ldlt, dense_tail_matches_host_reference)
+{
+  raft::handle_t handle{};
+  simplex_solver_settings_t<int, double> settings;
+
+  const int n_primal = 380;
+  const int m_dual   = 220;
+  const int n        = n_primal + m_dual;
+  std::vector<double> dense   = random_kkt_dense(n_primal, m_dual, 4242, 1.0);
+  csc_matrix_t<int, double> A = dense_to_full_csc(n, dense);
+
+  dense_vector_t<int, double> b(n);
+  for (int i = 0; i < n; i++) {
+    b[i] = std::sin(0.9 * i) + 0.25;
+  }
+
+  // Host reference (no tail).
+  setenv("CUOPT_LDLT_HOST", "1", 1);
+  dense_vector_t<int, double> x_ref(n);
+  {
+    sparse_cholesky_ldlt_t<int, double> chol(&handle, settings, n);
+    chol.set_positive_definite(false);
+    ASSERT_EQ(chol.analyze(A), 0);
+    ASSERT_EQ(chol.factorize(A), 0);
+    ASSERT_EQ(chol.solve(b, x_ref), 0);
+  }
+  unsetenv("CUOPT_LDLT_HOST");
+
+  // Device with a forced dense tail of several widths, including the full
+  // matrix (empty head) and a width that is not a multiple of the panel size.
+  for (int tail : {64, 150, 333, n}) {
+    setenv("CUOPT_LDLT_TAIL", std::to_string(tail).c_str(), 1);
+    sparse_cholesky_ldlt_t<int, double> chol(&handle, settings, n);
+    chol.set_positive_definite(false);
+    ASSERT_EQ(chol.analyze(A), 0);
+    ASSERT_EQ(chol.factorize(A), 0);
+    dense_vector_t<int, double> x(n);
+    ASSERT_EQ(chol.solve(b, x), 0);
+    double max_rel = 0.0;
+    for (int i = 0; i < n; i++) {
+      double denom = std::max(1.0, std::abs(x_ref[i]));
+      max_rel      = std::max(max_rel, std::abs(x_ref[i] - x[i]) / denom);
+    }
+    EXPECT_LT(max_rel, 1e-9) << "tail=" << tail;
+    EXPECT_LT(residual_inf_norm(n, dense, x, b), 1e-7) << "tail=" << tail;
+  }
+  unsetenv("CUOPT_LDLT_TAIL");
+}
+
 TEST(sparse_ldlt, singular_matrix_static_pivoting)
 {
   raft::handle_t handle{};
