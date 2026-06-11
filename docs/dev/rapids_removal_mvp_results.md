@@ -10,7 +10,7 @@
 **核心目标达成。** libcuopt.so + cuopt_cli + 全部 40 个测试可执行文件构建通过、
 **零编译错误**，运行时**不再链接 librmm.so / libraft / librapids_logger.so**。
 cuopt_cli 的 barrier 与 PDLP 求解目标值与基线**逐位一致**。C++ 单元测试
-**129/137 (94%) 通过**;剩余 8 个已逐项诊断（见 §5）。
+**131/137 (96%) 通过**;剩余 6 个全部是同一 routing 问题(见 §5)。CLI_TEST 与 DOC_EXAMPLE 的"失败"经查是测试环境问题(cuopt_cli 不在 PATH、/tmp 残留文件),非 shim bug。
 
 ### 通过率演进与真实根因（诊断记录）
 
@@ -79,26 +79,31 @@ libamd libsuitesparseconfig libtbb libgomp  (+ libc/libstdc++/libm)
   vendor include 目录与 CUDA::cudart_static；CCCL/gtest 仍经 rapids-cmake 拉（rapids-cmake
   作为纯构建工具暂留，4b 可进一步替换为平凡 FetchContent）。
 
-## 5. 剩余 8 个 C++ 测试失败（已逐项诊断）
+## 5. 剩余失败诊断（真实仅 6 个 routing；CLI/DOC 为环境问题）
 
-核心求解路径正确(cuopt_cli barrier+PDLP 目标值逐位匹配,PDLP/MIP 单元测试全过):
+跑 ctest 务必:`export PATH=$cpp/build:$PATH`(CLI 经 popen 调 `cuopt_cli`)、各测试目录放
+`datasets` 符号链接、清理 `/tmp/user_problem*.mps`。如此 = **131/137**。
 
-- **6 个 routing 测试**(ROUTING_TEST、ROUTING_GES_TEST、VEHICLE_ORDER_TEST、
-  VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST、ROUTING_UNIT_TEST):首个失败子测试
-  `vehicle_breaks.vehicle_time_windows` 报 `cudaErrorIllegalAddress`。**已排除**:分配器
-  模式(cuda/pool/zeroed 均失败)、未初始化读(zeroing 不修)、对齐(实测池分配均 256 对齐)、
-  per-thread 流(routing 经 `data_model.get_handle_ptr()->get_stream()` 已是 per-thread)。
-  剩余嫌疑:非 bit-exact 的 RNG(`make_blobs`/`uniform`/`uniformInt` 手写指针版,见 §4)
-  生成越界数据,或某个 vendored raft 设备工具/`block_random_sample` 的细微差异。需逐
-  kernel GPU 调试(memcheck 会扰动内存布局,不易复现)。
-- **DOC_EXAMPLE_TEST**(tests/mip):MIP doc 示例,疑似与 routing 同源或独立小问题,未细查。
-- **CLI_TEST**:cli_test_t 经 popen 捕获 cuopt_cli 的 stdout,期望错误输入时输出含
-  "error"/"Usage"。cuOpt 默认 logger 把消息缓冲到 `global_log_buffer`(callback_sink),
-  错误路径下缓冲未刷到 stdout。属日志 buffer-flush 行为,与求解无关。
+**非 shim bug（测试环境）:**
+- **CLI_TEST**:`cli_test_t` 用 `popen("cuopt_cli …", "r")`(含 `2>&1`)调 PATH 中的
+  cuopt_cli。cuopt_cli 输出完全正确("Unknown argument: --dummy-argument"、"0 provided"+
+  "Usage"、"Error: …")——失败仅因 ctest 时 cuopt_cli 不在 PATH;PATH 含 build/ 后通过。
+- **DOC_EXAMPLE_TEST**:`docs.user_problem_file` 在 line 119 `EXPECT_FALSE(exists(
+  /tmp/user_problem.mps))`——求解本身成功(Optimal, obj 303.5),失败仅因上次运行残留该文件;
+  删除后通过。
 
-后续方向:routing 用 compute-sanitizer + 关池逐 kernel 定位,或先核对 RNG 是否产出越界;
-CLI 核对 cuOpt logger buffer 在错误退出路径的 flush;routing 若是 RNG,数据变化还需重生成
-golden。
+**真实失败:6 个 routing 测试**(ROUTING_TEST、ROUTING_GES_TEST、VEHICLE_ORDER_TEST、
+VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST、ROUTING_UNIT_TEST),共一个根因:
+- compute-sanitizer 精确定位:`route.cuh:782 get_num_nodes()` 解引用 **NULL 指针** `n_nodes`
+  (`Address 0x0 out of bounds`),调用自 `perform_moves.cu:102 insert_graph_nodes_kernel`,
+  经 `global_route = solution.routes[route_id]` —— 即该 route 的 `n_nodes` device_scalar 指针
+  为空,意味 `route_id` 越界或该 route 未建好。
+- **已排除**:分配器模式(cuda/pool/zeroed 均失败)、未初始化读(zeroing 不修)、对齐(实测池
+  分配 256 对齐)、per-thread 流(routing 经 `data_model.get_handle_ptr()->get_stream()` 已是
+  per-thread)、求解器 RNG(PCGenerator/block_random_sample 逐字移植 bit-exact;手写非
+  bit-exact 的只有 generator.cu 合成数据,不在 local search 路径)。
+- **后续方向**:沿 `route_id = route_node_map.get_route_id(...)` 与初始路由/solution 路由池
+  分配上溯,定位 route_id 为何越界或 route 未分配——是单一 routing 数据建立路径的 bug。
 
 ## 6. 待办
 
