@@ -4,6 +4,7 @@
 #pragma once
 
 #include <rmm/detail/error.hpp>
+#include <rmm/detail/std_compat.hpp>
 
 #include <cuda_runtime_api.h>
 

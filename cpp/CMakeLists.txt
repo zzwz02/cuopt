@@ -241,21 +241,20 @@ rapids_cmake_install_lib_dir(lib_dir)
 
 option(FETCH_RAPIDS "Fetch RAPIDS dependencies" ON)
 
+# rmm / raft / rapids_logger are no longer fetched or linked: cuOpt's own
+# cuda::mr-free same-name shim headers under cpp/vendor/include provide the
+# used API subset (see docs/dev/rapids_removal_plan.md). Only CCCL is still
+# fetched (it is an NVIDIA/cccl product that ships with the CUDA toolkit, not
+# part of RAPIDS).
 if (FETCH_RAPIDS)
     include(cmake/thirdparty/get_cccl.cmake)
-    include(cmake/thirdparty/get_rmm.cmake)
-    include(cmake/thirdparty/get_raft.cmake)
-    # Source-built RMM can hide out-of-line utility symbols such as
-    # rmm::align_up / rmm::get_current_cuda_device when built with hidden visibility on clang.
-    # Force default visibility on the fetched rmm target until this is fixed upstream/figured out.
-    if (TARGET rmm)
-        set_target_properties(rmm PROPERTIES CXX_VISIBILITY_PRESET default)
-    endif ()
 else ()
     find_package(CCCL REQUIRED)
-    find_package(RMM REQUIRED)
-    find_package(RAFT REQUIRED)
 endif ()
+
+# Vendored rmm/raft/rapids_logger shim include directory. The rmm/raft/
+# rapids_logger header trees exist only here; CCCL still owns cuda/thrust/cub.
+set(CUOPT_VENDOR_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/include")
 
 FetchContent_Declare(
         papilo
@@ -311,10 +310,10 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(dejavu)
 message(STATUS "dejavu (graph automorphism): ${dejavu_SOURCE_DIR}")
 
-include(${rapids-cmake-dir}/cpm/rapids_logger.cmake)
-# generate logging macros
-rapids_cpm_rapids_logger(BUILD_EXPORT_SET cuopt-exports INSTALL_EXPORT_SET cuopt-exports)
-create_logger_macros(CUOPT "cuopt::default_logger()" include/cuopt)
+# rapids_logger is replaced by the header-only shim under
+# cpp/vendor/include/rapids_logger; the CUOPT_LOG_* macros that
+# create_logger_macros used to generate are now the static, committed header
+# cpp/include/cuopt/logger_macros.hpp.
 
 # ##################################################################################################
 # - gRPC and Protobuf setup -----------------------------------------------------------------------
@@ -584,14 +583,17 @@ target_compile_definitions(cuopt PUBLIC
         CUOPT_CUDA_ARCHITECTURES="${JOINED_CUDA_ARCHITECTURES}"
         CUOPT_CPU_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}")
 
+# Vendored rmm/raft/rapids_logger shim headers, ahead of any other include
+# dirs so <rmm/...>, <raft/...> and <rapids_logger/...> resolve to the shim.
+target_include_directories(cuopt PUBLIC
+        "$<BUILD_INTERFACE:${CUOPT_VENDOR_INCLUDE_DIR}>"
+        "$<INSTALL_INTERFACE:include/cuopt_vendor>")
+
 target_link_libraries(cuopt
         PUBLIC
         CUDA::cublas
         CUDA::cusparse
-        rmm::rmm
-        rapids_logger::rapids_logger
         CCCL::CCCL
-        raft::raft
         PRIVATE
         SuiteSparse::AMD
         ${CUOPT_PRIVATE_CUDA_LIBS}

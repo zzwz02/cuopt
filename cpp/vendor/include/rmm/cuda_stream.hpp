@@ -27,10 +27,11 @@ class cuda_stream {
   cuda_stream& operator=(cuda_stream const&) = delete;
   ~cuda_stream()                             = default;
 
-  cuda_stream()
-    : stream_{[]() {
+  explicit cuda_stream(flags stream_flags = flags::non_blocking)
+    : stream_{[stream_flags]() {
                 auto* str = new cudaStream_t;
-                RMM_CUDA_TRY(cudaStreamCreateWithFlags(str, cudaStreamNonBlocking));
+                RMM_CUDA_TRY(
+                  cudaStreamCreateWithFlags(str, static_cast<unsigned int>(stream_flags)));
                 return str;
               }(),
               [](cudaStream_t* str) {

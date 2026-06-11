@@ -13,6 +13,7 @@
 #include <utilities/device_utils.cuh>
 
 #include <raft/random/rng.cuh>
+#include <raft/util/device_atomics.cuh>
 
 #include <thrust/iterator/transform_iterator.h>
 

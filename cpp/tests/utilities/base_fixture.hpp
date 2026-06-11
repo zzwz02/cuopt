@@ -13,56 +13,45 @@
 
 #include <gtest/gtest.h>
 
-#include <cuda/memory_resource>
-
-#include <rmm/mr/binning_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/managed_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
-#include <rmm/mr/pool_memory_resource.hpp>
+
+#include <memory>
 
 namespace cuopt {
 namespace test {
 
-/// MR factory functions
-inline auto make_cuda() { return rmm::mr::cuda_memory_resource(); }
+using mr_ptr = std::shared_ptr<rmm::mr::device_memory_resource>;
 
-inline auto make_async() { return rmm::mr::cuda_async_memory_resource(); }
+/// MR factory functions (cuda::mr-free shim: owning shared_ptr resources).
+inline mr_ptr make_cuda() { return std::make_shared<rmm::mr::cuda_memory_resource>(); }
 
-inline auto make_managed() { return rmm::mr::managed_memory_resource(); }
+inline mr_ptr make_async() { return std::make_shared<rmm::mr::cuda_async_memory_resource>(); }
 
-inline auto make_pool()
+inline mr_ptr make_managed() { return std::make_shared<rmm::mr::managed_memory_resource>(); }
+
+inline mr_ptr make_pool()
 {
-  // 1GB of initial pool size
+  // 1GB of initial pool size, backed by the stream-ordered CUDA mempool.
   const size_t initial_pool_size = 1024 * 1024 * 1024;
-  return rmm::mr::pool_memory_resource(make_async(), initial_pool_size);
+  return std::make_shared<rmm::mr::cuda_async_memory_resource>(initial_pool_size);
 }
 
-inline auto make_binning()
-{
-  auto pool = make_pool();
-  // Add a fixed_size_memory_resource for bins of size 256, 512, 1024, 2048 and
-  // 4096KiB Larger allocations will use the pool resource
-  return rmm::mr::binning_memory_resource(pool, 18, 22);
-}
+// The mempool already pools allocations; "binning" maps to the pool resource.
+inline mr_ptr make_binning() { return make_pool(); }
 
 /**
  * @brief Creates a memory resource for the unit test environment given the name
- * of the allocation mode.
+ * of the allocation mode. The returned resource must be kept alive for the
+ * duration of the tests.
  *
- * The returned resource instance must be kept alive for the duration of the
- * tests. Attaching the resource to a TestEnvironment causes issues since the
- * environment objects are not destroyed until after the runtime is shutdown.
- *
- * @throw cuopt::logic_error if the `allocation_mode` is unsupported.
- *
- * @param allocation_mode String identifies which resource type.
- *        Accepted types are "pool", "cuda", and "managed" only.
- * @return Memory resource instance
+ * @param allocation_mode One of "binning", "cuda", "pool", "managed".
+ * @return Owning memory resource handle.
  */
-inline cuda::mr::any_resource<cuda::mr::device_accessible> create_memory_resource(
-  std::string const& allocation_mode)
+inline mr_ptr create_memory_resource(std::string const& allocation_mode)
 {
   if (allocation_mode == "binning") return make_binning();
   if (allocation_mode == "cuda") return make_cuda();

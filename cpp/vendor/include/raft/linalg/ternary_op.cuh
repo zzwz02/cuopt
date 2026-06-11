@@ -12,9 +12,9 @@ namespace raft::linalg {
 
 namespace detail {
 
-template <typename OutT, typename InT, typename IdxType, typename Lambda>
+template <typename math_t, typename IdxType, typename Lambda>
 __global__ void ternary_op_kernel(
-  OutT* out, const InT* in1, const InT* in2, const InT* in3, IdxType len, Lambda op)
+  math_t* out, const math_t* in1, const math_t* in2, const math_t* in3, IdxType len, Lambda op)
 {
   for (IdxType i = static_cast<IdxType>(blockIdx.x) * blockDim.x + threadIdx.x; i < len;
        i += static_cast<IdxType>(gridDim.x) * blockDim.x) {
@@ -24,12 +24,16 @@ __global__ void ternary_op_kernel(
 
 }  // namespace detail
 
-/** @brief Elementwise ternary op: out[i] = op(in1[i], in2[i], in3[i]). */
-template <typename OutT, typename InT, typename IdxType, typename Lambda>
-void ternaryOp(OutT* out,
-               const InT* in1,
-               const InT* in2,
-               const InT* in3,
+/**
+ * @brief Elementwise ternary op: out[i] = op(in1[i], in2[i], in3[i]).
+ * Template order matches raft (<math_t, Lambda, IdxType>) for explicit-arg call
+ * sites such as ternaryOp<f_t, violation<f_t>>(...).
+ */
+template <typename math_t, typename Lambda, typename IdxType = int>
+void ternaryOp(math_t* out,
+               const math_t* in1,
+               const math_t* in2,
+               const math_t* in3,
                IdxType len,
                Lambda op,
                cudaStream_t stream)

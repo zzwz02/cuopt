@@ -4,6 +4,7 @@
 #pragma once
 
 #include <raft/core/span.hpp>
+#include <raft/util/cudart_utils.hpp>  // raft::copy, transitively expected by span users
 
 #include <cstddef>
 

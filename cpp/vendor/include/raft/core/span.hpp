@@ -12,7 +12,7 @@
 
 namespace raft {
 
-inline constexpr std::size_t dynamic_extent = cuda::std::dynamic_extent;
+using cuda::std::dynamic_extent;
 
 /**
  * @brief raft span: a non-owning view with raft's template signature
@@ -30,7 +30,9 @@ class span {
   using const_pointer   = T const*;
   using reference       = T&;
   using const_reference = T const&;
-  using iterator        = typename base_type::iterator;
+  // raft::span exposes raw-pointer iterators (cuOpt passes span.begin()/end()
+  // to APIs expecting T*); do NOT use cuda::std::span's wrapped iterator.
+  using iterator        = pointer;
 
   static constexpr bool is_device_span = is_device;
 
@@ -50,6 +52,17 @@ class span {
 
   __host__ __device__ constexpr span(base_type other) noexcept : base_{other} {}
 
+  // Qualification-converting constructor: span<U> -> span<T> when U* converts to
+  // T* (e.g. span<int> -> span<const int>), matching raft::span semantics.
+  template <typename U,
+            std::size_t OtherExtent,
+            typename = std::enable_if_t<std::is_convertible_v<U (*)[], T (*)[]> &&
+                                        (Extent == dynamic_extent || Extent == OtherExtent)>>
+  __host__ __device__ constexpr span(span<U, is_device, OtherExtent> const& other) noexcept
+    : base_{other.data(), other.size()}
+  {
+  }
+
   __host__ __device__ constexpr span(span const&) noexcept            = default;
   __host__ __device__ constexpr span& operator=(span const&) noexcept = default;
 
@@ -65,8 +78,10 @@ class span {
   __host__ __device__ constexpr reference front() const noexcept { return base_.front(); }
   __host__ __device__ constexpr reference back() const noexcept { return base_.back(); }
 
-  __host__ __device__ constexpr iterator begin() const noexcept { return base_.begin(); }
-  __host__ __device__ constexpr iterator end() const noexcept { return base_.end(); }
+  __host__ __device__ constexpr iterator begin() const noexcept { return data(); }
+  __host__ __device__ constexpr iterator end() const noexcept { return data() + size(); }
+  __host__ __device__ constexpr iterator cbegin() const noexcept { return data(); }
+  __host__ __device__ constexpr iterator cend() const noexcept { return data() + size(); }
 
   __host__ __device__ constexpr span<T, is_device, dynamic_extent> subspan(
     size_type offset, size_type count = dynamic_extent) const noexcept
@@ -78,5 +93,24 @@ class span {
  private:
   base_type base_{};
 };
+
+// Element-wise comparison, matching raft::span semantics.
+template <typename T, std::size_t X, typename U, std::size_t Y, bool is_device>
+__host__ __device__ constexpr bool operator==(span<T, is_device, X> l, span<U, is_device, Y> r)
+{
+  if (l.size() != r.size()) { return false; }
+  auto l_beg = l.cbegin();
+  auto r_beg = r.cbegin();
+  for (; l_beg != l.cend(); ++l_beg, ++r_beg) {
+    if (*l_beg != *r_beg) { return false; }
+  }
+  return true;
+}
+
+template <typename T, std::size_t X, typename U, std::size_t Y, bool is_device>
+__host__ __device__ constexpr bool operator!=(span<T, is_device, X> l, span<U, is_device, Y> r)
+{
+  return !(l == r);
+}
 
 }  // namespace raft

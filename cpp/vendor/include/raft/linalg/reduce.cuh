@@ -11,6 +11,7 @@
 #include <rmm/exec_policy.hpp>
 
 #include <cub/device/device_reduce.cuh>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 
 namespace raft::linalg {
@@ -21,6 +22,15 @@ __global__ void reduce_finalize_kernel(OutType* out, const OutType* acc, FinalLa
 {
   if (threadIdx.x == 0 && blockIdx.x == 0) { out[0] = final_op(*acc); }
 }
+
+// Applies raft's index-aware main_op: main_op(in[i], i). Named functor (not a
+// lambda) so the return type is explicit for transform_iterator under nvcc<12.3.
+template <typename InType, typename OutType, typename IdxType, typename MainLambda>
+struct indexed_main_op {
+  const InType* in;
+  MainLambda main_op;
+  __host__ __device__ OutType operator()(IdxType i) const { return main_op(in[i], i); }
+};
 }  // namespace detail
 
 /**
@@ -46,9 +56,12 @@ void reduce(OutType* out,
             ReduceLambda reduce_op = raft::add_op{},
             FinalLambda final_op  = raft::identity_op{})
 {
-  // cuOpt only uses the N==1 full-reduction form.
+  // cuOpt only uses the N==1 full-reduction form. raft applies main_op as
+  // main_op(in[i], i), so iterate indices and apply the indexed functor.
   IdxType const len = D * N;
-  auto in_it        = thrust::make_transform_iterator(in, main_op);
+  auto counting     = thrust::make_counting_iterator<IdxType>(0);
+  detail::indexed_main_op<InType, OutType, IdxType, MainLambda> op_fn{in, main_op};
+  auto in_it        = thrust::make_transform_iterator(counting, op_fn);
 
   rmm::device_uvector<OutType> acc(1, stream);
   std::size_t tmp_bytes = 0;

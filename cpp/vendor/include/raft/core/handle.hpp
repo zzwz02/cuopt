@@ -6,6 +6,7 @@
 
 #include <raft/core/cublas_macros.hpp>
 #include <raft/core/cusparse_macros.hpp>
+#include <raft/core/device_mdspan.hpp>  // raft::make_mdspan/extents transitively expected
 #include <raft/util/cuda_rt_essentials.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -74,6 +75,15 @@ class handle_t {
     return dev;
   }
 
+  [[nodiscard]] cudaDeviceProp const& get_device_properties() const
+  {
+    if (!device_prop_valid_) {
+      RAFT_CUDA_TRY(cudaGetDeviceProperties(&device_prop_, get_device()));
+      device_prop_valid_ = true;
+    }
+    return device_prop_;
+  }
+
   void set_cuda_stream(rmm::cuda_stream_view stream)
   {
     stream_view_   = stream;
@@ -89,6 +99,8 @@ class handle_t {
   mutable std::unique_ptr<rmm::exec_policy> thrust_policy_;
   mutable cublasHandle_t cublas_handle_{nullptr};
   mutable cusparseHandle_t cusparse_handle_{nullptr};
+  mutable cudaDeviceProp device_prop_{};
+  mutable bool device_prop_valid_{false};
 };
 
 // raft uses `resources` as the base type name; alias both to handle_t.

@@ -1,9 +1,13 @@
 /*
  * cuOpt vendored RAFT shim — dot.cuh.
- * Header is included by cuOpt but its functions are not called; the legacy
- * pointer-form helpers cuOpt uses live in eltwise.cuh / binary_op.cuh / reduce.cuh.
+ * Re-exports the legacy pointer-form helpers and cuBLAS wrappers (cublasdot /
+ * cublasnrm2) that the upstream header transitively provided.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
 
-#include <raft/util/cudart_utils.hpp>
+#include <raft/linalg/binary_op.cuh>
+#include <raft/linalg/detail/cublas_wrappers.hpp>
+#include <raft/linalg/eltwise.cuh>
+#include <raft/linalg/reduce.cuh>
+#include <raft/linalg/unary_op.cuh>

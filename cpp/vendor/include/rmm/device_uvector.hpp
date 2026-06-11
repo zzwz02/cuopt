@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include <rmm/cuda_stream.hpp>       // transitively expected (owning streams)
+#include <rmm/cuda_stream_pool.hpp>  // transitively expected (stream pools)
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>

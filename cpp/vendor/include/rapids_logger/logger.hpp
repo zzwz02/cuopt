@@ -125,10 +125,20 @@ class logger {
   logger()                         = delete;
   logger(logger const&)            = delete;
   logger& operator=(logger const&) = delete;
-  logger(logger&&)                 = default;
+
+  // Movable despite the std::mutex member (a moved-into logger gets a fresh
+  // mutex; the sink_vector holds no back-reference to the parent).
+  logger(logger&& other) noexcept
+    : name_{std::move(other.name_)},
+      sinks_{std::move(other.sinks_)},
+      level_{other.level_},
+      flush_level_{other.flush_level_},
+      pattern_{std::move(other.pattern_)}
+  {
+  }
 
   logger(std::string name, std::vector<sink_ptr> sinks)
-    : name_{std::move(name)}, sinks_{*this, std::move(sinks)}
+    : name_{std::move(name)}, sinks_{std::move(sinks)}
   {
   }
   logger(std::string name, std::string filename)
@@ -148,10 +158,8 @@ class logger {
     using Iterator      = std::vector<sink_ptr>::iterator;
     using ConstIterator = std::vector<sink_ptr>::const_iterator;
 
-    explicit sink_vector(logger& parent, std::vector<sink_ptr> sinks = {})
-      : parent_{parent}, sinks_{std::move(sinks)}
-    {
-    }
+    sink_vector() = default;
+    explicit sink_vector(std::vector<sink_ptr> sinks) : sinks_{std::move(sinks)} {}
     void push_back(sink_ptr const& s) { sinks_.push_back(s); }
     void push_back(sink_ptr&& s) { sinks_.push_back(std::move(s)); }
     void pop_back() { sinks_.pop_back(); }
@@ -163,7 +171,6 @@ class logger {
     [[nodiscard]] std::size_t size() const { return sinks_.size(); }
 
    private:
-    logger& parent_;
     std::vector<sink_ptr> sinks_;
   };
 
@@ -200,6 +207,12 @@ class logger {
     std::snprintf(buf.data(), buf.size(), format.c_str(), to_c(std::forward<Args>(args))...);
     buf.resize(static_cast<std::size_t>(sz));
     log(lvl, buf);
+  }
+
+  void flush()
+  {
+    std::lock_guard<std::mutex> lock{mtx_};
+    for (auto& s : sinks_) { s->flush(); }
   }
 
   [[nodiscard]] const sink_vector& sinks() const { return sinks_; }
