@@ -71,6 +71,14 @@ class cuda_async_memory_resource final : public device_memory_resource {
     if (bytes == 0) { return nullptr; }
     cuda_set_device_raii set_dev{device_id_};
     RMM_CUDA_TRY_ALLOC(cudaMallocFromPoolAsync(&ptr, bytes, pool_, stream.value()), bytes);
+    // Zero stream-ordered pool allocations. The driver mempool reuses freed
+    // blocks with stale contents, whereas rmm's pool sub-allocates from a large
+    // arena whose first touch is zeroed; some cuOpt paths read uninitialized
+    // device memory and use it as an index, so the stale contents cause
+    // out-of-bounds accesses. Zeroing restores the effectively-zeroed behavior
+    // (the proper fix is to initialize those reads in cuOpt). The memset is
+    // async on the allocation stream and negligible vs. solve time.
+    cudaMemsetAsync(ptr, 0, bytes, stream.value());
     return ptr;
   }
 
