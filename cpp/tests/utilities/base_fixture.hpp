@@ -108,6 +108,6 @@ inline auto parse_test_options(int argc, char** argv)
     auto const cmd_opts = parse_test_options(argc, argv);                \
     auto const rmm_mode = cmd_opts["rmm_mode"].as<std::string>();        \
     auto resource       = cuopt::test::create_memory_resource(rmm_mode); \
-    rmm::mr::set_current_device_resource(resource);                      \
+    rmm::mr::set_current_device_resource(resource.get());                \
     return RUN_ALL_TESTS();                                              \
   }

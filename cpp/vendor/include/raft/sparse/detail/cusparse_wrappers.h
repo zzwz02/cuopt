@@ -9,6 +9,7 @@
 #include <raft/core/detail/macros.hpp>
 #include <raft/core/error.hpp>
 #include <raft/linalg/transpose.cuh>
+#include <raft/linalg/detail/cublas_wrappers.hpp>
 
 #include <rmm/device_uvector.hpp>
 

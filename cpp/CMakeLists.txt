@@ -591,6 +591,7 @@ target_include_directories(cuopt PUBLIC
 
 target_link_libraries(cuopt
         PUBLIC
+        CUDA::cudart_static  # was pulled in transitively via rmm::rmm before the cutover
         CUDA::cublas
         CUDA::cusparse
         CCCL::CCCL

@@ -8,6 +8,7 @@
 #include <raft/core/cusparse_macros.hpp>
 #include <raft/core/device_mdspan.hpp>  // raft::make_mdspan/extents transitively expected
 #include <raft/util/cuda_rt_essentials.hpp>
+#include <raft/util/cudart_utils.hpp>  // raft::copy transitively expected via handle users
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
@@ -36,10 +37,25 @@ class handle_t {
   {
   }
 
-  handle_t(handle_t const&)            = delete;
+  // Copyable like raft::handle_t: the copy shares the stream but gets a fresh
+  // Thrust policy and lazily creates its own cuBLAS/cuSPARSE handles (copying
+  // the handle pointers would double-free on destruction). Move is deleted,
+  // matching raft.
+  handle_t(handle_t const& other)
+    : stream_view_{other.stream_view_},
+      thrust_policy_{std::make_unique<rmm::exec_policy>(other.stream_view_)}
+  {
+  }
   handle_t& operator=(handle_t const&) = delete;
   handle_t(handle_t&&)                 = delete;
   handle_t& operator=(handle_t&&)      = delete;
+
+  // Minimal comms surface (cuOpt is single-GPU here; comms is never initialized).
+  struct comms_t {
+    void barrier() const {}
+  };
+  [[nodiscard]] bool comms_initialized() const noexcept { return false; }
+  [[nodiscard]] comms_t get_comms() const noexcept { return {}; }
 
   virtual ~handle_t()
   {
