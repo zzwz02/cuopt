@@ -5,7 +5,7 @@
 #pragma once
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/mr/cuda_async_memory_resource.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
@@ -35,16 +35,15 @@ inline std::array<device_memory_resource*, max_devices>& resource_table()
   return table;
 }
 
-// Lazily-created default resource (stream-ordered pool) for a device. The whole
-// codebase is written against stream-ordered semantics, so the default matches.
-inline device_memory_resource* initial_resource(cuda_device_id id)
+// Default resource, matching rmm: a single static cuda_memory_resource (plain
+// synchronous cudaMalloc/cudaFree, not pooled). Pooling is opt-in and configured
+// at the edges (cuopt_cli, the server, gtest base_fixture). Defaulting to a
+// stream-ordered pool changes memory-reuse patterns and surfaces latent
+// use-after-free / uninitialized-read behavior in consumer code.
+inline device_memory_resource* initial_resource(cuda_device_id /*id*/ = cuda_device_id{0})
 {
-  static std::array<cuda_async_memory_resource*, max_devices> defaults{};
-  cuda_set_device_raii set_dev{id};
-  if (defaults[id.value()] == nullptr) {
-    defaults[id.value()] = new cuda_async_memory_resource{};
-  }
-  return defaults[id.value()];
+  static cuda_memory_resource mr{};
+  return &mr;
 }
 
 }  // namespace detail
