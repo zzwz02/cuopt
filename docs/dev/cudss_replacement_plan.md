@@ -184,13 +184,36 @@ libgrpc 未构建)**
 最优且 ours 略快;大型稀疏 LP 上 cuDSS 1–4s vs ours 600s 时限
 (性能取舍,见 §9)。Dual Simplex/PDLP 双方行为一致(无意外回归)。
 
-## 9. 已知限制与后续方向
+## 9. 性能优化(2026-06-11,达成 cuDSS 50% 性能目标)
 
-- **性能**:level 调度逐层 launch kernel,分解/求解各需 O(层数) 次启动;
-  woodlands09 约 78s/迭代(cuDSS 亚秒级)。计划内取舍。优化方向:
-  小层合并/批量 launch(CUDA Graph)、supernodal 化、列内多块并行、
-  求解阶段多 RHS 批处理。
+初版 level 调度实现与 cuDSS 差 13×–100×+(woodlands09 约 78s/迭代)。
+nsys 剖析驱动的三项优化后,LP 基准集全部进入 cuDSS 的 2× 以内
+(0.77×–1.67×,见 benchmark 文档):
+
+1. **稠密尾块**:AMD 排序因子的消去树顶部退化为数千列的顺序链
+   (woodlands09 3080/qap15 4169/nug08 15052 条链层),链上列又近乎稠密,
+   是 level 调度的串行化根源。现将尾部 [j*, n) 作为一整块稠密 LDLᵀ:
+   左视分块 panel(每 panel 一次大 k DGEMM,flops 较右视全方阵更新减半)
+   + 块内并行的对角块 kernel + shared memory panel 求解;尾宽按
+   「头部剩余层数 ≤512」选取,再向下吞并近稠密边界带,显存封顶。
+   头列对尾块的 Schur 贡献分轻重两路:尾段短的列成对原子散射,
+   尾段长的列稠密化后 DGEMM。求解阶段尾块用 cublasDtrsm。
+2. **两段式原子 head 更新**:原"每列一 block、k 顺序"kernel 改为
+   update(2D grid:层内列 × 行模式分片,原子累加)+ finalize(选主元
+   与缩放)两个 kernel,窄层与长列不再让设备空转。
+3. **符号分析尾块裁剪**:先按层数选尾块,尾行的 etree reach 在 j* 截断,
+   尾-尾模式完全不构建(nug08-3rd:存储因子条目 1.16 亿→302 万,
+   符号分析 5.9s→0.27s)。
+
+原子路径不可逐位复现;`cudss_deterministic` 模式自动回退到原确定性
+kernel(无尾块),语义与 cuDSS 一致(确定性换性能)。
+`CUOPT_LDLT_TAIL` 可强制/关闭尾宽,`CUOPT_LDLT_STATS` 输出结构与
+分阶段计时。
+
+剩余限制:
 - 无数值选主元:依赖拟正定性 + 静态选主元 + 调用方自适应正则化与 GMRES 精化;
   极端病态问题可能比 cuDSS 早进入 suboptimal 终止。
+- 进一步优化方向:头部 supernodal 化、求解阶段批量 RHS、CUDA Graph 化
+  launch 序列。
 - gRPC 组件在系统 CUDA 12.1 构建中跳过(容器系统层无 libgrpc/protobuf);
   已在 conda 构建中编译并全部通过(C++ 140 项 + Python 远程执行 11 项)。
