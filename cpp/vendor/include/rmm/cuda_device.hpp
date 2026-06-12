@@ -28,19 +28,26 @@ struct cuda_device_id {
   value_type id_{0};
 };
 
-/** @brief Returns the current CUDA device id. */
+/**
+ * @brief Returns the current CUDA device id.
+ *
+ * Non-throwing, mirroring rmm (RMM_ASSERT_CUDA_SUCCESS is a no-op in release):
+ * on machines with no CUDA device this returns -1 instead of throwing, so
+ * GPU-free code paths (e.g. cuOpt's CPU-only remote-execution mode, which runs
+ * with CUDA_VISIBLE_DEVICES="") can construct settings/containers of size 0.
+ */
 [[nodiscard]] inline cuda_device_id get_current_cuda_device()
 {
-  cuda_device_id::value_type dev_id{0};
-  RMM_CUDA_TRY(cudaGetDevice(&dev_id));
+  cuda_device_id::value_type dev_id{-1};
+  if (cudaGetDevice(&dev_id) != cudaSuccess) { cudaGetLastError(); }
   return cuda_device_id{dev_id};
 }
 
-/** @brief Returns the number of visible CUDA devices. */
+/** @brief Returns the number of visible CUDA devices (non-throwing, like rmm). */
 [[nodiscard]] inline int get_num_cuda_devices()
 {
-  cuda_device_id::value_type num_dev{0};
-  RMM_CUDA_TRY(cudaGetDeviceCount(&num_dev));
+  cuda_device_id::value_type num_dev{-1};
+  if (cudaGetDeviceCount(&num_dev) != cudaSuccess) { cudaGetLastError(); }
   return num_dev;
 }
 
@@ -58,7 +65,10 @@ struct cuda_set_device_raii {
     : old_device_{get_current_cuda_device()},
       needs_reset_{dev_id.value() >= 0 && old_device_ != dev_id}
   {
-    if (needs_reset_) { RMM_CUDA_TRY(cudaSetDevice(dev_id.value())); }
+    // Non-throwing, like rmm's RMM_ASSERT_CUDA_SUCCESS (no-op in release).
+    if (needs_reset_) {
+      if (cudaSetDevice(dev_id.value()) != cudaSuccess) { cudaGetLastError(); }
+    }
   }
 
   ~cuda_set_device_raii() noexcept

@@ -48,10 +48,18 @@ inline device_memory_resource* initial_resource(cuda_device_id /*id*/ = cuda_dev
 
 }  // namespace detail
 
+namespace detail {
+// get_current_cuda_device() returns -1 when no CUDA device exists (mirroring
+// rmm's non-throwing behavior); rmm's registry is a map so -1 is just a key,
+// but ours is an array — clamp to slot 0. GPU-free paths only ever construct
+// zero-sized containers, which never call the resource.
+inline int table_index(cuda_device_id id) noexcept { return id.value() < 0 ? 0 : id.value(); }
+}  // namespace detail
+
 inline device_memory_resource* get_per_device_resource(cuda_device_id id)
 {
   std::lock_guard<std::mutex> lock{detail::map_mutex()};
-  auto& slot = detail::resource_table()[id.value()];
+  auto& slot = detail::resource_table()[detail::table_index(id)];
   if (slot == nullptr) { slot = detail::initial_resource(id); }
   return slot;
 }
@@ -60,7 +68,7 @@ inline device_memory_resource* set_per_device_resource(cuda_device_id id,
                                                        device_memory_resource* new_mr)
 {
   std::lock_guard<std::mutex> lock{detail::map_mutex()};
-  auto& slot    = detail::resource_table()[id.value()];
+  auto& slot    = detail::resource_table()[detail::table_index(id)];
   auto* old_mr  = (slot == nullptr) ? detail::initial_resource(id) : slot;
   slot          = (new_mr == nullptr) ? detail::initial_resource(id) : new_mr;
   return old_mr;
