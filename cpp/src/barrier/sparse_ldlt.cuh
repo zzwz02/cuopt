@@ -19,6 +19,8 @@
 
 #include <raft/core/cublas_macros.hpp>
 #include <raft/core/nvtx.hpp>
+#include <raft/util/reduction.cuh>
+#include <raft/util/warp_constants.hpp>
 
 #include <cublas_v2.h>
 
@@ -399,6 +401,563 @@ __global__ void ldlt_backward_level_kernel(const i_t* level_cols,
 }
 
 // ---------------------------------------------------------------------------
+// Bundled (fused) level execution. Banded and grid-like problems produce
+// elimination trees that are long chains of tiny levels: per-level kernel
+// launches are then pure latency (LISWET: 9999 levels of one short column).
+// A bundle runs a contiguous range of consecutive light levels inside ONE
+// thread block, with __syncthreads() as the level barrier (global-memory
+// writes of a block are visible to the block after __syncthreads). Levels
+// with a single column use the whole block per column; wider levels assign
+// one warp per column. Both paths are deterministic: the k loop is
+// sequential per column and the reductions are fixed-order.
+// ---------------------------------------------------------------------------
+
+constexpr int bundle_block_dim = 256;
+
+template <typename i_t, typename f_t>
+__global__ void ldlt_factor_bundle_kernel(const i_t* level_ptr,
+                                          const i_t* level_cols,
+                                          i_t level_lo,
+                                          i_t level_hi,
+                                          const i_t* Lp,
+                                          const i_t* Li,
+                                          const i_t* rp_ptr,
+                                          const i_t* rp_col,
+                                          const i_t* rp_pos,
+                                          f_t* Lx,
+                                          f_t* D,
+                                          i_t* fail_flag,
+                                          i_t* static_pivot_count,
+                                          f_t static_pivot_tol,
+                                          bool positive_definite,
+                                          const i_t* perm,
+                                          i_t pivot_n_neg,
+                                          f_t pivot_neg_floor,
+                                          f_t pivot_pos_floor,
+                                          i_t* sign_corrections)
+{
+  const i_t lane    = static_cast<i_t>(threadIdx.x) & (raft::WarpSize - 1);
+  const i_t warp_id = static_cast<i_t>(threadIdx.x) >> raft::WarpSizeLog2;
+  const i_t n_warps = static_cast<i_t>(blockDim.x) >> raft::WarpSizeLog2;
+
+  for (i_t l = level_lo; l < level_hi; l++) {
+    const i_t lev_beg = level_ptr[l];
+    const i_t lev_cnt = level_ptr[l + 1] - lev_beg;
+    if (lev_cnt == 1) {
+      // Whole block on the single column (the chain case).
+      const i_t j       = level_cols[lev_beg];
+      const i_t col_beg = Lp[j];
+      const i_t col_end = Lp[j + 1];
+      for (i_t t = rp_ptr[j]; t < rp_ptr[j + 1]; t++) {
+        const i_t k    = rp_col[t];
+        const i_t p_jk = rp_pos[t];
+        const f_t ljk  = Lx[p_jk];
+        const f_t c    = ljk * D[k];
+        if (threadIdx.x == 0) { D[j] -= c * ljk; }
+        const i_t k_end = Lp[k + 1];
+        for (i_t p = p_jk + 1 + static_cast<i_t>(threadIdx.x); p < k_end;
+             p += static_cast<i_t>(blockDim.x)) {
+          const i_t i = Li[p];
+          i_t lo      = col_beg;
+          i_t hi      = col_end;
+          while (lo < hi) {
+            const i_t mid = lo + (hi - lo) / 2;
+            if (Li[mid] < i) {
+              lo = mid + 1;
+            } else {
+              hi = mid;
+            }
+          }
+          Lx[lo] -= c * Lx[p];
+        }
+        __syncthreads();
+      }
+      f_t dj          = D[j];
+      const f_t dj_in = dj;
+      const i_t bad   = ldlt_pivot_rule(dj,
+                                      perm[j],
+                                      pivot_n_neg,
+                                      pivot_neg_floor,
+                                      pivot_pos_floor,
+                                      static_pivot_tol,
+                                      positive_definite,
+                                      threadIdx.x == 0,
+                                      static_pivot_count,
+                                      sign_corrections);
+      if (bad) {
+        if (threadIdx.x == 0) { atomicCAS(fail_flag, i_t(0), j + 1); }
+      } else {
+        if (dj != dj_in && threadIdx.x == 0) { D[j] = dj; }
+        for (i_t p = col_beg + static_cast<i_t>(threadIdx.x); p < col_end;
+             p += static_cast<i_t>(blockDim.x)) {
+          Lx[p] /= dj;
+        }
+      }
+    } else {
+      // One warp per column of the level.
+      for (i_t c0 = warp_id; c0 < lev_cnt; c0 += n_warps) {
+        const i_t j       = level_cols[lev_beg + c0];
+        const i_t col_beg = Lp[j];
+        const i_t col_end = Lp[j + 1];
+        for (i_t t = rp_ptr[j]; t < rp_ptr[j + 1]; t++) {
+          const i_t k    = rp_col[t];
+          const i_t p_jk = rp_pos[t];
+          const f_t ljk  = Lx[p_jk];
+          const f_t c    = ljk * D[k];
+          if (lane == 0) { D[j] -= c * ljk; }
+          const i_t k_end = Lp[k + 1];
+          for (i_t p = p_jk + 1 + lane; p < k_end; p += raft::WarpSize) {
+            const i_t i = Li[p];
+            i_t lo      = col_beg;
+            i_t hi      = col_end;
+            while (lo < hi) {
+              const i_t mid = lo + (hi - lo) / 2;
+              if (Li[mid] < i) {
+                lo = mid + 1;
+              } else {
+                hi = mid;
+              }
+            }
+            Lx[lo] -= c * Lx[p];
+          }
+          __syncwarp();
+        }
+        f_t dj          = D[j];
+        const f_t dj_in = dj;
+        const i_t bad   = ldlt_pivot_rule(dj,
+                                        perm[j],
+                                        pivot_n_neg,
+                                        pivot_neg_floor,
+                                        pivot_pos_floor,
+                                        static_pivot_tol,
+                                        positive_definite,
+                                        lane == 0,
+                                        static_pivot_count,
+                                        sign_corrections);
+        if (bad) {
+          if (lane == 0) { atomicCAS(fail_flag, i_t(0), j + 1); }
+        } else {
+          if (dj != dj_in && lane == 0) { D[j] = dj; }
+          for (i_t p = col_beg + lane; p < col_end; p += raft::WarpSize) {
+            Lx[p] /= dj;
+          }
+        }
+      }
+    }
+    __syncthreads();  // level barrier
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chain (width-1 level run) kernels. A run of consecutive single-column
+// levels is a sequential dependency chain (banded problems: the whole etree).
+// Processing it level-by-level — even fused in one block — pays a global
+// round-trip per level. These kernels slide a window of chain_window columns
+// over the run: the window's column data lives in shared memory, external
+// contributions (columns before the window, already final in global memory)
+// are applied warp-parallel, and the unavoidable sequential sweep then runs
+// entirely in shared memory. Deterministic: per column, updates apply in row
+// pattern order; lanes write disjoint slots.
+// ---------------------------------------------------------------------------
+
+constexpr int chain_window  = 512;   // max columns per window
+constexpr int chain_col_cap = 32;    // max entries per chain column (analyze enforces)
+constexpr int chain_smem    = 1536;  // max window entries (host packs windows to this)
+
+// Binary search for v in s[lo, hi); returns its index (callers rely on the
+// factor-pattern guarantee that v is present for scatter targets).
+template <typename i_t>
+__device__ inline i_t ldlt_smem_search(const i_t* s, i_t lo, i_t hi, i_t v)
+{
+  while (lo < hi) {
+    const i_t mid = lo + (hi - lo) / 2;
+    if (s[mid] < v) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+// All chain metadata is resolved on the host at analyze time (the pattern is
+// static across the IPM iterations): window boundaries (win_ptr, positions
+// within the chain), each column's data offset inside its window's shared
+// buffer (smoff, window-relative), each row-pattern entry's window slot
+// (rp_slot, -1 = external) and each column entry's window slot (col_slot,
+// -1 = external), plus per-column op-list offsets (fop_off window-relative
+// prefix of in-window row-pattern entries). The kernels then touch global
+// memory only in the parallel load/external/store phases; the sequential
+// sweep runs entirely in shared memory.
+template <typename i_t, typename f_t>
+__global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
+                                         const i_t* win_ptr,
+                                         i_t n_windows,
+                                         const i_t* smoff,    // per chain position
+                                         const i_t* fop_off,  // per chain position
+                                         const i_t* rp_slot,  // per rp entry (global index)
+                                         const i_t* Lp,
+                                         const i_t* Li,
+                                         const i_t* rp_ptr,
+                                         const i_t* rp_col,
+                                         const i_t* rp_pos,
+                                         f_t* Lx,
+                                         f_t* D,
+                                         i_t* fail_flag,
+                                         i_t* static_pivot_count,
+                                         f_t static_pivot_tol,
+                                         bool positive_definite,
+                                         const i_t* perm,
+                                         i_t pivot_n_neg,
+                                         f_t pivot_neg_floor,
+                                         f_t pivot_pos_floor,
+                                         i_t* sign_corrections)
+{
+  __shared__ i_t s_cols[chain_window];
+  __shared__ i_t s_smoff[chain_window + 1];
+  __shared__ i_t s_fopoff[chain_window + 1];
+  __shared__ i_t s_perm[chain_window];
+  __shared__ f_t s_d[chain_window];
+  __shared__ i_t s_li[chain_smem];
+  __shared__ f_t s_lx[chain_smem];
+  __shared__ i_t s_op_slot[chain_smem];
+  __shared__ i_t s_op_q[chain_smem];
+
+  const i_t lane    = static_cast<i_t>(threadIdx.x) & (raft::WarpSize - 1);
+  const i_t warp_id = static_cast<i_t>(threadIdx.x) >> raft::WarpSizeLog2;
+  const i_t n_warps = static_cast<i_t>(blockDim.x) >> raft::WarpSizeLog2;
+
+  for (i_t w = 0; w < n_windows; w++) {
+    const i_t w0 = win_ptr[w];
+    const i_t we = win_ptr[w + 1] - w0;
+    // Load metadata, column data, diagonals.
+    for (i_t c = static_cast<i_t>(threadIdx.x); c < we; c += static_cast<i_t>(blockDim.x)) {
+      const i_t j  = chain_cols[w0 + c];
+      s_cols[c]    = j;
+      s_smoff[c]   = smoff[w0 + c];
+      s_fopoff[c]  = fop_off[w0 + c] - fop_off[w0];
+      s_perm[c]    = perm[j];
+      s_d[c]       = D[j];
+      if (c == we - 1) {
+        s_smoff[we]  = smoff[w0 + we - 1] + (Lp[j + 1] - Lp[j]);
+        s_fopoff[we] = fop_off[w0 + we] - fop_off[w0];
+      }
+    }
+    __syncthreads();
+    for (i_t c = warp_id; c < we; c += n_warps) {
+      const i_t j   = s_cols[c];
+      const i_t len = Lp[j + 1] - Lp[j];
+      for (i_t p = lane; p < len; p += raft::WarpSize) {
+        s_li[s_smoff[c] + p] = Li[Lp[j] + p];
+        s_lx[s_smoff[c] + p] = Lx[Lp[j] + p];
+      }
+    }
+    __syncthreads();
+    // External updates (final in global memory) + op-list construction.
+    for (i_t c = warp_id; c < we; c += n_warps) {
+      const i_t j = s_cols[c];
+      i_t n_ops   = 0;
+      for (i_t t = rp_ptr[j]; t < rp_ptr[j + 1]; t++) {
+        const i_t slot = rp_slot[t];
+        if (slot >= 0) {
+          if (lane == 0) {
+            const i_t k                    = rp_col[t];
+            s_op_slot[s_fopoff[c] + n_ops] = slot;
+            s_op_q[s_fopoff[c] + n_ops]    = rp_pos[t] - Lp[k] + s_smoff[slot];
+          }
+          n_ops++;
+          continue;
+        }
+        const i_t k    = rp_col[t];
+        const i_t p_jk = rp_pos[t];
+        const f_t ljk  = Lx[p_jk];
+        const f_t cku  = ljk * D[k];
+        if (lane == 0) { s_d[c] -= cku * ljk; }
+        const i_t k_end = Lp[k + 1];
+        for (i_t p = p_jk + 1 + lane; p < k_end; p += raft::WarpSize) {
+          const i_t idx = ldlt_smem_search(s_li, s_smoff[c], s_smoff[c + 1], Li[p]);
+          s_lx[idx] -= cku * Lx[p];
+        }
+        __syncwarp();
+      }
+    }
+    __syncthreads();
+    // Sequential in-window sweep (warp 0), entirely in shared memory.
+    if (warp_id == 0) {
+      for (i_t c = 0; c < we; c++) {
+        for (i_t o = s_fopoff[c]; o < s_fopoff[c + 1]; o++) {
+          const i_t slot = s_op_slot[o];
+          const i_t q    = s_op_q[o];
+          const f_t ljk  = s_lx[q];
+          const f_t cku  = ljk * s_d[slot];
+          if (lane == 0) { s_d[c] -= cku * ljk; }
+          for (i_t p = q + 1 + lane; p < s_smoff[slot + 1]; p += raft::WarpSize) {
+            const i_t idx = ldlt_smem_search(s_li, s_smoff[c], s_smoff[c + 1], s_li[p]);
+            s_lx[idx] -= cku * s_lx[p];
+          }
+          __syncwarp();
+        }
+        f_t dj        = s_d[c];
+        const i_t bad = ldlt_pivot_rule(dj,
+                                        s_perm[c],
+                                        pivot_n_neg,
+                                        pivot_neg_floor,
+                                        pivot_pos_floor,
+                                        static_pivot_tol,
+                                        positive_definite,
+                                        lane == 0,
+                                        static_pivot_count,
+                                        sign_corrections);
+        if (bad) {
+          if (lane == 0) { atomicCAS(fail_flag, i_t(0), s_cols[c] + 1); }
+        } else {
+          if (lane == 0) { s_d[c] = dj; }
+          for (i_t p = s_smoff[c] + lane; p < s_smoff[c + 1]; p += raft::WarpSize) {
+            s_lx[p] /= dj;
+          }
+        }
+        __syncwarp();
+      }
+    }
+    __syncthreads();
+    // Store the window back.
+    for (i_t c = warp_id; c < we; c += n_warps) {
+      const i_t j   = s_cols[c];
+      const i_t len = s_smoff[c + 1] - s_smoff[c];
+      for (i_t p = lane; p < len; p += raft::WarpSize) {
+        Lx[Lp[j] + p] = s_lx[s_smoff[c] + p];
+      }
+      if (lane == 0) { D[j] = s_d[c]; }
+    }
+    __syncthreads();
+  }
+}
+
+// Forward substitution over a chain: per window, external row entries
+// (rp_slot == -1) are reduced thread-parallel against final global y,
+// internal entries become (slot, value) ops, and the sequential sweep runs in
+// shared memory.
+template <typename i_t, typename f_t>
+__global__ void ldlt_forward_chain_kernel(const i_t* chain_cols,
+                                          const i_t* win_ptr,
+                                          i_t n_windows,
+                                          const i_t* fop_off,  // per chain position
+                                          const i_t* rp_slot,  // per rp entry
+                                          const i_t* rp_ptr,
+                                          const i_t* rp_col,
+                                          const i_t* rp_pos,
+                                          const f_t* Lx,
+                                          f_t* y)
+{
+  __shared__ i_t s_cols[chain_window];
+  __shared__ f_t s_y[chain_window];
+  __shared__ f_t s_ext[chain_window];
+  __shared__ i_t s_op_off[chain_window + 1];
+  __shared__ i_t s_op_slot[chain_smem];
+  __shared__ f_t s_op_val[chain_smem];
+
+  for (i_t w = 0; w < n_windows; w++) {
+    const i_t w0 = win_ptr[w];
+    const i_t we = win_ptr[w + 1] - w0;
+    for (i_t c = static_cast<i_t>(threadIdx.x); c < we; c += static_cast<i_t>(blockDim.x)) {
+      const i_t j = chain_cols[w0 + c];
+      s_cols[c]   = j;
+      s_y[c]      = y[j];
+      s_op_off[c] = fop_off[w0 + c] - fop_off[w0];
+      if (c == we - 1) { s_op_off[we] = fop_off[w0 + we] - fop_off[w0]; }
+    }
+    __syncthreads();
+    // Split row entries: external -> partial sums now; internal -> op list.
+    for (i_t c = static_cast<i_t>(threadIdx.x); c < we; c += static_cast<i_t>(blockDim.x)) {
+      const i_t j = s_cols[c];
+      f_t partial = f_t(0);
+      i_t n_in    = 0;
+      for (i_t t = rp_ptr[j]; t < rp_ptr[j + 1]; t++) {
+        const i_t slot = rp_slot[t];
+        if (slot >= 0) {
+          s_op_slot[s_op_off[c] + n_in] = slot;
+          s_op_val[s_op_off[c] + n_in]  = Lx[rp_pos[t]];
+          n_in++;
+        } else {
+          partial += Lx[rp_pos[t]] * y[rp_col[t]];
+        }
+      }
+      s_ext[c] = partial;
+    }
+    __syncthreads();
+    // Sequential sweep in shared memory.
+    if (threadIdx.x == 0) {
+      for (i_t c = 0; c < we; c++) {
+        f_t v = s_y[c] - s_ext[c];
+        for (i_t o = s_op_off[c]; o < s_op_off[c + 1]; o++) {
+          v -= s_op_val[o] * s_y[s_op_slot[o]];
+        }
+        s_y[c] = v;
+      }
+    }
+    __syncthreads();
+    for (i_t c = static_cast<i_t>(threadIdx.x); c < we; c += static_cast<i_t>(blockDim.x)) {
+      y[s_cols[c]] = s_y[c];
+    }
+    __syncthreads();
+  }
+}
+
+// Backward substitution over a chain (windows and the in-window sweep run in
+// reverse). Column entries point to later columns: in-window ones (col_slot
+// >= 0) become (slot, value) ops against s_y; the rest read final global y.
+template <typename i_t, typename f_t>
+__global__ void ldlt_backward_chain_kernel(const i_t* chain_cols,
+                                           const i_t* win_ptr,
+                                           i_t n_windows,
+                                           const i_t* bop_off,   // per chain position
+                                           const i_t* col_slot,  // per column entry
+                                           const i_t* Lp,
+                                           const i_t* Li,
+                                           const f_t* Lx,
+                                           f_t* y)
+{
+  __shared__ i_t s_cols[chain_window];
+  __shared__ f_t s_y[chain_window];
+  __shared__ f_t s_ext[chain_window];
+  __shared__ i_t s_op_off[chain_window + 1];
+  __shared__ i_t s_op_slot[chain_smem];
+  __shared__ f_t s_op_val[chain_smem];
+
+  for (i_t w = n_windows - 1; w >= 0; w--) {
+    const i_t w0 = win_ptr[w];
+    const i_t we = win_ptr[w + 1] - w0;
+    for (i_t c = static_cast<i_t>(threadIdx.x); c < we; c += static_cast<i_t>(blockDim.x)) {
+      const i_t j = chain_cols[w0 + c];
+      s_cols[c]   = j;
+      s_y[c]      = y[j];
+      s_op_off[c] = bop_off[w0 + c] - bop_off[w0];
+      if (c == we - 1) { s_op_off[we] = bop_off[w0 + we] - bop_off[w0]; }
+    }
+    __syncthreads();
+    for (i_t c = static_cast<i_t>(threadIdx.x); c < we; c += static_cast<i_t>(blockDim.x)) {
+      const i_t j = s_cols[c];
+      f_t partial = f_t(0);
+      i_t n_in    = 0;
+      for (i_t p = Lp[j]; p < Lp[j + 1]; p++) {
+        const i_t slot = col_slot[p];
+        if (slot >= 0) {
+          s_op_slot[s_op_off[c] + n_in] = slot;
+          s_op_val[s_op_off[c] + n_in]  = Lx[p];
+          n_in++;
+        } else {
+          partial += Lx[p] * y[Li[p]];
+        }
+      }
+      s_ext[c] = partial;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      for (i_t c = we - 1; c >= 0; c--) {
+        f_t v = s_y[c] - s_ext[c];
+        for (i_t o = s_op_off[c]; o < s_op_off[c + 1]; o++) {
+          v -= s_op_val[o] * s_y[s_op_slot[o]];
+        }
+        s_y[c] = v;
+      }
+    }
+    __syncthreads();
+    for (i_t c = static_cast<i_t>(threadIdx.x); c < we; c += static_cast<i_t>(blockDim.x)) {
+      y[s_cols[c]] = s_y[c];
+    }
+    __syncthreads();
+  }
+}
+
+// Forward substitution over a bundle of levels: y[j] -= row_j(L) . y.
+template <typename i_t, typename f_t>
+__global__ void ldlt_forward_bundle_kernel(const i_t* level_ptr,
+                                           const i_t* level_cols,
+                                           i_t level_lo,
+                                           i_t level_hi,
+                                           const i_t* rp_ptr,
+                                           const i_t* rp_col,
+                                           const i_t* rp_pos,
+                                           const f_t* Lx,
+                                           f_t* y)
+{
+  __shared__ f_t sdata[bundle_block_dim];
+  const i_t lane    = static_cast<i_t>(threadIdx.x) & (raft::WarpSize - 1);
+  const i_t warp_id = static_cast<i_t>(threadIdx.x) >> raft::WarpSizeLog2;
+  const i_t n_warps = static_cast<i_t>(blockDim.x) >> raft::WarpSizeLog2;
+
+  for (i_t l = level_lo; l < level_hi; l++) {
+    const i_t lev_beg = level_ptr[l];
+    const i_t lev_cnt = level_ptr[l + 1] - lev_beg;
+    if (lev_cnt == 1) {
+      const i_t j = level_cols[lev_beg];
+      f_t partial = f_t(0);
+      for (i_t t = rp_ptr[j] + static_cast<i_t>(threadIdx.x); t < rp_ptr[j + 1];
+           t += static_cast<i_t>(blockDim.x)) {
+        partial += Lx[rp_pos[t]] * y[rp_col[t]];
+      }
+      const f_t s = ldlt_block_reduce(partial, sdata);
+      if (threadIdx.x == 0) { y[j] -= s; }
+    } else {
+      for (i_t c0 = warp_id; c0 < lev_cnt; c0 += n_warps) {
+        const i_t j = level_cols[lev_beg + c0];
+        f_t partial = f_t(0);
+        for (i_t t = rp_ptr[j] + lane; t < rp_ptr[j + 1]; t += raft::WarpSize) {
+          partial += Lx[rp_pos[t]] * y[rp_col[t]];
+        }
+        const f_t s = raft::warpReduce(partial);
+        if (lane == 0) { y[j] -= s; }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Backward substitution over a bundle of levels (levels run in reverse):
+// y[j] -= col_j(L) . y.
+template <typename i_t, typename f_t>
+__global__ void ldlt_backward_bundle_kernel(const i_t* level_ptr,
+                                            const i_t* level_cols,
+                                            i_t level_lo,
+                                            i_t level_hi,
+                                            const i_t* Lp,
+                                            const i_t* Li,
+                                            const f_t* Lx,
+                                            f_t* y)
+{
+  __shared__ f_t sdata[bundle_block_dim];
+  const i_t lane    = static_cast<i_t>(threadIdx.x) & (raft::WarpSize - 1);
+  const i_t warp_id = static_cast<i_t>(threadIdx.x) >> raft::WarpSizeLog2;
+  const i_t n_warps = static_cast<i_t>(blockDim.x) >> raft::WarpSizeLog2;
+
+  for (i_t l = level_hi - 1; l >= level_lo; l--) {
+    const i_t lev_beg = level_ptr[l];
+    const i_t lev_cnt = level_ptr[l + 1] - lev_beg;
+    if (lev_cnt == 1) {
+      const i_t j = level_cols[lev_beg];
+      f_t partial = f_t(0);
+      for (i_t p = Lp[j] + static_cast<i_t>(threadIdx.x); p < Lp[j + 1];
+           p += static_cast<i_t>(blockDim.x)) {
+        partial += Lx[p] * y[Li[p]];
+      }
+      const f_t s = ldlt_block_reduce(partial, sdata);
+      if (threadIdx.x == 0) { y[j] -= s; }
+    } else {
+      for (i_t c0 = warp_id; c0 < lev_cnt; c0 += n_warps) {
+        const i_t j = level_cols[lev_beg + c0];
+        f_t partial = f_t(0);
+        for (i_t p = Lp[j] + lane; p < Lp[j + 1]; p += raft::WarpSize) {
+          partial += Lx[p] * y[Li[p]];
+        }
+        const f_t s = raft::warpReduce(partial);
+        if (lane == 0) { y[j] -= s; }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Dense-tail kernels. The trailing columns of an AMD-ordered factor are nearly
 // dense and form the long sequential path of the elimination tree; they are
 // factored as one dense LDL^T block (column-major, dimension tail_dim, column
@@ -640,6 +1199,100 @@ __global__ void ldlt_forward_tail_couple_kernel(i_t tail_start,
   if (threadIdx.x == 0) { y[j] -= s; }
 }
 
+// Postorder of the elimination tree (iterative DFS, children in index order).
+template <typename i_t>
+inline std::vector<i_t> ldlt_etree_postorder(const std::vector<i_t>& parent)
+{
+  const i_t n = static_cast<i_t>(parent.size());
+  // Build child lists (head/next).
+  std::vector<i_t> head(n, -1), next(n, -1), post(n), stack(n);
+  for (i_t j = n - 1; j >= 0; j--) {
+    const i_t p = parent[j];
+    if (p != -1) {
+      next[j] = head[p];
+      head[p] = j;
+    }
+  }
+  i_t k = 0;
+  for (i_t root = 0; root < n; root++) {
+    if (parent[root] != -1) { continue; }
+    i_t top      = 0;
+    stack[top]   = root;
+    while (top >= 0) {
+      const i_t j = stack[top];
+      const i_t c = head[j];
+      if (c == -1) {
+        post[k++] = j;
+        top--;
+      } else {
+        head[j]    = next[c];  // pop child from list
+        stack[++top] = c;
+      }
+    }
+  }
+  return post;
+}
+
+// Exact column counts of the Cholesky factor (Gilbert-Ng-Peyton, the
+// cs_counts algorithm from Davis, "Direct Methods for Sparse Linear
+// Systems"): colcount[j] = |{i >= j : L(i, j) != 0}| including the diagonal,
+// in O(nnz * alpha(n)) without forming the patterns. lc[j] must hold the
+// strict lower pattern of (permuted) column j, i.e. { i > j : A(i, j) != 0 }.
+template <typename i_t>
+inline std::vector<i_t> ldlt_column_counts(const std::vector<std::vector<i_t>>& lc,
+                                           const std::vector<i_t>& parent,
+                                           const std::vector<i_t>& post)
+{
+  const i_t n = static_cast<i_t>(parent.size());
+  std::vector<i_t> colcount(n), first(n, -1), maxfirst(n, -1), prevleaf(n, -1), ancestor(n);
+  // first[j] = postorder index of the first descendant of j; a node is a leaf
+  // of the etree iff it is its own first descendant.
+  for (i_t k = 0; k < n; k++) {
+    i_t j       = post[k];
+    colcount[j] = (first[j] == -1) ? 1 : 0;  // delta init: leaves count themselves
+    for (; j != -1 && first[j] == -1; j = parent[j]) {
+      first[j] = k;
+    }
+  }
+  for (i_t i = 0; i < n; i++) {
+    ancestor[i] = i;
+  }
+  for (i_t k = 0; k < n; k++) {
+    const i_t j = post[k];
+    if (parent[j] != -1) { colcount[parent[j]]--; }  // j contributes its subtree once
+    for (const i_t i : lc[j]) {
+      // j is a new leaf of the i-th row subtree?
+      if (first[j] > maxfirst[i]) {
+        maxfirst[i] = first[j];
+        colcount[j]++;
+        const i_t pl = prevleaf[i];
+        if (pl != -1) {
+          // Subtract the overlap at the least common ancestor of the previous
+          // leaf and j (union-find with path compression).
+          i_t q = pl;
+          while (q != ancestor[q]) {
+            q = ancestor[q];
+          }
+          for (i_t s = pl; s != q;) {
+            const i_t s_next = ancestor[s];
+            ancestor[s]      = q;
+            s                = s_next;
+          }
+          colcount[q]--;
+        }
+        prevleaf[i] = j;
+      }
+    }
+    if (parent[j] != -1) { ancestor[j] = parent[j]; }
+  }
+  // Accumulate the deltas up the tree (children before parents).
+  for (i_t k = 0; k < n; k++) {
+    const i_t j = post[k];
+    if (parent[j] != -1) { colcount[parent[j]] += colcount[j]; }
+  }
+  return colcount;
+}
+
 }  // namespace ldlt_detail
 
 // Sparse LDL^T factorization of a symmetric matrix A (stored with both triangles,
@@ -686,8 +1339,15 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_a2l_(0, handle_ptr->get_stream()),
       d_level_cols_(0, handle_ptr->get_stream()),
       d_head_level_cols_(0, handle_ptr->get_stream()),
+      d_head_level_ptr_(0, handle_ptr->get_stream()),
       d_tail_seg_(0, handle_ptr->get_stream()),
       d_rp_head_end_(0, handle_ptr->get_stream()),
+      d_chain_win_(0, handle_ptr->get_stream()),
+      d_chain_smoff_(0, handle_ptr->get_stream()),
+      d_chain_fop_off_(0, handle_ptr->get_stream()),
+      d_chain_bop_off_(0, handle_ptr->get_stream()),
+      d_chain_rp_slot_(0, handle_ptr->get_stream()),
+      d_chain_col_slot_(0, handle_ptr->get_stream()),
       d_schur_light_(0, handle_ptr->get_stream()),
       d_schur_heavy_(0, handle_ptr->get_stream()),
       d_dense_(0, handle_ptr->get_stream()),
@@ -876,48 +1536,225 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     return settings_.concurrent_halt != nullptr && *settings_.concurrent_halt == 1;
   }
 
-  // Picks the dimension of the dense trailing block. Driven by the level
-  // schedule: the tail must absorb the top of the elimination tree so that
-  // the remaining head schedule has bounded depth (the near-root chains are
-  // what serialize the level kernels). A density check extends the block over
-  // any almost-dense trailing region. Capped by device memory; dense flops
-  // are cheap compared to the chain-serialized sparse kernels.
-  i_t choose_tail_dim(const std::vector<i_t>& level)
+  // Picks the dense trailing block from the exact factor column counts: the
+  // largest trailing block whose true fill density clears a threshold (the
+  // genuinely dense top of the elimination tree, e.g. fill-heavy AMD factors).
+  // Sparse tops — banded/grid problems whose chains used to be absorbed here
+  // for scheduling reasons — are left to the bundled level kernels instead of
+  // being densified. Capped by device memory.
+  void choose_tail_density()
   {
-    if (use_host_numeric_) { return 0; }
-    if (settings_.cudss_deterministic) { return 0; }  // Schur assembly uses atomics
+    tail_dim_   = 0;
+    tail_start_ = n_;
+    if (use_host_numeric_) { return; }
+    if (settings_.cudss_deterministic) { return; }  // Schur assembly uses atomics
     const char* env = std::getenv("CUOPT_LDLT_TAIL");
     i_t forced      = env != nullptr ? std::atoi(env) : -1;
-    if (env != nullptr && forced <= 0) { return 0; }
+    if (env != nullptr && forced <= 0) { return; }
 
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { return 0; }
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { return; }
     const i_t d_mem = static_cast<i_t>(std::sqrt(0.30 * static_cast<double>(free_b) / 8.0));
     const i_t d_cap = std::min<i_t>(n_, d_mem);
-    if (forced > 0) { return std::min(forced, d_cap); }
-    if (n_ < 256) { return 0; }
+    if (forced > 0) {
+      tail_dim_   = std::min(forced, d_cap);
+      tail_start_ = n_ - tail_dim_;
+      return;
+    }
+    if (n_ < 256) { return; }
 
-    // Level-driven: the smallest split such that all head columns sit in the
-    // first head_level_target levels.
-    constexpr i_t head_level_target = 512;
-    i_t jstar                       = n_;
-    i_t prefix_max                  = 0;
-    for (i_t j = 0; j < n_; j++) {
-      prefix_max = std::max(prefix_max, level[j]);
-      if (prefix_max > head_level_target) {
-        jstar = j;
-        break;
+    const char* tau_env = std::getenv("CUOPT_LDLT_TAIL_DENSITY");
+    const double tau    = tau_env != nullptr ? std::atof(tau_env) : 0.5;
+
+    int64_t suffix_nnz = 0;  // strict-lower entries of columns >= t (all live in the block)
+    i_t best_t         = n_;
+    for (i_t t = n_ - 1; t >= 0 && n_ - t <= d_cap; t--) {
+      suffix_nnz += col_counts_[t] - 1;
+      const i_t d = n_ - t;
+      if (d >= 128) {
+        const double area = 0.5 * static_cast<double>(d) * static_cast<double>(d - 1);
+        if (static_cast<double>(suffix_nnz) >= tau * area) { best_t = t; }
       }
     }
-    i_t d_level = n_ - jstar;
+    if (best_t < n_) {
+      tail_start_ = best_t;
+      tail_dim_   = n_ - best_t;
+    }
+  }
 
-    // Density-based extension over near-dense boundary bands happens later,
-    // once the head column counts are known (see the refine loop in
-    // analyze_pattern); the level criterion here only has to absorb the
-    // sequential chains.
-    i_t d = d_level;
-    if (d < 128) { return 0; }
-    return std::min(d, d_cap);
+  // Groups consecutive light head levels into bundled segments executed by a
+  // single kernel launch (see ldlt_factor_bundle_kernel). Heavy levels stay
+  // on the per-level grid kernels. Separate plans for the factorization and
+  // the two triangular solves, since their per-level work differs. A bundle
+  // of width-1 micro levels (chains) runs on a single warp.
+  void build_level_bundles()
+  {
+    factor_segs_.clear();
+    fwd_segs_.clear();
+    bwd_segs_.clear();
+    if (n_head_levels_ == 0) { return; }
+
+    constexpr i_t max_bundle_cols     = 64;
+    constexpr int64_t max_bundle_work = 4096;
+    constexpr i_t chain_min_levels    = 64;  // below one window a plain bundle is fine
+
+    std::vector<int64_t> factor_work(n_head_levels_, 0);
+    std::vector<int64_t> fwd_work(n_head_levels_, 0);
+    std::vector<int64_t> bwd_work(n_head_levels_, 0);
+    std::vector<i_t> width(n_head_levels_, 0);
+    std::vector<char> chain_ok(n_head_levels_, 0);
+    for (i_t l = 0; l < n_head_levels_; l++) {
+      width[l] = head_level_ptr_[l + 1] - head_level_ptr_[l];
+      for (i_t t = head_level_ptr_[l]; t < head_level_ptr_[l + 1]; t++) {
+        const i_t j      = head_level_cols_[t];
+        const i_t rp_len = rp_ptr_[j + 1] - rp_ptr_[j];
+        const i_t c_len  = Lp_[j + 1] - Lp_[j];
+        int64_t scatter  = 0;
+        for (i_t u = rp_ptr_[j]; u < rp_ptr_[j + 1]; u++) {
+          scatter += Lp_[rp_col_[u] + 1] - rp_pos_[u] - 1;
+        }
+        factor_work[l] += rp_len + scatter + c_len;
+        fwd_work[l] += rp_len;
+        bwd_work[l] += c_len;
+        if (width[l] == 1) {
+          chain_ok[l] = rp_len <= ldlt_detail::chain_col_cap && c_len <= ldlt_detail::chain_col_cap;
+        }
+      }
+    }
+    // Length of the chain-eligible run starting at each level.
+    std::vector<i_t> chain_run(n_head_levels_ + 1, 0);
+    for (i_t l = n_head_levels_ - 1; l >= 0; l--) {
+      chain_run[l] = chain_ok[l] ? chain_run[l + 1] + 1 : 0;
+    }
+
+    auto build = [&](std::vector<level_seg_t>& segs, const std::vector<int64_t>& work) {
+      auto chain_here = [&](i_t l) { return chain_ok[l] && chain_run[l] >= chain_min_levels; };
+      i_t l           = 0;
+      while (l < n_head_levels_) {
+        if (chain_here(l)) {
+          segs.push_back({l, l + chain_run[l], 2, ldlt_detail::bundle_block_dim});
+          l += chain_run[l];
+          continue;
+        }
+        const bool can_bundle = width[l] <= max_bundle_cols && work[l] <= max_bundle_work;
+        if (!can_bundle) {
+          segs.push_back({l, l + 1, 0, 0});
+          l++;
+          continue;
+        }
+        i_t hi = l;
+        while (hi < n_head_levels_ && width[hi] <= max_bundle_cols &&
+               work[hi] <= max_bundle_work && !chain_here(hi)) {
+          hi++;
+        }
+        segs.push_back({l, hi, 1, ldlt_detail::bundle_block_dim});
+        l = hi;
+      }
+    };
+    build(factor_segs_, factor_work);
+    build(fwd_segs_, fwd_work);
+    build(bwd_segs_, bwd_work);
+
+    // Chain window metadata: window boundaries (shared-memory capacity
+    // driven), per-column data offsets inside the window buffer, the window
+    // slot of every row-pattern / column entry (-1 = external), and running
+    // in-window op prefixes. The pattern is static, so everything the
+    // sequential sweeps need is resolved here once.
+    chain_win_.clear();
+    chain_smoff_.assign(tail_start_ + 1, 0);
+    chain_fop_off_.assign(tail_start_ + 1, 0);
+    chain_bop_off_.assign(tail_start_ + 1, 0);
+    chain_rp_slot_.assign(nnz_L_, -1);
+    chain_col_slot_.assign(nnz_L_, -1);
+    for (auto& seg : factor_segs_) {
+      if (seg.bundled != 2) { continue; }
+      const i_t base    = head_level_ptr_[seg.lo];
+      const i_t n_chain = seg.hi - seg.lo;
+      seg.win_begin     = static_cast<i_t>(chain_win_.size());
+      chain_win_.push_back(0);
+      i_t w_start = 0, cum_len = 0, cum_rp = 0;
+      for (i_t i = 0; i < n_chain; i++) {
+        const i_t j    = head_level_cols_[base + i];
+        const i_t clen = Lp_[j + 1] - Lp_[j];
+        const i_t rlen = rp_ptr_[j + 1] - rp_ptr_[j];
+        if (i > w_start && (cum_len + clen > ldlt_detail::chain_smem ||
+                            cum_rp + rlen > ldlt_detail::chain_smem ||
+                            i - w_start >= ldlt_detail::chain_window)) {
+          chain_win_.push_back(i);
+          w_start = i;
+          cum_len = 0;
+          cum_rp  = 0;
+        }
+        chain_smoff_[base + i] = cum_len;
+        cum_len += clen;
+        cum_rp += rlen;
+      }
+      chain_win_.push_back(n_chain);
+      seg.win_count = static_cast<i_t>(chain_win_.size()) - seg.win_begin - 1;
+
+      i_t fop = 0, bop = 0;
+      for (i_t w = 0; w < seg.win_count; w++) {
+        const i_t w0     = chain_win_[seg.win_begin + w];
+        const i_t w1     = chain_win_[seg.win_begin + w + 1];
+        const i_t* wcols = head_level_cols_.data() + base + w0;  // ascending along the chain
+        const i_t wn     = w1 - w0;
+        for (i_t i = w0; i < w1; i++) {
+          const i_t j              = head_level_cols_[base + i];
+          chain_fop_off_[base + i] = fop;
+          for (i_t t = rp_ptr_[j]; t < rp_ptr_[j + 1]; t++) {
+            const i_t* it = std::lower_bound(wcols, wcols + wn, rp_col_[t]);
+            if (it != wcols + wn && *it == rp_col_[t]) {
+              chain_rp_slot_[t] = static_cast<i_t>(it - wcols);
+              fop++;
+            }
+          }
+          chain_bop_off_[base + i] = bop;
+          for (i_t p = Lp_[j]; p < Lp_[j + 1]; p++) {
+            const i_t* it = std::lower_bound(wcols, wcols + wn, Li_[p]);
+            if (it != wcols + wn && *it == Li_[p]) {
+              chain_col_slot_[p] = static_cast<i_t>(it - wcols);
+              bop++;
+            }
+          }
+        }
+      }
+      chain_fop_off_[base + n_chain] = fop;
+      chain_bop_off_[base + n_chain] = bop;
+    }
+    // The solve plans classify chains identically; share the window metadata.
+    for (auto* segs : {&fwd_segs_, &bwd_segs_}) {
+      for (auto& seg : *segs) {
+        if (seg.bundled != 2) { continue; }
+        for (const auto& fs : factor_segs_) {
+          if (fs.bundled == 2 && fs.lo == seg.lo && fs.hi == seg.hi) {
+            seg.win_begin = fs.win_begin;
+            seg.win_count = fs.win_count;
+            break;
+          }
+        }
+      }
+    }
+
+    if (std::getenv("CUOPT_LDLT_PIVDBG") != nullptr) {
+      auto stat = [&](const char* name, const std::vector<level_seg_t>& segs) {
+        i_t per = 0, bun = 0, chn = 0;
+        for (const auto& s : segs) {
+          per += (s.bundled == 0);
+          bun += (s.bundled == 1);
+          chn += (s.bundled == 2);
+        }
+        fprintf(stderr,
+                "[ldlt] %s segs: %d per-level, %d bundles, %d chains (levels=%d)\n",
+                name,
+                per,
+                bun,
+                chn,
+                n_head_levels_);
+      };
+      stat("factor", factor_segs_);
+      stat("fwd", fwd_segs_);
+      stat("bwd", bwd_segs_);
+    }
   }
 
   // Threshold below which a pivot is replaced rather than divided by:
@@ -931,10 +1768,228 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     return std::max(rel_tol * max_abs_diag, abs_tol_floor);
   }
 
+  // Banded-matrix nested dissection: for a matrix that is banded (half
+  // bandwidth bw) in its natural order, AMD keeps a near-natural order whose
+  // elimination tree is one n-long chain — the level-scheduled factorization
+  // and solves then serialize completely (LISWET-class problems). Recursive
+  // index bisection with the bw coupling columns as separators (ordered
+  // last) is an exact nested dissection for banded graphs: the etree depth
+  // drops to O(bw log n) with geometrically wide levels, at a modest fill
+  // increase. Returns false if the matrix is not narrow-banded.
+  // Reverse Cuthill-McKee over the symmetric pattern, restricted to the
+  // vertices with mask == 0 (spike columns are excluded). Returns the RCM
+  // order (vertex list); long thin graphs (staircase/period-coupled
+  // dynamics) become narrow-banded in this order even when the natural index
+  // order is not.
+  std::vector<i_t> compute_rcm_order(const std::vector<char>& mask) const
+  {
+    std::vector<i_t> order;
+    order.reserve(n_);
+    std::vector<i_t> deg(n_, 0);
+    for (i_t j = 0; j < n_; j++) {
+      if (mask[j]) { continue; }
+      for (i_t p = a_rowptr_host_[j]; p < a_rowptr_host_[j + 1]; p++) {
+        const i_t c = a_colidx_host_[p];
+        if (c != j && !mask[c]) { deg[j]++; }
+      }
+    }
+    std::vector<char> visited(mask.begin(), mask.end());
+    std::vector<i_t> queue;
+    queue.reserve(n_);
+    for (i_t start0 = 0; start0 < n_; start0++) {
+      if (visited[start0]) { continue; }
+      // pseudo-peripheral start: two BFS sweeps from the component's first
+      // vertex, restart from the last-visited minimum-degree vertex.
+      i_t start = start0;
+      for (int sweep = 0; sweep < 2; sweep++) {
+        queue.clear();
+        queue.push_back(start);
+        std::vector<i_t> seen{start};
+        std::vector<char> in_bfs(n_, 0);
+        in_bfs[start] = 1;
+        size_t qh     = 0;
+        i_t last      = start;
+        while (qh < queue.size()) {
+          const i_t v = queue[qh++];
+          last        = v;
+          for (i_t p = a_rowptr_host_[v]; p < a_rowptr_host_[v + 1]; p++) {
+            const i_t c = a_colidx_host_[p];
+            if (c == v || visited[c] || in_bfs[c]) { continue; }
+            in_bfs[c] = 1;
+            queue.push_back(c);
+          }
+        }
+        start = last;
+      }
+      // RCM BFS from the chosen start, neighbors by ascending degree.
+      queue.clear();
+      queue.push_back(start);
+      visited[start] = 1;
+      size_t qh      = 0;
+      std::vector<i_t> nbrs;
+      while (qh < queue.size()) {
+        const i_t v = queue[qh++];
+        order.push_back(v);
+        nbrs.clear();
+        for (i_t p = a_rowptr_host_[v]; p < a_rowptr_host_[v + 1]; p++) {
+          const i_t c = a_colidx_host_[p];
+          if (c == v || visited[c]) { continue; }
+          visited[c] = 1;
+          nbrs.push_back(c);
+        }
+        std::sort(nbrs.begin(), nbrs.end(), [&](i_t a, i_t b) {
+          return deg[a] < deg[b] || (deg[a] == deg[b] && a < b);
+        });
+        for (i_t c : nbrs) {
+          queue.push_back(c);
+        }
+      }
+    }
+    std::reverse(order.begin(), order.end());
+    return order;
+  }
+
+  bool compute_banded_nd_ordering()
+  {
+    constexpr i_t nd_bw_cap   = 40;
+    constexpr i_t nd_min_size = 1024;
+    if (n_ < nd_min_size) { return false; }
+    // Columns owning entries beyond the band cap become "spikes" (e.g. a
+    // wrap-around constraint, dense-ish rows): they are ordered last, like a
+    // root separator, and the band test applies to the rest.
+    std::vector<char> spike(n_, 0);
+    for (i_t r = 0; r < n_; r++) {
+      for (i_t p = a_rowptr_host_[r]; p < a_rowptr_host_[r + 1]; p++) {
+        if (std::abs(r - a_colidx_host_[p]) > nd_bw_cap) {
+          spike[r]                 = 1;
+          spike[a_colidx_host_[p]] = 1;
+        }
+      }
+    }
+    i_t n_spikes = 0;
+    for (i_t j = 0; j < n_; j++) {
+      n_spikes += spike[j];
+    }
+    const i_t spike_cap = std::max<i_t>(32, n_ / 64);
+    std::vector<i_t> nsq;
+    if (n_spikes > spike_cap) {
+      // Not banded in the natural order: try the RCM order instead (without
+      // spikes — RCM itself decides nothing about them, so retry with a
+      // dense-degree-based spike set: vertices whose degree is far above the
+      // median act like dense rows).
+      std::vector<i_t> sdeg(n_, 0);
+      for (i_t r = 0; r < n_; r++) {
+        sdeg[r] = a_rowptr_host_[r + 1] - a_rowptr_host_[r];
+      }
+      std::vector<i_t> tmp(sdeg);
+      std::nth_element(tmp.begin(), tmp.begin() + n_ / 2, tmp.end());
+      const i_t med_deg = std::max<i_t>(2, tmp[n_ / 2]);
+      std::fill(spike.begin(), spike.end(), 0);
+      n_spikes = 0;
+      for (i_t j = 0; j < n_; j++) {
+        if (sdeg[j] > 8 * med_deg) {
+          spike[j] = 1;
+          n_spikes++;
+        }
+      }
+      if (n_spikes > spike_cap) { return false; }
+      nsq = compute_rcm_order(spike);
+      // Bandwidth in RCM positions.
+      std::vector<i_t> pos_r(n_, -1);
+      for (i_t q = 0; q < static_cast<i_t>(nsq.size()); q++) {
+        pos_r[nsq[q]] = q;
+      }
+      i_t bw_rcm = 1;
+      for (i_t r = 0; r < n_ && bw_rcm <= nd_bw_cap; r++) {
+        if (spike[r]) { continue; }
+        for (i_t p = a_rowptr_host_[r]; p < a_rowptr_host_[r + 1]; p++) {
+          const i_t c = a_colidx_host_[p];
+          if (spike[c]) { continue; }
+          bw_rcm = std::max(bw_rcm, std::abs(pos_r[r] - pos_r[c]));
+        }
+      }
+      if (bw_rcm > nd_bw_cap) {
+        if (std::getenv("CUOPT_LDLT_PIVDBG") != nullptr) {
+          fprintf(stderr,
+                  "[ldlt] banded ND rejected: natural spikes=%d, RCM bw=%d (cap %d)\n",
+                  n_spikes,
+                  bw_rcm,
+                  nd_bw_cap);
+        }
+        return false;
+      }
+    } else {
+      // Positions of non-spike indices; position distance <= index distance,
+      // so a bw-wide position separator is a valid banded separator.
+      nsq.reserve(n_ - n_spikes);
+      for (i_t j = 0; j < n_; j++) {
+        if (!spike[j]) { nsq.push_back(j); }
+      }
+    }
+    const i_t nn = static_cast<i_t>(nsq.size());
+    std::vector<i_t> pos(n_, -1);
+    for (i_t q = 0; q < nn; q++) {
+      pos[nsq[q]] = q;
+    }
+    i_t bw = 1;
+    for (i_t r = 0; r < n_; r++) {
+      if (spike[r]) { continue; }
+      for (i_t p = a_rowptr_host_[r]; p < a_rowptr_host_[r + 1]; p++) {
+        const i_t c = a_colidx_host_[p];
+        if (spike[c]) { continue; }
+        bw = std::max(bw, std::abs(pos[r] - pos[c]));
+      }
+    }
+    if (std::getenv("CUOPT_LDLT_PIVDBG") != nullptr) {
+      fprintf(stderr, "[ldlt] banded ND: bw=%d spikes=%d n=%d\n", bw, n_spikes, n_);
+    }
+
+    perm_.clear();
+    perm_.reserve(n_);
+    const i_t leaf_size = std::max<i_t>(2 * bw, 64);
+    // Iterative post-order bisection over positions: emit [lo, hi) interiors
+    // first, the separator [mid - bw + 1, mid] last.
+    struct span_t {
+      i_t lo, hi;
+      bool expanded;
+    };
+    std::vector<span_t> stack{{0, nn, false}};
+    while (!stack.empty()) {
+      span_t s = stack.back();
+      stack.pop_back();
+      const i_t len = s.hi - s.lo;
+      if (len <= 0) { continue; }
+      if (!s.expanded && len <= leaf_size) {
+        for (i_t q = s.lo; q < s.hi; q++) {
+          perm_.push_back(nsq[q]);
+        }
+        continue;
+      }
+      if (s.expanded) {
+        // children done: emit the separator
+        const i_t mid = s.lo + len / 2;
+        for (i_t q = mid - bw + 1; q <= mid; q++) {
+          perm_.push_back(nsq[q]);
+        }
+        continue;
+      }
+      const i_t mid = s.lo + len / 2;
+      stack.push_back({s.lo, s.hi, true});           // separator after children
+      stack.push_back({mid + 1, s.hi, false});       // right interior
+      stack.push_back({s.lo, mid - bw + 1, false});  // left interior
+    }
+    for (i_t j = 0; j < n_; j++) {
+      if (spike[j]) { perm_.push_back(j); }
+    }
+    cuopt_assert(static_cast<i_t>(perm_.size()) == n_, "banded ND permutation incomplete");
+    return static_cast<i_t>(perm_.size()) == n_;
+  }
+
   // Fill-reducing ordering. perm_[k] = original index of the k-th pivot.
-  // Uses SuiteSparse AMD (approximate minimum degree) on the full symmetric
-  // pattern; the ordering only affects fill-in, never correctness, so any
-  // failure falls back to the natural ordering.
+  // Narrow-banded matrices use the banded nested dissection above (parallel
+  // schedule); everything else uses SuiteSparse AMD (approximate minimum
+  // degree) on the full symmetric pattern. The ordering only affects fill-in,
+  // never correctness, so any failure falls back to the natural ordering.
   void compute_ordering()
   {
     perm_.resize(n_);
@@ -944,7 +1999,11 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     }
 
     static_assert(std::is_same_v<i_t, int>, "amd_order requires int32 indices");
-    if (n_ > 1) {
+    if (n_ > 1 && !compute_banded_nd_ordering()) {
+      perm_.assign(n_, 0);
+      for (i_t k = 0; k < n_; k++) {
+        perm_[k] = k;
+      }
       i_t status = amd_order(
         n_, a_rowptr_host_.data(), a_colidx_host_.data(), perm_.data(), nullptr, nullptr);
       if (status != AMD_OK && status != AMD_OK_BUT_JUMBLED) {
@@ -1040,24 +2099,30 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       }
     }
 
-    tail_dim_   = choose_tail_dim(level);
-    tail_start_ = n_ - tail_dim_;
+    // Exact factor column counts (Gilbert-Ng-Peyton) without forming the
+    // patterns; they drive the density-based dense-tail choice.
+    {
+      std::vector<i_t> post = ldlt_detail::ldlt_etree_postorder<i_t>(etree_parent_);
+      std::vector<std::vector<i_t>> lc(n_);  // strict lower pattern per column
+      for (i_t k = 0; k < n_; k++) {
+        for (i_t i : uc[k]) {
+          lc[i].push_back(k);
+        }
+      }
+      col_counts_ = ldlt_detail::ldlt_column_counts<i_t>(lc, etree_parent_, post);
+    }
+    if (halted()) { return CONCURRENT_HALT_RETURN; }
+    choose_tail_density();
 
     // Row patterns of L: rows[j] = sorted { k < j : L(j, k) != 0 }, computed
     // via the elimination-tree reach of the entries of row j (Davis, Direct
     // Methods for Sparse Linear Systems). For tail rows (j >= tail_start_)
     // the reach is clamped at the tail boundary: tail-tail entries live in
-    // the dense block and their sparse patterns are never needed. After a
-    // first pass, the tail is extended over any near-dense boundary band
-    // (cheap, uses only the computed head column counts) and the pass is
-    // redone.
+    // the dense block and their (potentially huge) sparse patterns are never
+    // formed.
     std::vector<std::vector<i_t>> rows(n_);
-    std::vector<i_t> col_count;
-    for (int refine = 0; refine < 3; refine++) {
-      for (i_t j = 0; j < n_; j++) {
-        rows[j].clear();
-      }
-      col_count.assign(n_, 0);
+    std::vector<i_t> col_count(n_, 0);
+    {
       std::vector<i_t> mark(n_, -1);
       for (i_t j = 0; j < n_; j++) {
         mark[j] = j;
@@ -1073,28 +2138,19 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         std::sort(rows[j].begin(), rows[j].end());
         if ((j & 4095) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
       }
-      if (tail_dim_ == 0 || tail_start_ == 0) { break; }
-      // Extend the tail over a dense boundary band: walk down from the
-      // boundary accumulating the slab density of columns [b, tail_start_).
-      size_t free_b = 0, total_b = 0;
-      cudaMemGetInfo(&free_b, &total_b);
-      const i_t d_cap =
-        std::min<i_t>(n_, static_cast<i_t>(std::sqrt(0.30 * static_cast<double>(free_b) / 8.0)));
-      int64_t slab_nnz = 0, slab_area = 0;
-      i_t best_b = tail_start_;
-      for (i_t b = tail_start_ - 1; b >= 0; b--) {
-        if (n_ - b > d_cap) { break; }
-        // full column length of head column b including its tail rows
-        slab_nnz += col_count[b];
-        slab_area += n_ - 1 - b;
-        if (slab_area > 0 &&
-            static_cast<double>(slab_nnz) >= 0.5 * static_cast<double>(slab_area)) {
-          best_b = b;
-        }
+    }
+    // Cross-check the pattern pass against the exact counts: head columns
+    // must match (tail columns hold their entries in the dense block).
+    if (std::getenv("CUOPT_LDLT_PIVDBG") != nullptr) {
+      i_t mismatches = 0;
+      for (i_t j = 0; j < tail_start_; j++) {
+        if (col_count[j] != col_counts_[j] - 1) { mismatches++; }
       }
-      if (best_b >= tail_start_) { break; }
-      tail_start_ = best_b;
-      tail_dim_   = n_ - tail_start_;
+      fprintf(stderr,
+              "[ldlt] GNP count check: %d mismatches over %d head cols (tail_dim=%d)\n",
+              mismatches,
+              tail_start_,
+              tail_dim_);
     }
 
     // Column pointers of L (strict lower triangle, CSC).
@@ -1163,6 +2219,8 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
           std::max(head_level_max_rp_[level[j]], rp_ptr_[j + 1] - rp_ptr_[j]);
       }
     }
+
+    build_level_bundles();
 
     // Tail bookkeeping: per head column, the first tail row inside its
     // (sorted) column pattern; per tail row, where the head part of its row
@@ -1266,6 +2324,23 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         d_head_level_cols_.resize(tail_start_, stream);
         raft::copy(
           d_head_level_cols_.data(), head_level_cols_.data(), head_level_cols_.size(), stream);
+        d_head_level_ptr_.resize(n_head_levels_ + 1, stream);
+        raft::copy(d_head_level_ptr_.data(), head_level_ptr_.data(), n_head_levels_ + 1, stream);
+      }
+      if (!chain_win_.empty()) {
+        d_chain_win_.resize(chain_win_.size(), stream);
+        raft::copy(d_chain_win_.data(), chain_win_.data(), chain_win_.size(), stream);
+        d_chain_smoff_.resize(chain_smoff_.size(), stream);
+        raft::copy(d_chain_smoff_.data(), chain_smoff_.data(), chain_smoff_.size(), stream);
+        d_chain_fop_off_.resize(chain_fop_off_.size(), stream);
+        raft::copy(d_chain_fop_off_.data(), chain_fop_off_.data(), chain_fop_off_.size(), stream);
+        d_chain_bop_off_.resize(chain_bop_off_.size(), stream);
+        raft::copy(d_chain_bop_off_.data(), chain_bop_off_.data(), chain_bop_off_.size(), stream);
+        d_chain_rp_slot_.resize(chain_rp_slot_.size(), stream);
+        raft::copy(d_chain_rp_slot_.data(), chain_rp_slot_.data(), chain_rp_slot_.size(), stream);
+        d_chain_col_slot_.resize(chain_col_slot_.size(), stream);
+        raft::copy(
+          d_chain_col_slot_.data(), chain_col_slot_.data(), chain_col_slot_.size(), stream);
       }
       if (tail_dim_ > 0) {
         d_dense_.resize(static_cast<size_t>(tail_dim_) * tail_dim_, stream);
@@ -1430,9 +2505,67 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
 
     // The two-phase atomic path parallelizes the updates of long columns over
     // the whole device; it is not bitwise deterministic, so the deterministic
-    // mode keeps the sequential-per-column kernel.
+    // mode keeps the sequential-per-column kernel. Light consecutive levels
+    // are fused into single-launch bundles (deterministic by construction).
     const bool atomic_head = !settings_.cudss_deterministic;
-    for (i_t l = 0; l < n_head_levels_; l++) {
+    for (size_t seg_idx = 0; seg_idx < factor_segs_.size(); seg_idx++) {
+      const level_seg_t& seg = factor_segs_[seg_idx];
+      if (seg.bundled == 2) {
+        const i_t base = head_level_ptr_[seg.lo];
+        ldlt_detail::ldlt_factor_chain_kernel<i_t, f_t>
+          <<<1, seg.block_dim, 0, stream>>>(d_head_level_cols_.data() + base,
+                                            d_chain_win_.data() + seg.win_begin,
+                                            seg.win_count,
+                                            d_chain_smoff_.data() + base,
+                                            d_chain_fop_off_.data() + base,
+                                            d_chain_rp_slot_.data(),
+                                            d_Lp_.data(),
+                                            d_Li_.data(),
+                                            d_rp_ptr_.data(),
+                                            d_rp_col_.data(),
+                                            d_rp_pos_.data(),
+                                            d_Lx_.data(),
+                                            d_D_.data(),
+                                            d_fail_.data(),
+                                            d_static_pivots_.data(),
+                                            static_pivot_tol,
+                                            positive_definite_,
+                                            d_perm_.data(),
+                                            pivot_n_neg_,
+                                            pivot_neg_floor_,
+                                            pivot_pos_floor_,
+                                            d_sign_corrections_.data());
+        RAFT_CHECK_CUDA(stream);
+        if ((seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
+        continue;
+      }
+      if (seg.bundled == 1) {
+        ldlt_detail::ldlt_factor_bundle_kernel<i_t, f_t>
+          <<<1, seg.block_dim, 0, stream>>>(d_head_level_ptr_.data(),
+                                            d_head_level_cols_.data(),
+                                            seg.lo,
+                                            seg.hi,
+                                            d_Lp_.data(),
+                                            d_Li_.data(),
+                                            d_rp_ptr_.data(),
+                                            d_rp_col_.data(),
+                                            d_rp_pos_.data(),
+                                            d_Lx_.data(),
+                                            d_D_.data(),
+                                            d_fail_.data(),
+                                            d_static_pivots_.data(),
+                                            static_pivot_tol,
+                                            positive_definite_,
+                                            d_perm_.data(),
+                                            pivot_n_neg_,
+                                            pivot_neg_floor_,
+                                            pivot_pos_floor_,
+                                            d_sign_corrections_.data());
+        RAFT_CHECK_CUDA(stream);
+        if ((seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
+        continue;
+      }
+      for (i_t l = seg.lo; l < seg.hi; l++) {
       const i_t level_start = head_level_ptr_[l];
       const i_t level_size  = head_level_ptr_[l + 1] - level_start;
       if (level_size == 0) { continue; }
@@ -1492,6 +2625,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         RAFT_CHECK_CUDA(stream);
       }
       if ((l & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
+      }
     }
 
     if (tail_dim_ > 0) {
@@ -1798,19 +2932,51 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas, CUBLAS_POINTER_MODE_HOST));
     }
 
-    for (i_t l = 0; l < n_head_levels_; l++) {
-      const i_t level_start = head_level_ptr_[l];
-      const i_t level_size  = head_level_ptr_[l + 1] - level_start;
-      if (level_size == 0) { continue; }
-      ldlt_detail::ldlt_forward_level_kernel<i_t, f_t>
-        <<<level_size, block_dim, 0, stream>>>(d_head_level_cols_.data(),
-                                               level_start,
-                                               d_rp_ptr_.data(),
-                                               d_rp_col_.data(),
-                                               d_rp_pos_.data(),
-                                               d_Lx_.data(),
-                                               d_work_.data());
-      RAFT_CHECK_CUDA(stream);
+    for (const level_seg_t& seg : fwd_segs_) {
+      if (seg.bundled == 2) {
+        const i_t base = head_level_ptr_[seg.lo];
+        ldlt_detail::ldlt_forward_chain_kernel<i_t, f_t>
+          <<<1, seg.block_dim, 0, stream>>>(d_head_level_cols_.data() + base,
+                                            d_chain_win_.data() + seg.win_begin,
+                                            seg.win_count,
+                                            d_chain_fop_off_.data() + base,
+                                            d_chain_rp_slot_.data(),
+                                            d_rp_ptr_.data(),
+                                            d_rp_col_.data(),
+                                            d_rp_pos_.data(),
+                                            d_Lx_.data(),
+                                            d_work_.data());
+        RAFT_CHECK_CUDA(stream);
+        continue;
+      }
+      if (seg.bundled == 1) {
+        ldlt_detail::ldlt_forward_bundle_kernel<i_t, f_t>
+          <<<1, seg.block_dim, 0, stream>>>(d_head_level_ptr_.data(),
+                                            d_head_level_cols_.data(),
+                                            seg.lo,
+                                            seg.hi,
+                                            d_rp_ptr_.data(),
+                                            d_rp_col_.data(),
+                                            d_rp_pos_.data(),
+                                            d_Lx_.data(),
+                                            d_work_.data());
+        RAFT_CHECK_CUDA(stream);
+        continue;
+      }
+      for (i_t l = seg.lo; l < seg.hi; l++) {
+        const i_t level_start = head_level_ptr_[l];
+        const i_t level_size  = head_level_ptr_[l + 1] - level_start;
+        if (level_size == 0) { continue; }
+        ldlt_detail::ldlt_forward_level_kernel<i_t, f_t>
+          <<<level_size, block_dim, 0, stream>>>(d_head_level_cols_.data(),
+                                                 level_start,
+                                                 d_rp_ptr_.data(),
+                                                 d_rp_col_.data(),
+                                                 d_rp_pos_.data(),
+                                                 d_Lx_.data(),
+                                                 d_work_.data());
+        RAFT_CHECK_CUDA(stream);
+      }
     }
 
     if (tail_dim_ > 0) {
@@ -1858,18 +3024,49 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                   tail_dim_));
     }
 
-    for (i_t l = n_head_levels_ - 1; l >= 0; l--) {
-      const i_t level_start = head_level_ptr_[l];
-      const i_t level_size  = head_level_ptr_[l + 1] - level_start;
-      if (level_size == 0) { continue; }
-      ldlt_detail::ldlt_backward_level_kernel<i_t, f_t>
-        <<<level_size, block_dim, 0, stream>>>(d_head_level_cols_.data(),
-                                               level_start,
-                                               d_Lp_.data(),
-                                               d_Li_.data(),
-                                               d_Lx_.data(),
-                                               d_work_.data());
-      RAFT_CHECK_CUDA(stream);
+    for (auto seg_it = bwd_segs_.rbegin(); seg_it != bwd_segs_.rend(); ++seg_it) {
+      const level_seg_t& seg = *seg_it;
+      if (seg.bundled == 2) {
+        const i_t base = head_level_ptr_[seg.lo];
+        ldlt_detail::ldlt_backward_chain_kernel<i_t, f_t>
+          <<<1, seg.block_dim, 0, stream>>>(d_head_level_cols_.data() + base,
+                                            d_chain_win_.data() + seg.win_begin,
+                                            seg.win_count,
+                                            d_chain_bop_off_.data() + base,
+                                            d_chain_col_slot_.data(),
+                                            d_Lp_.data(),
+                                            d_Li_.data(),
+                                            d_Lx_.data(),
+                                            d_work_.data());
+        RAFT_CHECK_CUDA(stream);
+        continue;
+      }
+      if (seg.bundled == 1) {
+        ldlt_detail::ldlt_backward_bundle_kernel<i_t, f_t>
+          <<<1, seg.block_dim, 0, stream>>>(d_head_level_ptr_.data(),
+                                            d_head_level_cols_.data(),
+                                            seg.lo,
+                                            seg.hi,
+                                            d_Lp_.data(),
+                                            d_Li_.data(),
+                                            d_Lx_.data(),
+                                            d_work_.data());
+        RAFT_CHECK_CUDA(stream);
+        continue;
+      }
+      for (i_t l = seg.hi - 1; l >= seg.lo; l--) {
+        const i_t level_start = head_level_ptr_[l];
+        const i_t level_size  = head_level_ptr_[l + 1] - level_start;
+        if (level_size == 0) { continue; }
+        ldlt_detail::ldlt_backward_level_kernel<i_t, f_t>
+          <<<level_size, block_dim, 0, stream>>>(d_head_level_cols_.data(),
+                                                 level_start,
+                                                 d_Lp_.data(),
+                                                 d_Li_.data(),
+                                                 d_Lx_.data(),
+                                                 d_work_.data());
+        RAFT_CHECK_CUDA(stream);
+      }
     }
     if (tail_dim_ > 0) { RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas, prev_mode)); }
 
@@ -1958,6 +3155,30 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   std::vector<i_t> schur_light_;
   std::vector<i_t> schur_heavy_;
 
+  // Exact factor column counts (including the diagonal), Gilbert-Ng-Peyton.
+  std::vector<i_t> col_counts_;
+
+  // Bundled level execution plans (see build_level_bundles).
+  struct level_seg_t {
+    i_t lo;
+    i_t hi;
+    i_t bundled;  // 0 = per-level, 1 = bundle, 2 = chain
+    i_t block_dim;
+    i_t win_begin{0};  // chain: index into chain_win_ (window starts + end)
+    i_t win_count{0};  // chain: number of windows
+  };
+  std::vector<level_seg_t> factor_segs_;
+  std::vector<level_seg_t> fwd_segs_;
+  std::vector<level_seg_t> bwd_segs_;
+
+  // Chain metadata (host mirrors; see ldlt_factor_chain_kernel).
+  std::vector<i_t> chain_win_;       // concatenated per-run window start lists
+  std::vector<i_t> chain_smoff_;     // per head position: window-relative data offset
+  std::vector<i_t> chain_fop_off_;   // per head position: running in-window rp-entry prefix
+  std::vector<i_t> chain_bop_off_;   // per head position: running in-window col-entry prefix
+  std::vector<i_t> chain_rp_slot_;   // per rp entry: window slot or -1
+  std::vector<i_t> chain_col_slot_;  // per column entry: window slot or -1
+
   // Strict lower triangle of L in CSC form (row indices sorted per column).
   std::vector<i_t> Lp_;  // size n_ + 1
   std::vector<i_t> Li_;  // size nnz_L_
@@ -2008,8 +3229,15 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   rmm::device_uvector<int64_t> d_a2l_;
   rmm::device_uvector<i_t> d_level_cols_;
   rmm::device_uvector<i_t> d_head_level_cols_;
+  rmm::device_uvector<i_t> d_head_level_ptr_;
   rmm::device_uvector<i_t> d_tail_seg_;
   rmm::device_uvector<i_t> d_rp_head_end_;
+  rmm::device_uvector<i_t> d_chain_win_;
+  rmm::device_uvector<i_t> d_chain_smoff_;
+  rmm::device_uvector<i_t> d_chain_fop_off_;
+  rmm::device_uvector<i_t> d_chain_bop_off_;
+  rmm::device_uvector<i_t> d_chain_rp_slot_;
+  rmm::device_uvector<i_t> d_chain_col_slot_;
   rmm::device_uvector<i_t> d_schur_light_;
   rmm::device_uvector<i_t> d_schur_heavy_;
   rmm::device_uvector<f_t> d_dense_;
