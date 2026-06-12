@@ -262,8 +262,15 @@ QP_Test_1/2)——全部逐位一致;good_mip 仅 baseline 留档。shim 侧计�
    rmm/pylibraft cimport(shim 本地声明 + D2H→cudf.Series 输出,见 §7.7),
    `cuopt/tests/routing` 全套 **43/43 通过**(含 distance_engine/批量/重路由/合成数据生成);
 2. ~~Python distance_engine~~ **已支持并验证**——同上;
-3. **cuopt_server(REST)**——源码硬依赖 rmm/cudf(utils/solver.py:367 对**所有** solve
-   `import rmm`);routing 解耦后仅剩此项 + wheel 打包;
+3. ~~cuopt_server(REST)~~ **已支持并验证(2026-06-12,零源码改动)**:保留 cudf 决策后
+   rmm-cu12 随 cudf 安装,server 的 `import rmm`(池只管 cudf 侧内存)/`import cudf` 直接
+   可用,shim libcuopt 用自己的分配器、互不交换对象;补 pip 依赖
+   (fastapi/msgpack_numpy/uvicorn/jsonref/psutil)即可。
+   **测试 94 过 + 7 skip(skip 全为上游 #519,与 cuDSS 期完全一致)**;
+   2 个 grpc-entry-point"失败"为 PATH 环境问题(cuopt_grpc_server 上 PATH 后 2/2 过)。
+   self-hosted 客户端 **3/3 过**(对运行中的 REST server)。
+   注意:跑 server 测试需 `PYTHONPATH=python/libcuopt:python/cuopt:python/cuopt_server`
+   (libcuopt 包须显式上路径,否则 python/ 下的 libcuopt 目录会被当命名空间包)+ no_proxy;
 4. ~~gRPC server(C++)~~ **已支持并验证**:见 §7.6——conda 配置构建,3 个 gRPC C++ 测试 +
    Python 远程执行 11/11 全过,零 RAPIDS 链接;
 5. **pip wheel 安装**——pyproject 仍 rapids-build-backend + cudf/pylibraft/rmm 钉版;
