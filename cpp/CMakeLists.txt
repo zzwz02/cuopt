@@ -11,14 +11,23 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/thirdparty")
 include(GNUInstallDirs)
 
 set(RAFT_NVTX ON)
-include(../cmake/rapids_config.cmake)
-include(rapids-cmake)
-include(rapids-cpm)
-include(rapids-cuda)
-include(rapids-export)
-include(rapids-find)
 
-rapids_cuda_init_architectures(CUOPT)
+# Plain-CMake build (RAPIDS-free): version comes straight from ../VERSION;
+# no rapids-cmake scripts are downloaded or included.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION" _cuopt_version_file)
+string(REGEX MATCH "([0-9]+)\\.([0-9]+)\\.([0-9]+)" RAPIDS_VERSION "${_cuopt_version_file}")
+set(CUOPT_VERSION_MAJOR "${CMAKE_MATCH_1}")
+set(CUOPT_VERSION_MINOR "${CMAKE_MATCH_2}")
+set(CUOPT_VERSION_PATCH "${CMAKE_MATCH_3}")
+
+# GPU architectures: default to the build machine's GPU; map the historical
+# magic values accepted by build.sh ("NATIVE", "RAPIDS"/"ALL").
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL ""
+   OR CMAKE_CUDA_ARCHITECTURES STREQUAL "NATIVE")
+  set(CMAKE_CUDA_ARCHITECTURES native)
+elseif(CMAKE_CUDA_ARCHITECTURES STREQUAL "RAPIDS" OR CMAKE_CUDA_ARCHITECTURES STREQUAL "ALL")
+  set(CMAKE_CUDA_ARCHITECTURES "70-real;75-real;80-real;86-real;90")
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake")
 message(STATUS "CMAKE_MODULE_PATH = ${CMAKE_MODULE_PATH}")
@@ -37,12 +46,29 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # Disable C++20 module scanning as the codebase doesn't use modules
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE BOOL "Disable C++20 module scanning")
 
-rapids_cmake_write_version_file(include/cuopt/version_config.hpp)
+# Generate version_config.hpp (numeric components, leading zeros stripped).
+math(EXPR _v_major "${CUOPT_VERSION_MAJOR}")
+math(EXPR _v_minor "${CUOPT_VERSION_MINOR}")
+math(EXPR _v_patch "${CUOPT_VERSION_PATCH}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/include/cuopt/version_config.hpp"
+"/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#pragma once
+
+#define CUOPT_VERSION_MAJOR ${_v_major}
+#define CUOPT_VERSION_MINOR ${_v_minor}
+#define CUOPT_VERSION_PATCH ${_v_patch}
+")
 # ##################################################################################################
 # - build type ------------------------------------------------------------------------------------
 
 # Set a default build type if none was specified
-rapids_cmake_build_type(Release)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
 
 # #############################################################################
 # - User Options  ------------------------------------------------------------
@@ -68,13 +94,10 @@ message(VERBOSE "cuOpt: fatbin: ${WRITE_FATBIN}")
 # ##################################################################################################
 # - compiler options ------------------------------------------------------------------------------
 
-# CUDA runtime
-rapids_cuda_init_runtime(USE_STATIC ON)
+# CUDA runtime: link statically (was rapids_cuda_init_runtime(USE_STATIC ON)).
+set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
-rapids_find_package(CUDAToolkit REQUIRED
-        BUILD_EXPORT_SET cuopt-exports
-        INSTALL_EXPORT_SET cuopt-exports
-)
+find_package(CUDAToolkit REQUIRED)
 
 set(CUOPT_CXX_FLAGS "")
 set(CUOPT_CUDA_FLAGS "")
@@ -235,21 +258,19 @@ elseif (CMAKE_CUDA_LINEINFO)
 endif (CMAKE_BUILD_TYPE MATCHES Debug)
 
 # ##################################################################################################
-# - find CPM based dependencies  ------------------------------------------------------------------
-rapids_cpm_init()
-rapids_cmake_install_lib_dir(lib_dir)
-
-option(FETCH_RAPIDS "Fetch RAPIDS dependencies" ON)
+# - FetchContent based dependencies  --------------------------------------------------------------
+include(FetchContent)
+set(lib_dir "${CMAKE_INSTALL_LIBDIR}")
 
 # rmm / raft / rapids_logger are no longer fetched or linked: cuOpt's own
 # cuda::mr-free same-name shim headers under cpp/vendor/include provide the
 # used API subset (see docs/dev/rapids_removal_plan.md). Only CCCL is still
 # fetched (it is an NVIDIA/cccl product that ships with the CUDA toolkit, not
 # part of RAPIDS).
-if (FETCH_RAPIDS)
+# Fetched via FetchContent; use -DFETCHCONTENT_SOURCE_DIR_CCCL=<dir> to reuse
+# a local checkout (offline builds), or pre-provide a CCCL::CCCL target.
+if (NOT TARGET CCCL::CCCL)
     include(cmake/thirdparty/get_cccl.cmake)
-else ()
-    find_package(CCCL REQUIRED)
 endif ()
 
 # Vendored rmm/raft/rapids_logger shim include directory. The rmm/raft/
@@ -657,29 +678,60 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/cuopt/version_config.hpp
 )
 # ###############################################################################################
 # - install export -------------------------------------------------------------------------------
-set(doc_string
-        [=[
-Provide targets for cuOpt.
+# Hand-written package config (was rapids_export). Consumers get the
+# cuopt::cuopt target plus its PUBLIC dependencies: CUDAToolkit and
+# CCCL::CCCL (fetched on demand if absent, overridable for offline use via
+# -DFETCHCONTENT_SOURCE_DIR_CCCL).
+include(CMakePackageConfigHelpers)
 
-cuOpt library is a collection of GPU accelerated combinatorial optimization algorithms.
+set(_cuopt_config_body
+"include(CMakeFindDependencyMacro)
+find_dependency(CUDAToolkit)
+if(NOT TARGET CCCL::CCCL)
+  include(FetchContent)
+  FetchContent_Declare(
+    CCCL
+    GIT_REPOSITORY https://github.com/NVIDIA/cccl.git
+    GIT_TAG v3.4.0
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(CCCL)
+endif()
+include(\"\${CMAKE_CURRENT_LIST_DIR}/cuopt-targets.cmake\")
+")
 
-]=])
-
-rapids_export(INSTALL cuopt
-        EXPORT_SET cuopt-exports
-        GLOBAL_TARGETS cuopt
+# Install tree -----------------------------------------------------------------
+install(EXPORT cuopt-exports
+        FILE cuopt-targets.cmake
         NAMESPACE cuopt::
-        DOCUMENTATION doc_string
-)
+        DESTINATION "${lib_dir}/cmake/cuopt")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/install-config/cuopt-config.cmake"
+     "${_cuopt_config_body}")
+write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/install-config/cuopt-config-version.cmake"
+        VERSION "${PROJECT_VERSION}"
+        COMPATIBILITY SameMinorVersion)
+install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/install-config/cuopt-config.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/install-config/cuopt-config-version.cmake"
+        DESTINATION "${lib_dir}/cmake/cuopt")
 
 # ###############################################################################################
 # - build export -------------------------------------------------------------------------------
-rapids_export(BUILD cuopt
-        EXPORT_SET cuopt-exports
-        GLOBAL_TARGETS cuopt
-        NAMESPACE cuopt::
-        DOCUMENTATION doc_string
-)
+# Build-tree package files so CMAKE_PREFIX_PATH=<build dir> works (used by the
+# python wheels). Reuse this build's fetched CCCL sources when present.
+export(EXPORT cuopt-exports
+       FILE "${CMAKE_CURRENT_BINARY_DIR}/cuopt-targets.cmake"
+       NAMESPACE cuopt::)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/cuopt-config.cmake"
+"if(NOT DEFINED FETCHCONTENT_SOURCE_DIR_CCCL AND EXISTS \"${CCCL_SOURCE_DIR}\")
+  set(FETCHCONTENT_SOURCE_DIR_CCCL \"${CCCL_SOURCE_DIR}\")
+endif()
+${_cuopt_config_body}")
+write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/cuopt-config-version.cmake"
+        VERSION "${PROJECT_VERSION}"
+        COMPATIBILITY SameMinorVersion)
 
 # ##################################################################################################
 # - make documentation ----------------------------------------------------------------------------
@@ -699,14 +751,13 @@ if (Doxygen_FOUND)
 endif ()
 
 
-rapids_cpm_find(
-        argparse 3.2.0
-        GLOBAL_TARGETS argparse::argparse
-        CPM_ARGS
+FetchContent_Declare(
+        argparse
         GIT_REPOSITORY https://github.com/p-ranav/argparse.git
         GIT_TAG v3.2
         GIT_SHALLOW TRUE
 )
+FetchContent_MakeAvailable(argparse)
 
 if (NOT BUILD_LP_ONLY)
     add_executable(cuopt_cli cuopt_cli.cpp)

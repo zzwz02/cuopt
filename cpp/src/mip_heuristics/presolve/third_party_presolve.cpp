@@ -687,7 +687,13 @@ third_party_presolve_result_t<i_t, f_t> third_party_presolve_t<i_t, f_t>::apply(
                  papilo_problem.getNCols(),
                  papilo_problem.getConstraintMatrix().getNnz());
 
+// PAPILO_GITHASH is only defined when papilo's CMake could read the git hash
+// (not the case for non-git source overrides such as FETCHCONTENT_SOURCE_DIR).
+#ifdef PAPILO_GITHASH_AVAILABLE
   CUOPT_LOG_INFO("Calling Papilo presolver (git hash %s)", PAPILO_GITHASH);
+#else
+  CUOPT_LOG_INFO("Calling Papilo presolver");
+#endif
   if (category == problem_category_t::MIP) { dual_postsolve = false; }
   papilo::Presolve<f_t> papilo_presolver;
   set_presolve_methods(papilo_presolver, category, dual_postsolve);
