@@ -9,9 +9,8 @@
 
 from libc.stdint cimport uintptr_t
 
-from pylibraft.common.handle cimport *
-from rmm.pylibrmm.device_buffer cimport DeviceBuffer
-
+# handle_t / device_buffer come from routing_utilities' local shim
+# declarations (RAPIDS-free; no pylibraft/rmm cimports).
 from cuopt.routing.structure.routing_utilities cimport *
 
 from enum import IntEnum
@@ -22,11 +21,32 @@ from numba import cuda
 
 import cudf
 
+from libcpp.memory cimport unique_ptr
 from libcpp.utility cimport move
 
-from cuopt.utilities import series_from_buf
+# RAPIDS-free build: device buffers are copied to host numpy (then wrapped in
+# cudf/cupy) instead of crossing the boundary as rmm DeviceBuffer, whose
+# python class is compiled against the real rmm ABI.
+cdef extern from "cuda_runtime_api.h" nogil:
+    ctypedef enum cudaMemcpyKind:
+        cudaMemcpyDeviceToHost
+    int cudaMemcpy(void* dst, const void* src, size_t count,
+                   cudaMemcpyKind kind)
+    int cudaDeviceSynchronize()
 
-import pyarrow as pa
+
+cdef object _device_buffer_to_numpy(unique_ptr[device_buffer] buf, dtype):
+    """Copy a device buffer to a host numpy array of the given dtype."""
+    cdef device_buffer* b = buf.get()
+    np_dtype = np.dtype(dtype)
+    if b == NULL or b.size() == 0:
+        return np.array([], dtype=np_dtype)
+    cdef size_t nbytes = b.size()
+    arr = np.empty(nbytes // np_dtype.itemsize, dtype=np_dtype)
+    cdef uintptr_t dst = arr.__array_interface__['data'][0]
+    cudaDeviceSynchronize()
+    cudaMemcpy(<void*>dst, b.data(), nbytes, cudaMemcpyDeviceToHost)
+    return arr
 
 
 class DatasetDistribution(IntEnum):
@@ -100,80 +120,48 @@ def generate_dataset(locations=100, asymmetric=True, min_demand=cudf.Series(),
     vehicles = cudf.DataFrame()
     constraints = dict()
 
-    x_pos = DeviceBuffer.c_from_unique_ptr(move(g_ret.d_x_pos_))
-    y_pos = DeviceBuffer.c_from_unique_ptr(move(g_ret.d_y_pos_))
-    coordinates['x'] = series_from_buf(x_pos, pa.float32())
-    coordinates['y'] = series_from_buf(y_pos, pa.float32())
+    coordinates['x'] = cudf.Series(
+        _device_buffer_to_numpy(move(g_ret.d_x_pos_), np.float32))
+    coordinates['y'] = cudf.Series(
+        _device_buffer_to_numpy(move(g_ret.d_y_pos_), np.float32))
 
-    matrices_buf = DeviceBuffer.c_from_unique_ptr(move(g_ret.d_matrices_))
-    desc = matrices_buf.__cuda_array_interface__
-    desc["shape"] = (n_vehicle_types, n_matrix_types, locations, locations)
-    desc["typestr"] = "f4"
-    matrices = cuda.from_cuda_array_interface(desc)
-    matrices = cp.asarray(matrices, dtype=np.float32)
-    matrices_ret = cp.array(matrices)
+    matrices_np = _device_buffer_to_numpy(move(g_ret.d_matrices_), np.float32)
+    matrices_np = matrices_np.reshape(
+        (n_vehicle_types, n_matrix_types, locations, locations))
+    matrices_ret = cp.array(matrices_np)
 
     # Create vehicles_df
-    vehicle_earliest = DeviceBuffer.c_from_unique_ptr(
-        move(g_ret.d_vehicle_earliest_time_)
-    )
-    vehicle_latest = DeviceBuffer.c_from_unique_ptr(
-        move(g_ret.d_vehicle_latest_time_)
-    )
-    vehicle_drop_return_trips = DeviceBuffer.c_from_unique_ptr(
-        move(g_ret.d_drop_return_trips_)
-    )
-    vehicle_skip_first_trips = DeviceBuffer.c_from_unique_ptr(
-        move(g_ret.d_skip_first_trips_)
-    )
-
-    vehicles["earliest_time"] = series_from_buf(vehicle_earliest, pa.int32())
-    vehicles["latest_time"] = series_from_buf(vehicle_latest, pa.int32())
-    vehicles["drop_return_trips"] = series_from_buf(
-        vehicle_drop_return_trips, pa.bool_()
-    )
-    vehicles["skip_first_trips"] = series_from_buf(
-        vehicle_skip_first_trips, pa.bool_()
-    )
+    vehicles["earliest_time"] = cudf.Series(
+        _device_buffer_to_numpy(move(g_ret.d_vehicle_earliest_time_), np.int32))
+    vehicles["latest_time"] = cudf.Series(
+        _device_buffer_to_numpy(move(g_ret.d_vehicle_latest_time_), np.int32))
+    vehicles["drop_return_trips"] = cudf.Series(
+        _device_buffer_to_numpy(move(g_ret.d_drop_return_trips_), np.bool_))
+    vehicles["skip_first_trips"] = cudf.Series(
+        _device_buffer_to_numpy(move(g_ret.d_skip_first_trips_), np.bool_))
 
     fleet_size = vehicles["earliest_time"].shape[0]
-    capacities_buf = DeviceBuffer.c_from_unique_ptr(move(g_ret.d_caps_))
-    desc = capacities_buf.__cuda_array_interface__
-    desc["shape"] = (dim, fleet_size)
-    desc["typestr"] = "u2"
-    capacities = cuda.from_cuda_array_interface(desc)
-    capacities = cp.array(cp.asarray(capacities, dtype=np.uint16))
+    capacities_np = _device_buffer_to_numpy(move(g_ret.d_caps_), np.uint16)
+    capacities = cp.array(capacities_np.reshape((dim, fleet_size)))
     for i in range(dim):
         vehicles["capacity_" + str(i)] = capacities[i]
 
     # Fleet order constraints
-    service_times_buf = DeviceBuffer.c_from_unique_ptr(move(g_ret.d_service_time_))
-    desc = service_times_buf.__cuda_array_interface__
-    desc["shape"] = (fleet_size, locations)
-    desc["typestr"] = "i4"
-    order_service_times = cuda.from_cuda_array_interface(desc)
-    order_service_times = cp.asarray(order_service_times, dtype=np.int32)
-    order_service_times = cp.array(order_service_times)
+    service_times_np = _device_buffer_to_numpy(
+        move(g_ret.d_service_time_), np.int32)
+    order_service_times = cp.array(
+        service_times_np.reshape((fleet_size, locations)))
 
     constraints["order_service_times"] = order_service_times
 
     # Create orders df
-    earliest_time = DeviceBuffer.c_from_unique_ptr(
-        move(g_ret.d_earliest_time_)
-    )
-    latest_time = DeviceBuffer.c_from_unique_ptr(
-        move(g_ret.d_latest_time_)
-    )
+    orders["earliest_time"] = cudf.Series(
+        _device_buffer_to_numpy(move(g_ret.d_earliest_time_), np.int32))
+    orders["latest_time"] = cudf.Series(
+        _device_buffer_to_numpy(move(g_ret.d_latest_time_), np.int32))
 
-    orders["earliest_time"] = series_from_buf(earliest_time, pa.int32())
-    orders["latest_time"] = series_from_buf(latest_time, pa.int32())
-
-    demands_buf = DeviceBuffer.c_from_unique_ptr(move(g_ret.d_demands_))
-    desc = demands_buf.__cuda_array_interface__
-    desc["shape"] = (dim, locations)
-    desc["typestr"] = "i2"
-    demands = cuda.from_cuda_array_interface(desc)
-    demands = cp.array(cp.asarray(demands, dtype=np.int16))
+    demands_np = _device_buffer_to_numpy(move(g_ret.d_demands_), np.int16)
+    demands = cp.array(demands_np.reshape((dim, locations)))
     for i in range(dim):
         orders["demand_" + str(i)] = demands[i]
 

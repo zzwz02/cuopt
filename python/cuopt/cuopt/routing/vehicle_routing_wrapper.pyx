@@ -7,8 +7,8 @@
 # cython: embedsignature = True
 # cython: language_level = 3
 
-from pylibraft.common.handle cimport *
-
+# handle_t / device_buffer come from routing_utilities' local shim
+# declarations (RAPIDS-free; no pylibraft/rmm cimports).
 from cuopt.routing.structure.routing_utilities cimport *
 from cuopt.routing.vehicle_routing cimport (
     call_batch_solve,
@@ -20,8 +20,6 @@ from cuopt.routing.vehicle_routing cimport (
 )
 
 from datetime import date, datetime
-
-import pyarrow as pa
 
 from dateutil.relativedelta import relativedelta
 
@@ -38,7 +36,15 @@ from libcpp.string cimport string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
-from rmm.pylibrmm.device_buffer cimport DeviceBuffer
+# RAPIDS-free build: device solution buffers are copied to host numpy and
+# wrapped in cudf objects, instead of crossing the boundary as rmm
+# DeviceBuffer (whose python class is compiled against the real rmm ABI).
+cdef extern from "cuda_runtime_api.h" nogil:
+    ctypedef enum cudaMemcpyKind:
+        cudaMemcpyDeviceToHost
+    int cudaMemcpy(void* dst, const void* src, size_t count,
+                   cudaMemcpyKind kind)
+    int cudaDeviceSynchronize()
 
 import math
 import sys
@@ -51,7 +57,26 @@ from numba import cuda
 
 import cudf
 
-from cuopt.utilities import series_from_buf
+
+cdef object _device_buffer_to_series(unique_ptr[device_buffer] buf, dtype):
+    """Copy a device buffer to host and wrap it in a cudf.Series.
+
+    Keeps the cudf API contract while avoiding the rmm DeviceBuffer /
+    pylibcudf round-trip, whose python classes are compiled against the real
+    rmm ABI (the vendored shim's rmm::device_buffer has a different layout).
+    cudaDeviceSynchronize guarantees the solver's stream work is complete
+    before the synchronous copy.
+    """
+    cdef device_buffer* b = buf.get()
+    np_dtype = np.dtype(dtype)
+    if b == NULL or b.size() == 0:
+        return cudf.Series(np.array([], dtype=np_dtype))
+    cdef size_t nbytes = b.size()
+    arr = np.empty(nbytes // np_dtype.itemsize, dtype=np_dtype)
+    cdef uintptr_t dst = arr.__array_interface__['data'][0]
+    cudaDeviceSynchronize()
+    cudaMemcpy(<void*>dst, b.data(), nbytes, cudaMemcpyDeviceToHost)
+    return cudf.Series(arr)
 
 
 class ErrorStatus(IntEnum):
@@ -783,33 +808,22 @@ def Solve(DataModel data_model, SolverSettings solver_settings):
     finally:
         free(c_sol_string)
 
-    route = DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_route_))
-    route_locations = DeviceBuffer.c_from_unique_ptr(
-        move(vr_ret.d_route_locations_)
-    )
-    arrival_stamp = DeviceBuffer.c_from_unique_ptr(
-        move(vr_ret.d_arrival_stamp_)
-    )
-    truck_id = DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_truck_id_))
-    node_types = DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_node_types_))
-    unserviced_nodes = \
-        DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_unserviced_nodes_))
-    accepted = \
-        DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_accepted_))
-
     route_df = cudf.DataFrame()
-    route_df['route'] = series_from_buf(route, pa.int32())
-    route_df['arrival_stamp'] = series_from_buf(arrival_stamp, pa.float64())
-    route_df['truck_id'] = series_from_buf(truck_id, pa.int32())
-    route_df['location'] = series_from_buf(route_locations, pa.int32())
-    route_df['type'] = series_from_buf(node_types, pa.int32())
+    route_df['route'] = _device_buffer_to_series(
+        move(vr_ret.d_route_), np.int32)
+    route_df['arrival_stamp'] = _device_buffer_to_series(
+        move(vr_ret.d_arrival_stamp_), np.float64)
+    route_df['truck_id'] = _device_buffer_to_series(
+        move(vr_ret.d_truck_id_), np.int32)
+    route_df['location'] = _device_buffer_to_series(
+        move(vr_ret.d_route_locations_), np.int32)
+    route_df['type'] = _device_buffer_to_series(
+        move(vr_ret.d_node_types_), np.int32)
 
-    unserviced_nodes = cudf.Series._from_column(
-        series_from_buf(unserviced_nodes, pa.int32())
-    )
-    accepted = cudf.Series._from_column(
-        series_from_buf(accepted, pa.int32())
-    )
+    unserviced_nodes = _device_buffer_to_series(
+        move(vr_ret.d_unserviced_nodes_), np.int32)
+    accepted = _device_buffer_to_series(
+        move(vr_ret.d_accepted_), np.int32)
 
     def get_type_from_int(type_in_int):
         if type_in_int == int(NodeType.DEPOT):
@@ -860,33 +874,22 @@ cdef create_assignment_from_vr_ret(vehicle_routing_ret_t& vr_ret):
     finally:
         free(c_sol_string)
 
-    route = DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_route_))
-    route_locations = DeviceBuffer.c_from_unique_ptr(
-        move(vr_ret.d_route_locations_)
-    )
-    arrival_stamp = DeviceBuffer.c_from_unique_ptr(
-        move(vr_ret.d_arrival_stamp_)
-    )
-    truck_id = DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_truck_id_))
-    node_types = DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_node_types_))
-    unserviced_nodes_buf = \
-        DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_unserviced_nodes_))
-    accepted_buf = \
-        DeviceBuffer.c_from_unique_ptr(move(vr_ret.d_accepted_))
-
     route_df = cudf.DataFrame()
-    route_df['route'] = series_from_buf(route, pa.int32())
-    route_df['arrival_stamp'] = series_from_buf(arrival_stamp, pa.float64())
-    route_df['truck_id'] = series_from_buf(truck_id, pa.int32())
-    route_df['location'] = series_from_buf(route_locations, pa.int32())
-    route_df['type'] = series_from_buf(node_types, pa.int32())
+    route_df['route'] = _device_buffer_to_series(
+        move(vr_ret.d_route_), np.int32)
+    route_df['arrival_stamp'] = _device_buffer_to_series(
+        move(vr_ret.d_arrival_stamp_), np.float64)
+    route_df['truck_id'] = _device_buffer_to_series(
+        move(vr_ret.d_truck_id_), np.int32)
+    route_df['location'] = _device_buffer_to_series(
+        move(vr_ret.d_route_locations_), np.int32)
+    route_df['type'] = _device_buffer_to_series(
+        move(vr_ret.d_node_types_), np.int32)
 
-    unserviced_nodes = cudf.Series._from_column(
-        series_from_buf(unserviced_nodes_buf, pa.int32())
-    )
-    accepted = cudf.Series._from_column(
-        series_from_buf(accepted_buf, pa.int32())
-    )
+    unserviced_nodes = _device_buffer_to_series(
+        move(vr_ret.d_unserviced_nodes_), np.int32)
+    accepted = _device_buffer_to_series(
+        move(vr_ret.d_accepted_), np.int32)
 
     def get_type_from_int(type_in_int):
         if type_in_int == int(NodeType.DEPOT):

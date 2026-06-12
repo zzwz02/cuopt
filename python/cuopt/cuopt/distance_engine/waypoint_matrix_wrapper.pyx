@@ -10,10 +10,13 @@ from libc.stdint cimport uintptr_t
 from libcpp.memory cimport unique_ptr
 from libcpp.utility cimport move, pair
 
-from pylibraft.common.handle cimport *
-from rmm.pylibrmm.device_buffer cimport DeviceBuffer
-
-from cuopt.distance_engine.waypoint_matrix cimport waypoint_matrix_t
+# handle_t / device_buffer come from waypoint_matrix.pxd's local shim
+# declarations (RAPIDS-free; no pylibraft/rmm cimports).
+from cuopt.distance_engine.waypoint_matrix cimport (
+    device_buffer,
+    handle_t,
+    waypoint_matrix_t,
+)
 
 import cupy as cp
 import numpy as np
@@ -21,9 +24,29 @@ from numba import cuda
 
 import cudf
 
-from cuopt.utilities import series_from_buf
+# RAPIDS-free build: device buffers are copied to host numpy and wrapped in
+# cudf objects instead of crossing the boundary as rmm DeviceBuffer (whose
+# python class is compiled against the real rmm ABI).
+cdef extern from "cuda_runtime_api.h" nogil:
+    ctypedef enum cudaMemcpyKind:
+        cudaMemcpyDeviceToHost
+    int cudaMemcpy(void* dst, const void* src, size_t count,
+                   cudaMemcpyKind kind)
+    int cudaDeviceSynchronize()
 
-import pyarrow as pa
+
+cdef object _device_buffer_to_series(unique_ptr[device_buffer] buf, dtype):
+    """Copy a device buffer to host and wrap it in a cudf.Series."""
+    cdef device_buffer* b = buf.get()
+    np_dtype = np.dtype(dtype)
+    if b == NULL or b.size() == 0:
+        return cudf.Series(np.array([], dtype=np_dtype))
+    cdef size_t nbytes = b.size()
+    arr = np.empty(nbytes // np_dtype.itemsize, dtype=np_dtype)
+    cdef uintptr_t dst = arr.__array_interface__['data'][0]
+    cudaDeviceSynchronize()
+    cudaMemcpy(<void*>dst, b.data(), nbytes, cudaMemcpyDeviceToHost)
+    return cudf.Series(arr)
 
 
 cdef class WaypointMatrix:
@@ -90,20 +113,15 @@ cdef class WaypointMatrix:
                 len(route_locations)))
         )
 
-        full_sequence_offset = (
-            DeviceBuffer.c_from_unique_ptr(move(path_info.first))
-        )
-        full_path = DeviceBuffer.c_from_unique_ptr(move(path_info.second))
-
-        route_df['sequence_offset'] = series_from_buf(
-            full_sequence_offset, pa.int32()
+        route_df['sequence_offset'] = _device_buffer_to_series(
+            move(path_info.first), np.int32
         )
         locations = route_df["location"].replace(
             to_replace=list(range(len(target_locations))),
             value=target_locations.tolist()
         )
         route_df['location'] = locations
-        waypoint_seq = series_from_buf(full_path, pa.int32())
+        waypoint_seq = _device_buffer_to_series(move(path_info.second), np.int32)
 
         def create_way_point_types(routes, waypoint_seq):
 

@@ -10,8 +10,16 @@
 from libcpp.memory cimport unique_ptr
 from libcpp.utility cimport pair
 
-from pylibraft.common.handle cimport *
-from rmm.librmm.device_buffer cimport device_buffer
+# RAPIDS-free build: local declarations against the vendored shim headers
+# (see routing/structure/routing_utilities.pxd for rationale).
+cdef extern from "raft/core/handle.hpp" namespace "raft" nogil:
+    cdef cppclass handle_t:
+        handle_t() except +
+
+cdef extern from "rmm/device_buffer.hpp" namespace "rmm" nogil:
+    cdef cppclass device_buffer:
+        void* data()
+        size_t size()
 
 
 cdef extern from "cuopt/routing/distance_engine/waypoint_matrix.hpp" namespace "cuopt::distance_engine": # noqa

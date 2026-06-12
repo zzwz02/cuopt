@@ -15,8 +15,18 @@ from libcpp.string cimport string
 from libcpp.utility cimport pair
 from libcpp.vector cimport vector
 
-from pylibraft.common.handle cimport *
-from rmm.librmm.device_buffer cimport device_buffer
+# RAPIDS-free build: declare raft::handle_t and rmm::device_buffer locally
+# from the vendored shim headers instead of cimporting from the pylibraft/rmm
+# wheels (whose Cython declarations carry the REAL raft/rmm ABI, which differs
+# from the shim's). Only the members used on the Cython side are declared.
+cdef extern from "raft/core/handle.hpp" namespace "raft" nogil:
+    cdef cppclass handle_t:
+        handle_t() except +
+
+cdef extern from "rmm/device_buffer.hpp" namespace "rmm" nogil:
+    cdef cppclass device_buffer:
+        void* data()
+        size_t size()
 
 
 cdef extern from "cuopt/routing/assignment.hpp" namespace "cuopt::routing":

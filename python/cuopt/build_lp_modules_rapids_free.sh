@@ -42,6 +42,9 @@ cuopt/linear_programming/solver_settings/solver_settings.pyx
 cuopt/linear_programming/io/parser_wrapper.pyx
 cuopt/linear_programming/internals/internals.pyx
 cuopt/linear_programming/solver/solver_wrapper.pyx
+cuopt/routing/vehicle_routing_wrapper.pyx
+cuopt/routing/utils_wrapper.pyx
+cuopt/distance_engine/waypoint_matrix_wrapper.pyx
 "
 
 cd "$HERE"

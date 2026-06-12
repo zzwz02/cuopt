@@ -11,8 +11,7 @@ from libcpp cimport bool
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 
-from pylibraft.common.handle cimport *
-
+# handle_t comes from routing_utilities' local shim declaration (RAPIDS-free).
 from cuopt.routing.structure.routing_utilities cimport *
 
 
