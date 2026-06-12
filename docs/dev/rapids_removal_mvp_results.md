@@ -11,6 +11,7 @@
 **零编译错误**，运行时**不再链接 librmm.so / libraft / librapids_logger.so**。
 cuopt_cli 的 barrier 与 PDLP 求解目标值与基线**逐位一致**。C++ 单元测试
 **131/137 (96%) 通过**;剩余 6 个全部是同一 routing 问题(见 §5)。CLI_TEST 与 DOC_EXAMPLE 的"失败"经查是测试环境问题(cuopt_cli 不在 PATH、/tmp 残留文件),非 shim bug。
+**Python LP/MILP 路径已在零 RAPIDS 包环境构建并通过全部测试(51 passed / 0 failed,见 §6)。**
 
 ### 通过率演进与真实根因（诊断记录）
 
@@ -114,13 +115,45 @@ VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST、ROUTING_UNIT_TEST),共一个根�
   `move_candidates.cycles.paths/offsets`,定位环查找(代价图松弛 / block_reduce 归约序 /
   thrust scan)在哪一步让 depot 进入环。属 GES 环构造的数值/顺序分歧,非容器或 RNG 问题。
 
-## 6. 待办
+## 6. Python LP/MILP 路径（无 RAPIDS 包，已验证通过）
 
-- Python LP/MILP 路径在无 RAPIDS 包环境构建/通过（Cython cimport 改本地声明、
-  cudf 惰性导入、pyproject 去 rapids-build-backend）——未开始。
-- 上述 C++ 长尾失败的逐项修复。
-- 可选 4b：rapids-cmake → 平凡 CMake/FetchContent，彻底移除 rapids 构建工具。
-- HIP/MACA 后端（本 MVP 不含；shim 的 cuda::mr-free 设计是其前提）。
+**结论:LP/MILP 的 Python 绑定在零 RAPIDS 包(无 rmm/cudf/pylibraft)环境下构建并
+通过全部测试 —— `cuopt/tests/linear_programming` 51 passed / 9 skipped / 0 failed**
+(skip 均为特性门控,无一因 cudf/rmm 缺失)。afiro PDLP 目标值 `-4.64761260e+02` 与 C++
+基线逐位一致;tiny LP 返回正确 `numpy.ndarray`。
+
+源码改动(仅 LP/MILP 路径,routing 运行时 cudf 不动):
+- `solver.pxd`:删 `pylibraft.common.handle` 与 `rmm.librmm.device_buffer` 的 cimport;
+  就地 `cdef extern from "rmm/device_buffer.hpp"` 声明 `device_buffer`(只用 data()/size());
+  显式 `from libcpp.memory cimport unique_ptr`(原由 pylibraft 通配 cimport 传递提供)。
+- `solver_wrapper.pyx`:删未用的 pylibraft-handle / cupy / numba 导入;用 `_device_buffer_to_numpy`
+  (cudaMemcpy D2H + 前置 cudaDeviceSynchronize)替换 `DeviceBuffer.c_from_unique_ptr` +
+  `series_from_buf(...).to_numpy()` 的 rmm/cudf 往返;`type_cast` 先判 np.ndarray,仅 cudf 输入
+  才惰性 `import cudf`。
+- `utilities/utils.py`、`utilities/type_casting.py`:cudf/pylibcudf 惰性导入,numpy 路径零触碰。
+- `cuopt/__init__.py` 本就惰性导入子模块 → `import cuopt.linear_programming` 不拉 routing/cudf。
+- `libcuopt/load.py` 本就 `try/except ModuleNotFoundError` 包裹 rmm/raft/rapids_logger 预加载,
+  且新 libcuopt.so 不再 DT_NEEDED 它们 → 无需改。
+
+构建(MVP 暂以脚本绕过 rapids-cmake):
+- `python/cuopt/build_lp_modules_rapids_free.sh`:cython + g++(`-std=c++20`,因 cuopt 公共头用
+  std::span)把 5 个 LP 扩展(data_model_wrapper / solver_settings / parser_wrapper / internals /
+  solver_wrapper)编成 .so,链接 RAPIDS-free 的 libcuopt.so。验证:
+  `PYTHONPATH=python/cuopt RAPIDS_DATASET_ROOT_DIR=$PWD/datasets pytest python/cuopt/cuopt/tests/linear_programming`。
+- 干净环境只需非 RAPIDS 依赖:numpy/scipy/pandas/python-dateutil/msgpack(+ 构建用 cython)。
+
+## 7. 待办
+
+- **routing/distance_engine 的 Cython 解耦 + 整轮 wheel 构建**:这两模块运行时确需 cudf/rmm
+  (返回 cudf DataFrame、`DeviceBuffer.c_from_unique_ptr` 是 cdef API),要让整包在无 RAPIDS 下
+  cythonize 须把它们的输出路径也改 host 拷贝,或在 MVP wheel 中排除 routing/distance。
+- **python CMake 去 rapids-cmake/rapids-cython**(Wave 2):`rapids_config`/`rapids-cuda`/
+  `rapids_cython_create_modules`/`find_package(cuopt)` → 平凡 CMake;3 个 pyproject 的
+  `rapids-build-backend` → `scikit_build_core`、删 rmm/pylibraft/rapids-logger 依赖。届时
+  上面的手工脚本可弃。
+- 6 个 routing C++ 测试(GES 环含 depot,见 §5)。
+- 可选 4b:C++ 侧 rapids-cmake → 平凡 CMake/FetchContent。
+- HIP/MACA 后端(本 MVP 不含;shim 的 cuda::mr-free 设计是其前提)。
 
 ## 7. 提交序列（本分支）
 
