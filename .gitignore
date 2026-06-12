@@ -78,3 +78,4 @@ cpp/include/cuopt/semantic_version.hpp
 # Local shim smoke tests (dev only)
 cpp/vendor/smoke_*.cu
 cpp/vendor/smoke_*.cpp
+cpp/build2/
