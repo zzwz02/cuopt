@@ -82,6 +82,7 @@ __device__ inline i_t ldlt_pivot_rule(f_t& dj,
                                       f_t pos_floor,
                                       f_t static_pivot_tol,
                                       f_t diag0_j,
+                                      f_t floor_scale,
                                       bool positive_definite,
                                       bool count,
                                       i_t* static_pivot_count,
@@ -112,7 +113,7 @@ __device__ inline i_t ldlt_pivot_rule(f_t& dj,
   }
   const bool neg  = orig < n_neg;
   const f_t s     = neg ? f_t(-1) : f_t(1);
-  const f_t f_blk = neg ? neg_floor : pos_floor;
+  const f_t f_blk = (neg ? neg_floor : pos_floor) * floor_scale;
   const f_t fl    = f_blk > f_t(0) ? f_blk : static_pivot_tol;
   if (s * dj < fl) {
     if (count) {
@@ -171,6 +172,7 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
                                          f_t pivot_neg_floor,
                                          f_t pivot_pos_floor,
                                          const f_t* diag0,
+                                         const f_t* fscale,
                                          i_t* sign_corrections)
 {
   const i_t j       = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
@@ -213,6 +215,7 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
                                   pivot_pos_floor,
                                   static_pivot_tol,
                                   diag0[j],
+                                  fscale != nullptr ? fscale[j] * fscale[j] : f_t(1),
                                   positive_definite,
                                   threadIdx.x == 0,
                                   static_pivot_count,
@@ -296,6 +299,7 @@ __global__ void ldlt_factor_level_finalize_kernel(const i_t* level_cols,
                                                   f_t pivot_neg_floor,
                                                   f_t pivot_pos_floor,
                                                   const f_t* diag0,
+                                                  const f_t* fscale,
                                                   i_t* sign_corrections)
 {
   const i_t j     = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
@@ -308,6 +312,7 @@ __global__ void ldlt_factor_level_finalize_kernel(const i_t* level_cols,
                                   pivot_pos_floor,
                                   static_pivot_tol,
                                   diag0[j],
+                                  fscale != nullptr ? fscale[j] * fscale[j] : f_t(1),
                                   positive_definite,
                                   threadIdx.x == 0,
                                   static_pivot_count,
@@ -323,20 +328,61 @@ __global__ void ldlt_factor_level_finalize_kernel(const i_t* level_cols,
   }
 }
 
-// y[k] = b[perm[k]]
+// y[k] = b[perm[k]] * (scale ? scale[k] : 1): with the symmetric scaling
+// M' = S M S the solve is x = S * M'^{-1} * (S b).
 template <typename i_t, typename f_t>
-__global__ void ldlt_perm_gather_kernel(const f_t* b, const i_t* perm, i_t n, f_t* y)
+__global__ void ldlt_perm_gather_kernel(
+  const f_t* b, const i_t* perm, i_t n, const f_t* scale, f_t* y)
 {
   const i_t k = static_cast<i_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (k < n) { y[k] = b[perm[k]]; }
+  if (k < n) { y[k] = scale != nullptr ? b[perm[k]] * scale[k] : b[perm[k]]; }
 }
 
-// x[perm[k]] = y[k]
+// x[perm[k]] = y[k] * (scale ? scale[k] : 1)
 template <typename i_t, typename f_t>
-__global__ void ldlt_perm_scatter_kernel(const f_t* y, const i_t* perm, i_t n, f_t* x)
+__global__ void ldlt_perm_scatter_kernel(
+  const f_t* y, const i_t* perm, i_t n, const f_t* scale, f_t* x)
 {
   const i_t k = static_cast<i_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (k < n) { x[perm[k]] = y[k]; }
+  if (k < n) { x[perm[k]] = scale != nullptr ? y[k] * scale[k] : y[k]; }
+}
+
+// Symmetric Jacobi scaling of the assembled (permuted) system:
+// scale[j] = 1/sqrt(|diag_j|), entries (i, j) *= scale_i * scale_j. Bounds
+// the diagonal to +-1, taming element growth of the pivot-free LDL^T on
+// badly ranged quasi-definite KKT systems.
+template <typename i_t, typename f_t>
+__global__ void ldlt_compute_scale_kernel(const f_t* D, i_t n, f_t* scale)
+{
+  const i_t j = static_cast<i_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j >= n) { return; }
+  const f_t a = fabs(D[j]);
+  scale[j]    = a > f_t(0) ? rsqrt(a) : f_t(1);
+}
+
+template <typename i_t, typename f_t>
+__global__ void ldlt_apply_scale_kernel(
+  const i_t* Lp, const i_t* Li, i_t n, const f_t* scale, f_t* Lx, f_t* D)
+{
+  const i_t j = static_cast<i_t>(blockIdx.x);
+  const f_t sj = scale[j];
+  for (i_t p = Lp[j] + static_cast<i_t>(threadIdx.x); p < Lp[j + 1];
+       p += static_cast<i_t>(blockDim.x)) {
+    Lx[p] *= sj * scale[Li[p]];
+  }
+  if (threadIdx.x == 0) { D[j] *= sj * sj; }
+}
+
+template <typename i_t, typename f_t>
+__global__ void ldlt_apply_scale_dense_kernel(
+  i_t tail_start, i_t tail_dim, const f_t* scale, f_t* S)
+{
+  const int64_t t =
+    static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= static_cast<int64_t>(tail_dim) * tail_dim) { return; }
+  const i_t c = static_cast<i_t>(t / tail_dim);
+  const i_t r = static_cast<i_t>(t % tail_dim);
+  S[t] *= scale[tail_start + r] * scale[tail_start + c];
 }
 
 // y[j] /= D[j]
@@ -444,6 +490,7 @@ __global__ void ldlt_factor_bundle_kernel(const i_t* level_ptr,
                                           f_t pivot_neg_floor,
                                           f_t pivot_pos_floor,
                                           const f_t* diag0,
+                                          const f_t* fscale,
                                           i_t* sign_corrections)
 {
   const i_t lane    = static_cast<i_t>(threadIdx.x) & (raft::WarpSize - 1);
@@ -491,6 +538,7 @@ __global__ void ldlt_factor_bundle_kernel(const i_t* level_ptr,
                                       pivot_pos_floor,
                                       static_pivot_tol,
                                       diag0[j],
+                                      fscale != nullptr ? fscale[j] * fscale[j] : f_t(1),
                                       positive_definite,
                                       threadIdx.x == 0,
                                       static_pivot_count,
@@ -542,6 +590,7 @@ __global__ void ldlt_factor_bundle_kernel(const i_t* level_ptr,
                                         pivot_pos_floor,
                                         static_pivot_tol,
                                         diag0[j],
+                                        fscale != nullptr ? fscale[j] * fscale[j] : f_t(1),
                                         positive_definite,
                                         lane == 0,
                                         static_pivot_count,
@@ -624,6 +673,7 @@ __global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
                                          f_t pivot_neg_floor,
                                          f_t pivot_pos_floor,
                                          const f_t* diag0,
+                                         const f_t* fscale,
                                          i_t* sign_corrections)
 {
   __shared__ i_t s_cols[chain_window];
@@ -631,7 +681,9 @@ __global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
   __shared__ i_t s_fopoff[chain_window + 1];
   __shared__ i_t s_perm[chain_window];
   __shared__ f_t s_d[chain_window];
-  __shared__ f_t s_d0[chain_window];
+  // SPD mode needs the assembled diagonal, QD mode the squared floor scale —
+  // mutually exclusive, so one auxiliary array serves both.
+  __shared__ f_t s_aux[chain_window];
   __shared__ i_t s_li[chain_smem];
   __shared__ f_t s_lx[chain_smem];
   __shared__ i_t s_op_slot[chain_smem];
@@ -652,7 +704,9 @@ __global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
       s_fopoff[c]  = fop_off[w0 + c] - fop_off[w0];
       s_perm[c]    = perm[j];
       s_d[c]       = D[j];
-      s_d0[c]      = diag0[j];
+      s_aux[c]     = pivot_n_neg == i_t(0)
+                       ? diag0[j]
+                       : (fscale != nullptr ? fscale[j] * fscale[j] : f_t(1));
       if (c == we - 1) {
         s_smoff[we]  = smoff[w0 + we - 1] + (Lp[j + 1] - Lp[j]);
         s_fopoff[we] = fop_off[w0 + we] - fop_off[w0];
@@ -719,7 +773,8 @@ __global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
                                         pivot_neg_floor,
                                         pivot_pos_floor,
                                         static_pivot_tol,
-                                        s_d0[c],
+                                        pivot_n_neg == i_t(0) ? s_aux[c] : f_t(1),
+                                        pivot_n_neg > i_t(0) ? s_aux[c] : f_t(1),
                                         positive_definite,
                                         lane == 0,
                                         static_pivot_count,
@@ -1082,6 +1137,7 @@ __global__ void ldlt_dense_diag_kernel(f_t* S,
                                        f_t pivot_neg_floor,
                                        f_t pivot_pos_floor,
                                        const f_t* diag0,
+                                       const f_t* fscale,
                                        i_t* sign_corrections)
 {
   for (i_t c = 0; c < nb; c++) {
@@ -1098,6 +1154,8 @@ __global__ void ldlt_dense_diag_kernel(f_t* S,
                                       pivot_pos_floor,
                                       static_pivot_tol,
                                       diag0[tail_start + p0 + c],
+                                      fscale != nullptr ? fscale[tail_start + p0 + c] * fscale[tail_start + p0 + c]
+                                                        : f_t(1),
                                       positive_definite,
                                       true,
                                       static_pivot_count,
@@ -1349,6 +1407,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       first_factor_(true),
       positive_definite_(true),
       use_host_numeric_(std::getenv("CUOPT_LDLT_HOST") != nullptr),
+      stats_enabled_(std::getenv("CUOPT_LDLT_STATS") != nullptr),
       d_Lp_(0, handle_ptr->get_stream()),
       d_Li_(0, handle_ptr->get_stream()),
       d_rp_ptr_(0, handle_ptr->get_stream()),
@@ -1377,6 +1436,9 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_a_values_(0, handle_ptr->get_stream()),
       d_work_(0, handle_ptr->get_stream()),
       d_diag0_(0, handle_ptr->get_stream()),
+      d_scale_(0, handle_ptr->get_stream()),
+      d_solve_b_(0, handle_ptr->get_stream()),
+      d_solve_x_(0, handle_ptr->get_stream()),
       d_fail_(handle_ptr->get_stream()),
       d_static_pivots_(handle_ptr->get_stream()),
       d_sign_corrections_(handle_ptr->get_stream())
@@ -1387,6 +1449,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
 
   ~sparse_cholesky_ldlt_t() override
   {
+    if (solve_graph_valid_) { cudaGraphExecDestroy(solve_graph_); }
     if (std::getenv("CUOPT_LDLT_STATS") != nullptr) {
       settings_.log.printf(
         "LDLT stats: factorize calls=%d total=%.2fs | solve calls=%d total=%.2fs\n",
@@ -1615,7 +1678,11 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
 
     constexpr i_t max_bundle_cols     = 64;
     constexpr int64_t max_bundle_work = 4096;
-    constexpr i_t chain_min_levels    = 64;  // below one window a plain bundle is fine
+    // One block executes a bundle serially: cap the per-launch total so a
+    // long run of near-threshold levels does not become a millisecond-long
+    // single-block kernel.
+    constexpr int64_t max_seg_work = 16384;
+    constexpr i_t chain_min_levels = 64;  // below one window a plain bundle is fine
 
     std::vector<int64_t> factor_work(n_head_levels_, 0);
     std::vector<int64_t> fwd_work(n_head_levels_, 0);
@@ -1661,9 +1728,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
           l++;
           continue;
         }
-        i_t hi = l;
+        i_t hi           = l;
+        int64_t seg_work = 0;
         while (hi < n_head_levels_ && width[hi] <= max_bundle_cols &&
-               work[hi] <= max_bundle_work && !chain_here(hi)) {
+               work[hi] <= max_bundle_work && seg_work + work[hi] <= max_seg_work &&
+               !chain_here(hi)) {
+          seg_work += work[hi];
           hi++;
         }
         segs.push_back({l, hi, 1, ldlt_detail::bundle_block_dim});
@@ -2332,6 +2402,15 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_D_.resize(n_, stream);
       d_work_.resize(n_, stream);
       d_diag0_.resize(n_, stream);
+      d_scale_.resize(n_, stream);
+      d_solve_b_.resize(n_, stream);
+      d_solve_x_.resize(n_, stream);
+      if (solve_graph_valid_) {
+        RAFT_CUDA_TRY(cudaGraphExecDestroy(solve_graph_));
+        solve_graph_ = nullptr;
+      }
+      solve_graph_valid_ = false;
+      solve_graph_warm_  = false;
       raft::copy(d_Lp_.data(), Lp_.data(), Lp_.size(), stream);
       raft::copy(d_Li_.data(), Li_.data(), Li_.size(), stream);
       raft::copy(d_rp_ptr_.data(), rp_ptr_.data(), rp_ptr_.size(), stream);
@@ -2517,6 +2596,27 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     RAFT_CUDA_TRY(cudaMemcpyAsync(
       d_diag0_.data(), d_D_.data(), sizeof(f_t) * n_, cudaMemcpyDeviceToDevice, stream));
 
+    // Symmetric Jacobi scaling of the quasi-definite KKT system (M' = S M S):
+    // bounds the diagonal to +-1, taming element growth of the pivot-free
+    // factorization on badly ranged systems; the solve untransforms.
+    scaling_active_ = pivot_n_neg_ > 0;
+    if (scaling_active_) {
+      const int grid_n0 = (n_ + block_dim - 1) / block_dim;
+      ldlt_detail::ldlt_compute_scale_kernel<i_t, f_t>
+        <<<grid_n0, block_dim, 0, stream>>>(d_D_.data(), n_, d_scale_.data());
+      RAFT_CHECK_CUDA(stream);
+      ldlt_detail::ldlt_apply_scale_kernel<i_t, f_t><<<n_, block_dim, 0, stream>>>(
+        d_Lp_.data(), d_Li_.data(), n_, d_scale_.data(), d_Lx_.data(), d_D_.data());
+      RAFT_CHECK_CUDA(stream);
+      if (tail_dim_ > 0) {
+        const int64_t elems = static_cast<int64_t>(tail_dim_) * tail_dim_;
+        const int grid      = static_cast<int>((elems + block_dim - 1) / block_dim);
+        ldlt_detail::ldlt_apply_scale_dense_kernel<i_t, f_t><<<grid, block_dim, 0, stream>>>(
+          tail_start_, tail_dim_, d_scale_.data(), d_dense_.data());
+        RAFT_CHECK_CUDA(stream);
+      }
+    }
+
     // Static pivoting threshold relative to the largest diagonal magnitude of
     // the (permuted) input.
     const f_t max_abs_diag = thrust::transform_reduce(rmm::exec_policy(stream),
@@ -2559,6 +2659,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                             pivot_neg_floor_,
                                             pivot_pos_floor_,
                                             d_diag0_.data(),
+                                            scaling_active_ ? d_scale_.data() : nullptr,
                                             d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
         if ((seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
@@ -2586,6 +2687,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                             pivot_neg_floor_,
                                             pivot_pos_floor_,
                                             d_diag0_.data(),
+                                            scaling_active_ ? d_scale_.data() : nullptr,
                                             d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
         if ((seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
@@ -2627,6 +2729,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                                  pivot_neg_floor_,
                                                  pivot_pos_floor_,
                                                  d_diag0_.data(),
+                                                 scaling_active_ ? d_scale_.data() : nullptr,
                                                  d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
       } else {
@@ -2649,6 +2752,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                                  pivot_neg_floor_,
                                                  pivot_pos_floor_,
                                                  d_diag0_.data(),
+                                                 scaling_active_ ? d_scale_.data() : nullptr,
                                                  d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
       }
@@ -2816,6 +2920,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                 pivot_neg_floor_,
                                 pivot_pos_floor_,
                                 d_diag0_.data(),
+                                scaling_active_ ? d_scale_.data() : nullptr,
                                 d_sign_corrections_.data());
       RAFT_CHECK_CUDA(stream);
       const i_t m_rest = d - p0 - nb_eff;
@@ -2843,6 +2948,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   {
     f_t start_numeric = tic();
     factorized_       = false;
+    scaling_active_   = false;  // the host reference path never scales
 
     // Scatter A into the factor storage (assignment, see a2l_ comment).
     std::fill(Lx_.begin(), Lx_.end(), f_t(0));
@@ -2939,18 +3045,15 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   // Triangular solves on the device with level-scheduled kernels:
   // x = P^T L^{-T} D^{-1} L^{-1} P b. d_b and d_x are device pointers; d_b is
   // left untouched (the work vector carries the intermediate states).
-  i_t solve_values_device(const f_t* d_b, f_t* d_x, rmm::cuda_stream_view stream)
+  // Issues the full solve kernel sequence (no synchronization): used both
+  // eagerly and under CUDA-graph capture.
+  void solve_kernels_device(const f_t* d_b, f_t* d_x, rmm::cuda_stream_view stream)
   {
-    if (!factorized_) {
-      settings_.log.printf("Solve called before factorize\n");
-      return -1;
-    }
-    f_t t_solve_start = tic();
     constexpr int block_dim = ldlt_detail::factor_block_dim;
     const int grid_n        = (n_ + block_dim - 1) / block_dim;
 
-    ldlt_detail::ldlt_perm_gather_kernel<i_t, f_t>
-      <<<grid_n, block_dim, 0, stream>>>(d_b, d_perm_.data(), n_, d_work_.data());
+    ldlt_detail::ldlt_perm_gather_kernel<i_t, f_t><<<grid_n, block_dim, 0, stream>>>(
+      d_b, d_perm_.data(), n_, scaling_active_ ? d_scale_.data() : nullptr, d_work_.data());
     RAFT_CHECK_CUDA(stream);
 
     cublasHandle_t cublas         = nullptr;
@@ -3101,12 +3204,54 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     }
     if (tail_dim_ > 0) { RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas, prev_mode)); }
 
-    ldlt_detail::ldlt_perm_scatter_kernel<i_t, f_t>
-      <<<grid_n, block_dim, 0, stream>>>(d_work_.data(), d_perm_.data(), n_, d_x);
+    ldlt_detail::ldlt_perm_scatter_kernel<i_t, f_t><<<grid_n, block_dim, 0, stream>>>(
+      d_work_.data(), d_perm_.data(), n_, scaling_active_ ? d_scale_.data() : nullptr, d_x);
     RAFT_CHECK_CUDA(stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+  }
 
-    solve_time_ += toc(t_solve_start);
+  // Triangular solves on the device. The level-scheduled sequence is launch
+  // latency bound, so it is captured once into a CUDA graph against staging
+  // buffers and replayed per solve (the scaling mode is part of the captured
+  // state; analyze invalidates the graph). The first call after each
+  // (re)capture trigger runs eagerly to warm library workspaces.
+  i_t solve_values_device(const f_t* d_b, f_t* d_x, rmm::cuda_stream_view stream)
+  {
+    if (!factorized_) {
+      settings_.log.printf("Solve called before factorize\n");
+      return -1;
+    }
+    f_t t_solve_start = tic();
+    if (solve_graph_valid_ && solve_graph_scaling_ != scaling_active_) {
+      RAFT_CUDA_TRY(cudaGraphExecDestroy(solve_graph_));
+      solve_graph_       = nullptr;
+      solve_graph_valid_ = false;
+      solve_graph_warm_  = false;
+    }
+    raft::copy(d_solve_b_.data(), d_b, n_, stream);
+    if (!solve_graph_valid_) {
+      if (!solve_graph_warm_) {
+        solve_kernels_device(d_solve_b_.data(), d_solve_x_.data(), stream);
+        solve_graph_warm_ = true;
+      } else {
+        RAFT_CUDA_TRY(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        solve_kernels_device(d_solve_b_.data(), d_solve_x_.data(), stream);
+        cudaGraph_t graph = nullptr;
+        RAFT_CUDA_TRY(cudaStreamEndCapture(stream, &graph));
+        RAFT_CUDA_TRY(cudaGraphInstantiate(&solve_graph_, graph, nullptr, nullptr, 0));
+        RAFT_CUDA_TRY(cudaGraphDestroy(graph));
+        solve_graph_valid_   = true;
+        solve_graph_scaling_ = scaling_active_;
+        RAFT_CUDA_TRY(cudaGraphLaunch(solve_graph_, stream));
+      }
+    } else {
+      RAFT_CUDA_TRY(cudaGraphLaunch(solve_graph_, stream));
+    }
+    raft::copy(d_x, d_solve_x_.data(), n_, stream);
+
+    if (stats_enabled_) {
+      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+      solve_time_ += toc(t_solve_start);
+    }
     n_solve_calls_++;
     if (halted()) { return CONCURRENT_HALT_RETURN; }
     return 0;
@@ -3170,6 +3315,14 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   f_t pivot_neg_floor_{0};
   f_t pivot_pos_floor_{0};
   i_t last_sign_corrections_{0};
+  bool scaling_active_{false};
+  bool stats_enabled_{false};
+
+  // Captured solve sequence (see solve_values_device).
+  cudaGraphExec_t solve_graph_{nullptr};
+  bool solve_graph_valid_{false};
+  bool solve_graph_warm_{false};
+  bool solve_graph_scaling_{false};
 
   // Permutation: perm_[k] = original index of the k-th pivot.
   std::vector<i_t> perm_;
@@ -3280,6 +3433,9 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   rmm::device_uvector<f_t> d_a_values_;
   rmm::device_uvector<f_t> d_work_;
   rmm::device_uvector<f_t> d_diag0_;
+  rmm::device_uvector<f_t> d_scale_;
+  rmm::device_uvector<f_t> d_solve_b_;
+  rmm::device_uvector<f_t> d_solve_x_;
   rmm::device_scalar<i_t> d_fail_;
   rmm::device_scalar<i_t> d_static_pivots_;
   rmm::device_scalar<i_t> d_sign_corrections_;
