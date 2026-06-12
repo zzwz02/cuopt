@@ -120,10 +120,20 @@ VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST)→ 全量 ctest **136/137**。根�
 - **MVP 修复**(`move_candidates.cuh::reset`):默认走 eager reset(正确,开销相对 solve 可忽略);
   reset graph 改为经 `CUOPT_USE_RESET_GRAPH` 显式开启,留待 shim 实现真正的 arena
   `pool_memory_resource`(稳定子分配,对所有 routing graph 路径都 capture-safe)后再启用。
-- **剩余 1 个(ROUTING_UNIT_TEST `vehicle_breaks.non_uniform_breaks`)**:compute-sanitizer
-  报 **0 个 device 错误**,是 **host 侧 segfault**(与上面 device 非法地址不同类),仍在排查;
-  其余 56 个 ROUTING_UNIT 子测试已通过。这很可能是 breaks 路径用到的*另一个* CUDA graph
-  (sliding_window / nodes_to_search / vrp find_kernel),进一步印证 arena 分配器才是根治。
+- **剩余 1 个(ROUTING_UNIT_TEST `vehicle_breaks.non_uniform_breaks`)= 潜在 cuOpt
+  use-after-free,被 shim 暴露**(非 shim 自身 bug)。compute-sanitizer 报 **0 个 device
+  错误**;LD_PRELOAD backtrace 定位:测试校验代码 `check_route`(check_constraints.cu)经
+  `cuopt::host_copy<int>` → `raft::copy` → `cudaMemcpyAsync` 在**驱动内 segfault**,即读了一个
+  **已释放的 data_model device 指针**。
+  - **决定性对照**(同一二进制,改 `--rmm_mode`):`cuda`(同步 cudaMalloc)**段错**、
+    `pool`(cudaMallocAsync)**段错**、`managed`(cudaMallocManaged)**通过**。非 managed 内存
+    释放后 VA 被解除映射 → 读悬垂指针即崩;managed/arena 让 VA 始终可读 → 读到陈旧但合法数据 →
+    过。baseline(rmm 默认 = arena `pool_memory_resource`,从大块 cudaMalloc 子分配、永不解映射)
+    正是这样把这个潜在 UAF 掩盖掉的。
+  - **根治** = shim 实现真正的 stream-ordered arena/caching `pool_memory_resource`(释放只回收进
+    free-list、不真正 cudaFree → VA 始终映射;同流复用保序、跨流不复用保安全)。它同时能:修掉本
+    测试、让 reset graph(及其它 routing graph)可经 `CUOPT_USE_RESET_GRAPH` 重新启用。见 task。
+  - 该 UAF 属 cuOpt 既有缺陷(读已释放指针),与 cuDSS 期记录的"被 rmm pool 掩盖的潜在 bug"同类。
 
 ## 6. Python LP/MILP 路径（无 RAPIDS 包，已验证通过）
 
