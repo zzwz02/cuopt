@@ -203,8 +203,9 @@ VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST)→ 全量 ctest **136/137**。根�
 
 双侧**同等跳过**(与 RAPIDS 移除无关):
 - 2 个上游无条件禁用:RETAIL_L1TEST、ROUTING_L1TEST(cpp/tests/routing/CMakeLists.txt:29)。
-- 3 个 gRPC C++ 测试(GRPC_CLIENT/PIPE_SERIALIZATION/INTEGRATION_TEST):双侧 CMakeCache 均
-  `SKIP_GRPC_BUILD=1`,未注册未构建(cuDSS 期 conda 构建为 140 测试含 gRPC,139/140)。
+- 3 个 gRPC C++ 测试(GRPC_CLIENT/PIPE_SERIALIZATION/INTEGRATION_TEST):双侧本地构建
+  CMakeCache 均 `SKIP_GRPC_BUILD=1`,未注册未构建。**后续已补齐:见 §7.6 的 gRPC 启用构建
+  (shim 树 conda 配置,142 注册、3 个 gRPC 测试全过)。**
 
 baseline 137/137 的证据链:初跑 118/137,19 个失败全为 datasets 相对路径环境错;加
 `tests/**/datasets` 符号链接后清零(记录于 /tmp/baseline_bench.txt;最终清跑日志未保留,
@@ -258,12 +259,13 @@ QP_Test_1/2)——全部逐位一致;good_mip 仅 baseline 留档。shim 侧计�
 
 **❌ 不支持**:
 1. **Python routing API**(cuopt.routing)——cimport rmm/pylibraft + 运行时 import cudf,
-   扩展未编译;
+   扩展未编译;**决策(2026-06-12):MI100 有对应 cudf,保留 cudf API 契约,只解耦
+   rmm/pylibraft cimport(路线 a)**;
 2. **Python distance_engine**——同上(waypoint_matrix.pxd:13-14);
 3. **cuopt_server(REST)**——源码硬依赖 rmm/cudf(utils/solver.py:367 对**所有** solve
    `import rmm`);
-4. **gRPC server(C++)**——未构建(双侧 SKIP_GRPC;源码已对接 logger shim,
-   grpc_server_logger 的 pattern 在 shim 支持子集内);
+4. ~~gRPC server(C++)~~ **已支持并验证**:见 §7.6——conda 配置构建,3 个 gRPC C++ 测试 +
+   Python 远程执行 11/11 全过,零 RAPIDS 链接;
 5. **pip wheel 安装**——pyproject 仍 rapids-build-backend + cudf/pylibraft/rmm 钉版;
    现行路径仅 §6 的手工脚本;
 6. HIP/MACA(本就不在 MVP 范围,是后续动机)。
@@ -298,6 +300,34 @@ QP_Test_1/2)——全部逐位一致;good_mip 仅 baseline 留档。shim 侧计�
   未覆盖;
 - MPS parser 无 fuzz harness(仓库本就没有);
 - 多 GPU:无任何测试;cuopt_cli 的 per-device 池循环 >1 GPU 分支未走。
+
+### 7.6 gRPC 启用（2026-06-12 补齐;对齐 cuDSS 期 conda 门槛）
+
+在 `cuopt-dev` conda 环境(gcc14 conda 编译器、nvcc 12.9、grpc 1.78、Boost 1.91、Ninja)
+以 `SKIP_GRPC_BUILD=0` 重建 shim 树到 `cpp/build-conda`:
+
+- **整树在新工具链下只需一个 shim 修复**:rapids_logger shim 补命名级别方法
+  (trace/debug/info/warn/error/critical,gRPC server 的 SERVER_LOG_* 直接调用;主库走宏
+  所以此前未暴露)。
+- **142 个 ctest 注册**(139 + 3 gRPC)。正式 `-j4` 全量 = **139/140**,3 个 gRPC 测试
+  (GRPC_CLIENT / PIPE_SERIALIZATION / INTEGRATION)**全部通过**——与 cuDSS 期 conda 门槛
+  (139/140)持平。唯一失败 CUTS_TEST 为该工具链下的 1 秒时限边缘抖动:目标值每次精确 -28、
+  total_solve_time 骑线 0.99–1.25s,**串行重跑即过**(cuDSS 期对照二进制同样骑线 0.989s
+  仅余 11ms)→ 套件实际 **140/140 可绿**。ROUTING_UNIT(prize_collection)与 UNIT_TEST 为
+  `-j4` GPU 争抢 flake,单独跑 3/3 过。
+- `cuopt_grpc_server` 直接 NEEDED = libcuopt + grpc + protobuf,**零 RAPIDS**。
+- **第二个 shim 保真度修复(CPU-only 模式)**:rmm 的 get_current_cuda_device /
+  cuda_set_device_raii 用 RMM_ASSERT_CUDA_SUCCESS(release 下 no-op、无设备返回 -1 不抛),
+  shim 原用 RMM_CUDA_TRY 在 `CUDA_VISIBLE_DEVICES=""` 时抛 cudaErrorNoDevice,破坏 CPU-only
+  远程执行;改为镜像 rmm(吞错返 -1,per_device 表对 -1 钳位)。
+- **Python 远程执行路径打通**:`test_cpu_only_execution.py` **11/11 全过**(此前 9 个常年
+  skip)——gRPC 远程 LP/MIP solve、对偶解、warmstart、CLI remote 模式、TLS、mTLS。
+  LP/QP/SOCP 回归 19/19 仍绿。
+- 运行环境注意:conda LDFLAGS 把 env lib 排 RUNPATH 最前且 env 装有旧版全 RAPIDS libcuopt →
+  跑测试须 `LD_LIBRARY_PATH=$build`(LD_LIBRARY_PATH 优先于 RUNPATH);本机有
+  `http_proxy=127.0.0.1:3576` → gRPC localhost 连接须 unset 代理 + `no_proxy=localhost,...`
+  (与 cuDSS 期记录一致);python 扩展若加载 conda 构建的 libcuopt 须把
+  `/opt/conda/envs/cuopt-dev/lib` 加入 LD_LIBRARY_PATH(GLIBCXX_3.4.31)。
 
 ## 8. 待办
 
