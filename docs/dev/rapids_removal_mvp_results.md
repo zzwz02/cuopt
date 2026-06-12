@@ -141,11 +141,47 @@
 对照组(未受影响路径):PDLP afiro -4.64761260e+02 与基线逐位一致;
 对偶单纯形 afiro 0.03 s,行为与双基线一致。
 
+### 5.3 QP 全集(Maros-Mészáros 138 题,Barrier,180 s)
+
+本版与 cuDSS 原版各完整扫描一遍:
+
+| 指标 | 本版(shim,自研 LDLᵀ) | cuDSS 原版 |
+|---|---|---|
+| 180 s 内完成 | **138 / 138** | 138 / 138 |
+| 目标值一致(rel < 1e-4,129 题可比) | **126 / 129** | — |
+| 总求解时间(双方均完成的 129 题) | 289 s | 38 s |
+| 单题时间比(本版/cuDSS) | 中位数 **1.44×**,均值 4.49× | 1× |
+
+3 题目标差 0.10–0.36%(QCAPRI / QSIERRA / UBH1,病态 QP 的 IPM 容差级差异,
+两侧均为可行驻点);时间差距源于自研 LDLᵀ 与 cuDSS supernodal 分解在
+填充重因子上的既有差距(与 §5.1 LP 结论一致),与 RAPIDS 移除无关。
+
+### 5.4 Routing(CVRPLIB Set-X / Solomon / Homberger,固定时间预算)
+
+同一驱动脚本、同机两套构建(**shim** = 本版 wheel;**RAPIDS 基线** = 官方
+26.06 wheel,真 rmm/raft),每组合 2 次重复,报告目标值(均为 SUCCESS、
+车辆数一致):
+
+| 实例(规模,预算) | shim(2 次) | RAPIDS 基线(2 次) | 文献 BKS |
+|---|---|---|---|
+| X-n101-k25(101,30 s) | 31573 / 32753 | 31962 / 32680 | 27591 |
+| X-n439-k37(439,60 s) | 36454 / 36470 | 36447 / 36497 | 36391 |
+| X-n1001-k43(1001,120 s) | 73709 / 74042 | 73821 / 74077 | 72355 |
+| C101(Solomon 100+TW,30 s) | **828.94 / 828.94** | 828.94 / 828.94 | 828.94(最优)|
+| C1_10_1(Homberger 1000+TW,120 s) | **42478.95 / 42478.95** | 42478.95 / 42478.95 | ≈42444 |
+
+结论:固定预算下两构建解质量**统计无差**(组间差小于组内重复方差,多处
+shim 略优);时间窗类双方逐位同解,C101 双方均达已证最优。eager-reset 与
+arena 池对 routing 求解质量与速度无可测影响。
+
 ## 6. 构建与打包
 
-- **C++(本地)**:`.toolchain` cmake 3.30.8 + 系统 gcc11/CUDA12.1,
-  `cpp/build`;rapids-cmake 仅作为构建期工具保留(拉取 CCCL/gtest,可后续
-  替换为平凡 FetchContent)。
+- **C++(本地)**:`.toolchain` cmake 3.30.8 + 系统 gcc11/CUDA12.1。
+  **构建系统已完全去 rapids-cmake**(4b):版本/架构/构建类型/静态 cudart
+  为原生 CMake;CCCL(v3.4.0)/googletest/argparse/papilo 等经标准
+  `FetchContent`(支持 `-DFETCHCONTENT_SOURCE_DIR_*` 离线源覆盖);
+  `cuopt-config.cmake` 改为手写(install + build 两套,自动为消费方提供
+  CCCL 目标)。配置期**不再从 RAPIDS 仓库下载任何内容**。
 - **C++(conda,含 gRPC)**:`cuopt-dev` 环境 gcc14/nvcc12.9/grpc1.78,
   `cpp/build-conda`,`-DSKIP_GRPC_BUILD=0`。
 - **Python wheel**:`pip wheel ./python/libcuopt`(scikit-build-core,完整
@@ -160,8 +196,7 @@
 
 - routing reset 的捕获重放 CUDA Graph 在 shim 下仍异常(默认 eager 全绿,
   开关保留),机制待独立定位。
-- routing 性能基准(CVRPLIB Set-X / Solomon / Homberger)未例行化,为
-  最有价值的补测项;MIP 实例集与 server 吞吐基准同此。
-- cpp 侧 rapids-cmake → 平凡 FetchContent(纯构建工具替换,可选)。
-- HIP/MACA 后端移植:本工作消除了 cuda::mr/RAPIDS 障碍,后续主要工作为
-  warp64/平台运行时适配;routing Python 依赖目标平台的 cudf 移植版。
+- MIP 实例集(MIPLIB)与 server 吞吐基准未例行化。
+- HIP/MACA 后端移植:本工作消除了 cuda::mr/RAPIDS 障碍(运行时与构建系统
+  均不再触及 RAPIDS),后续主要工作为 warp64/平台运行时适配;routing
+  Python 依赖目标平台的 cudf 移植版。

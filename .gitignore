@@ -79,3 +79,4 @@ cpp/include/cuopt/semantic_version.hpp
 cpp/vendor/smoke_*.cu
 cpp/vendor/smoke_*.cpp
 cpp/build2/
+cpp/build3/
