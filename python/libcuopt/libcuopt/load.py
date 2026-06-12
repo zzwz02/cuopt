@@ -35,18 +35,8 @@ def _load_wheel_installation(soname: str):
 
 def load_library():
     """Dynamically load libcuopt.so and its dependencies"""
-    try:
-        # librmm and libraft must be loaded before libcuopt
-        # because libcuopt references them.
-        import libraft
-        import librmm
-        import rapids_logger
-
-        rapids_logger.load_library()
-        librmm.load_library()
-        libraft.load_library()
-    except ModuleNotFoundError:
-        pass
+    # No RAPIDS preloads: libcuopt no longer links librmm / libraft /
+    # librapids_logger (vendored RAPIDS-free shims are header-inlined).
 
     prefer_system_installation = (
         os.getenv("RAPIDS_LIBCUOPT_PREFER_SYSTEM_LIBRARY", "false").lower()

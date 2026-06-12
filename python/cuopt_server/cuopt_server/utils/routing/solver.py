@@ -116,14 +116,8 @@ def create_data_model(
     travel_time_matrix: Optional[dict] = None,
 ):
     warnings = []
-    # Make sure that we are using pool memory allocator
-    import rmm
-
-    assert isinstance(
-        rmm.mr.get_current_device_resource(), rmm.mr.StatisticsResourceAdaptor
-    ) or isinstance(
-        rmm.mr.get_current_device_resource(), rmm.mr.PoolMemoryResource
-    )
+    # (No rmm pool assertion: libcuopt allocates through the vendored
+    # RAPIDS-free allocators, not the real-rmm registry.)
 
     n_fleet = len(optimization_data.fleet_data["vehicle_locations"])
 

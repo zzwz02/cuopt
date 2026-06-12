@@ -3,36 +3,13 @@
 
 import numpy as np
 
-# cudf / pylibcudf are imported lazily so the LP/MILP path (numpy-in/numpy-out)
-# works without RAPIDS packages installed. Only the routing path needs them.
-
-
-def series_from_buf(buf, dtype):
-    """Helper function to create a cudf series from a buffer.
-
-    Parameters
-    ----------
-    buf : cudf.core.buffer.Buffer
-        The buffer containing the data
-    dtype : pyarrow.dtype or type
-        The data type for the Series
-
-    Returns
-    -------
-    cudf.Series
-        A cudf Series built from the buffer
-    """
-    import cudf
-    import pylibcudf as plc
-
-    col = plc.column.Column.from_rmm_buffer(
-        buf,
-        dtype=plc.types.DataType.from_arrow(dtype),
-        size=buf.size // dtype.byte_width,
-        children=[],
-    )
-
-    return cudf.Series.from_pylibcudf(col)
+# cudf is imported lazily so the LP/MILP path (numpy-in/numpy-out) works
+# without it installed. Only the routing path needs cudf.
+#
+# (series_from_buf, which built cudf Series from rmm DeviceBuffers via
+# pylibcudf, was removed: the Cython wrappers now copy device buffers to
+# host numpy and construct cudf objects directly, so nothing in cuopt
+# touches the rmm python package.)
 
 
 def get_data_ptr(array):

@@ -357,24 +357,11 @@ def process_async_solve(
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-    # Initialize memory resource to use pool memory
-    # upfront to make sure all memory allocations are
-    # using the same pool allocator. cuOpt performs
-    # significant number of memory allocations and
-    # deallocations, especially when there are high
-    # number of vehicles. Pool memory is efficient in
-    # handling such memory allocation patterns
-    import rmm
-
-    pool_gigs = int(os.environ.get("CUOPT_GIGABYTES_PER_PROC", 1))
-
-    # limit the pool size so that we allow running
-    # multiple processes on same GPU simultaneously
-    pool = rmm.mr.PoolMemoryResource(
-        rmm.mr.CudaMemoryResource(), initial_pool_size=2**30 * pool_gigs
-    )
-
-    rmm.mr.set_current_device_resource(pool)
+    # No rmm pool setup: libcuopt manages its own device memory through the
+    # vendored RAPIDS-free allocators, and cudf manages its columns with its
+    # own bundled memory resource. The historical per-worker
+    # rmm.mr.PoolMemoryResource here only ever configured the real-rmm
+    # registry, which the shimmed libcuopt does not read.
 
     # These are all the loggers touched by CUDA that we do not
     # want to hear from normally. The only practical way to build
@@ -409,8 +396,6 @@ def process_async_solve(
                 logging.error(f"solver process unhealthy: {msg}")
                 results_queue.put(CudaUnhealthy())
         return cuda_healthy
-
-    logging.info(f"solver rmm pool size in gigabytes {pool_gigs}")
 
     try:
         # only log cuda health check message 1 per hour
