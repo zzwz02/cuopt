@@ -18,6 +18,7 @@
 #include <rmm/mr/device_memory_resource.hpp>
 #include <rmm/mr/managed_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 
 #include <memory>
 
@@ -35,12 +36,19 @@ inline mr_ptr make_managed() { return std::make_shared<rmm::mr::managed_memory_r
 
 inline mr_ptr make_pool()
 {
-  // 1GB of initial pool size, backed by the stream-ordered CUDA mempool.
-  const size_t initial_pool_size = 1024 * 1024 * 1024;
-  return std::make_shared<rmm::mr::cuda_async_memory_resource>(initial_pool_size);
+  // rmm-faithful arena pool: sub-allocates from large cudaMalloc slabs that
+  // are never freed back until destruction, so freed virtual addresses stay
+  // mapped. This keeps pointers captured inside replayed CUDA graphs stable
+  // and matches rmm pool_memory_resource's memory-reuse behavior (the
+  // cudaMallocFromPoolAsync-backed resource it replaces unmapped freed VAs,
+  // which broke captured-graph replay and surfaced a latent use-after-free).
+  static rmm::mr::cuda_memory_resource upstream{};
+  const size_t initial_pool_size = 1024 * 1024 * 1024;  // 1 GiB
+  return std::make_shared<rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
+    &upstream, initial_pool_size);
 }
 
-// The mempool already pools allocations; "binning" maps to the pool resource.
+// The pool already coalesces and bins by best-fit; "binning" maps to it.
 inline mr_ptr make_binning() { return make_pool(); }
 
 /**
