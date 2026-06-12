@@ -258,17 +258,33 @@ QP_Test_1/2)——全部逐位一致;good_mip 仅 baseline 留档。shim 侧计�
 (numpy 进出,含 batch solve、warm start、incumbent callback)。
 
 **❌ 不支持**:
-1. **Python routing API**(cuopt.routing)——cimport rmm/pylibraft + 运行时 import cudf,
-   扩展未编译;**决策(2026-06-12):MI100 有对应 cudf,保留 cudf API 契约,只解耦
-   rmm/pylibraft cimport(路线 a)**;
-2. **Python distance_engine**——同上(waypoint_matrix.pxd:13-14);
+1. ~~Python routing API~~ **已支持并验证(2026-06-12,路线 a:保留 cudf 契约)**:解耦
+   rmm/pylibraft cimport(shim 本地声明 + D2H→cudf.Series 输出,见 §7.7),
+   `cuopt/tests/routing` 全套 **43/43 通过**(含 distance_engine/批量/重路由/合成数据生成);
+2. ~~Python distance_engine~~ **已支持并验证**——同上;
 3. **cuopt_server(REST)**——源码硬依赖 rmm/cudf(utils/solver.py:367 对**所有** solve
-   `import rmm`);
+   `import rmm`);routing 解耦后仅剩此项 + wheel 打包;
 4. ~~gRPC server(C++)~~ **已支持并验证**:见 §7.6——conda 配置构建,3 个 gRPC C++ 测试 +
    Python 远程执行 11/11 全过,零 RAPIDS 链接;
 5. **pip wheel 安装**——pyproject 仍 rapids-build-backend + cudf/pylibraft/rmm 钉版;
-   现行路径仅 §6 的手工脚本;
+   现行路径仅 §6 的手工脚本(已含 routing/distance 共 8 模块);
 6. HIP/MACA(本就不在 MVP 范围,是后续动机)。
+
+### 7.7 Python routing/distance_engine 解耦(2026-06-12,cudf 契约保留)
+
+**结论:`cuopt/tests/routing` 43/43 通过**(cudf-cu12 26.6.0 安装、shim libcuopt,6m37s)。
+- **为什么装着 RAPIDS 也必须解耦 cimport**:pylibraft `Handle`、rmm `DeviceBuffer`、
+  pylibcudf `Column.from_rmm_buffer` 的 Cython 声明/Python 类按**真** raft/rmm ABI 编译;
+  shim 的 `handle_t`/`device_buffer` 内存布局不同,跨界传递 = UB。wrapper 本就自建裸
+  `new handle_t()`(不经 pylibraft Python 对象),故照 LP 模式即可。
+- 改动:routing_utilities.pxd / waypoint_matrix.pxd 改 shim 本地 `cdef extern` 声明;
+  三个 wrapper 的输出路径(Solve + BatchSolve + 数据生成器 + waypoint 序列)用
+  `_device_buffer_to_series/_to_numpy`(cudaDeviceSynchronize + cudaMemcpy D2H,按
+  np.dtype.itemsize 定尺寸)替换 DeviceBuffer/series_from_buf,再包 cudf.Series /
+  cp.array(4 处带形状的 cupy 重建逐一保形)。
+- **ABI 隔离原则**:shim device_buffer 的析构全部发生在 cuopt 扩展 TU 内;cudf 用它自带的
+  真 rmm 管理自身内存——两边永不交换 C++ 对象。
+- 构建:`build_lp_modules_rapids_free.sh` 扩至 8 模块(含 routing×2 + distance×1)。
 
 **⚠️ 降级**:
 1. routing C++:CUDA-graph reset 默认关闭(eager reset;`CUOPT_USE_RESET_GRAPH` 实验性,
