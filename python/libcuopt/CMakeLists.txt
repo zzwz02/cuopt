@@ -5,13 +5,17 @@
 
 cmake_minimum_required(VERSION 3.30 FATAL_ERROR)
 
-include(../../cmake/rapids_config.cmake)
-include(rapids-cuda)
-rapids_cuda_init_architectures(libcuopt-python)
+# Plain-CMake build (RAPIDS-free): no rapids-cmake / rapids-cuda.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/libcuopt/VERSION" _libcuopt_version_raw)
+string(STRIP "${_libcuopt_version_raw}" LIBCUOPT_PY_VERSION)
+
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
 
 project(
   libcuopt-python
-  VERSION "${RAPIDS_VERSION}"
+  VERSION "${LIBCUOPT_PY_VERSION}"
   LANGUAGES CXX CUDA
 )
 
@@ -23,7 +27,7 @@ message(STATUS "=============================================================")
 
 # Check if cuopt is already available. If so, it is the user's responsibility to ensure that the
 # CMake package is also available at build time of the Python cuopt package.
-find_package(cuopt "${RAPIDS_VERSION}")
+find_package(cuopt "${LIBCUOPT_PY_VERSION}")
 
 if(cuopt_FOUND)
   return()
@@ -39,9 +43,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(argparse)
 
-# gRPC must be available as an installed CMake package (gRPCConfig.cmake).
-# On RockyLinux 8 wheel builds we install it in CI via ci/utils/install_protobuf_grpc.sh.
-find_package(gRPC CONFIG REQUIRED)
+# gRPC must be available as an installed CMake package (gRPCConfig.cmake)
+# unless the gRPC server is skipped (-DSKIP_GRPC_BUILD=ON).
+if(NOT SKIP_GRPC_BUILD)
+  find_package(gRPC CONFIG REQUIRED)
+endif()
 
 find_package(Boost 1.65 REQUIRED)
 if(Boost_FOUND)
@@ -71,8 +77,6 @@ target_link_libraries(cuopt_cli PRIVATE
 
 set(rpaths
   "$ORIGIN/../lib64"
-  "$ORIGIN/../../rapids_logger/lib64"
-  "$ORIGIN/../../librmm/lib64"
   "$ORIGIN/../../nvidia/cublas/lib"
   "$ORIGIN/../../nvidia/curand/lib"
   "$ORIGIN/../../nvidia/cusolver/lib"
@@ -95,4 +99,17 @@ message(STATUS "libcuopt: Final RPATH = ${rpaths}")
 
 set_property(TARGET cuopt PROPERTY INSTALL_RPATH ${rpaths} APPEND)
 set_property(TARGET cuopt_cli PROPERTY INSTALL_RPATH ${rpaths} APPEND)
-set_property(TARGET cuopt_grpc_server PROPERTY INSTALL_RPATH ${rpaths} APPEND)
+if(TARGET cuopt_grpc_server)
+  set_property(TARGET cuopt_grpc_server PROPERTY INSTALL_RPATH ${rpaths} APPEND)
+endif()
+
+# Bundle the TBB runtime next to libcuopt.so when TBB is an external shared
+# library (production wheels normally achieve this via auditwheel repair).
+if(TBB_LIBRARY)
+  get_filename_component(_tbb_real "${TBB_LIBRARY}" REALPATH)
+  get_filename_component(_tbb_dir "${_tbb_real}" DIRECTORY)
+  file(GLOB _tbb_runtime "${_tbb_dir}/libtbb.so*")
+  if(_tbb_runtime)
+    install(FILES ${_tbb_runtime} DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  endif()
+endif()

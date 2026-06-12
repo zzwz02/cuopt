@@ -1,392 +1,167 @@
-# cuOpt 移除 rmm/raft/rapids 的 MVP 实施结果（CUDA-only）
+# cuOpt RAPIDS 依赖移除——实施结果与全栈验证报告
 
-> 实施记录。分支 `feature/remove-cudss-custom-ldlt`。目标：在 CUDA 上以
-> 自有 cuda::mr-free 同名 shim 替换 rmm/raft/rapids_logger，使 libcuopt 构建并
-> 链接为零 RAPIDS 运行时依赖，求解结果与基线一致。计划见
-> `docs/dev/rapids_removal_plan.md`，shim 在 `cpp/vendor/include/{rmm,raft,rapids_logger}`。
+> 分支 `feature/remove-cudss-custom-ldlt`(在 cuDSS 移除/自研 LDLᵀ 之上)。
+> 目标:以自研 cuda::mr-free 同名 shim 头文件树替换 rmm / raft / rapids_logger,
+> 使 cuOpt 全栈(C++ / C API / CLI / Python / REST server / gRPC)在零 RAPIDS
+> 运行时依赖下构建、与官方 conda/wheel 版功能持平;cudf 按产品决策保留为
+> routing 的可选运行时依赖(MI100 等目标平台有对应 cudf 移植)。
+> 计划文档:`docs/dev/rapids_removal_plan.md`;
+> cuDSS 阶段基准:`docs/dev/cudss_replacement_benchmark.md`。
+> 硬件:NVIDIA A100-PCIE-40GB(驱动 CUDA 12.9);AMD EPYC 7543。
 
 ## 1. 结论
 
-**核心目标达成。** libcuopt.so + cuopt_cli + 全部 40 个测试可执行文件构建通过、
-**零编译错误**，运行时**不再链接 librmm.so / libraft / librapids_logger.so**。
-cuopt_cli 的 barrier 与 PDLP 求解目标值与基线**逐位一致**。C++ 单元测试
-**137/137 (100%) 通过,与 baseline 完全持平**(演进:121→129→131→136→137;最后一步由
-shim 实现 rmm 式 stream-ordered **arena** `pool_memory_resource` 达成,见 §5)。CLI_TEST 与
-DOC_EXAMPLE 早期的"失败"经查是测试环境问题(cuopt_cli 不在 PATH、/tmp 残留文件),非 shim bug。
-**Python LP/MILP 路径已在零 RAPIDS 包环境构建并通过全部测试(51 passed / 0 failed,见 §6);
-QP/SOCP 专项 Python 套件同环境 5/5 通过。** 与 baseline 的全量测试覆盖对比、跳过项与
-不支持功能清单见 §7(2026-06-12 实证审计)。
+- **运行时依赖**:`ldd libcuopt.so` 不再含 librmm / libraft / librapids_logger
+  / libcudss;体积 ~108 MB → ~106 MB。源码层面,cuopt 全部 C++/Python/server
+  代码中 `import rmm`/pylibraft 引用为零;rmm 仅作为 cudf 自身的内部依赖存在,
+  与 cuopt 代码零接触,无须修改 cudf。
+- **功能**:与 cuDSS 期 conda 版全量验证门槛逐项持平(§4):C++ ctest 本地
+  137/137、conda 配置(含 gRPC)139/140;Python 全树 108/108;server 94+7 skip;
+  self-hosted 3/3;Python gRPC 远程执行(CPU-only/TLS/mTLS)11/11。
+- **性能**:与移除前(06-11 自研 LDLᵀ 优化版)逐实例一致(差异 ≤4%,在运行
+  噪声内);与 cuDSS 原版的关系维持 06-11 结论(小/中型与 QP 同量级或更快,
+  填充重的大型因子分解 1.3–1.7×)。详见 §5。
+- **打包**:三个 Python 包均改为平凡构建后端(scikit-build-core / setuptools),
+  `pip wheel` 不再依赖 rapids-build-backend / rapids-cmake / rapids-cython;
+  cudf 移入 `cuopt[routing]` extra。
 
-### 通过率演进与真实根因（诊断记录）
+## 2. 实施步骤概要
 
-初次全量构建后 ctest 只有 121–123/137,失败报 `cudaErrorIllegalAddress` 等。逐一定位
-后发现**多数是真实的 shim 正确性 bug**(非最初推测的"cuOpt 潜在 bug 长尾"),修复后达
-129/137:
+| 阶段 | 内容 | 结果 |
+|---|---|---|
+| 1. shim 头文件树 | 手写 cuda::mr-free 的 rmm(容器/流/资源/分配器,16 头)+ raft core(handle/span/mdspan/copy 等);纯 CUDA 的 raft 叶子(math/operators/reduction/warp/RNG-PCG/cublas+cusparse wrappers)逐字移植保数值序;header-only rapids_logger | 独立烟测通过 |
+| 2. CMake 切换 | cpp/CMakeLists 删除 rmm/raft/rapids_logger 拉取与链接,vendor include 接管;CCCL(非 RAPIDS)保留 | 全量零编译错误,ldd 零 RAPIDS |
+| 3. C++ 测试修复 | 五项修复(见 §2.1)将 ctest 由 121/137 修至 **137/137** | 与 baseline 持平 |
+| 4. Python LP/MILP | solver.pxd/pyx 的 rmm/pylibraft cimport 改 shim 本地声明,device_buffer 输出改 cudaMemcpy D2H→numpy;utilities cudf 惰性化 | LP/QP/SOCP 65/65,afiro 目标值与 C++ 逐位一致 |
+| 5. routing/distance Python | 同法解耦 cimport,输出改 D2H→cudf.Series(**cudf API 契约保留**);要点:即使环境装有 RAPIDS,wheel 编译的 pylibraft/rmm Python 类按真 raft/rmm ABI 布局,不可与 shim 类型互传 | routing 全套 43/43(含 distance/批量/重路由/数据生成) |
+| 6. gRPC 启用 | conda 环境(gcc14/nvcc12.9/grpc1.78)以 SKIP_GRPC_BUILD=0 重建 shim 树;两项 shim 保真度修复(§2.1) | 142 注册,139/140,3 个 gRPC 测试全过;Python 远程 11/11 |
+| 7. server + rmm 彻底剥离 | server 零功能改动即通过;按要求删除全部 `import rmm`(池初始化/断言/预加载/死代码) | server 94+7 复测通过 |
+| 8. 打包 | 3 个 pyproject 去 rapids-build-backend;python CMake 去 rapids-cmake/rapids-cython(自带 30 行兼容函数,子目录零改动) | `pip wheel` 产出 cuopt/libcuopt wheel |
 
-1. **默认流必须是 per-thread,不能是 legacy null 流**(最大单点,+7 测试)。cuOpt 用
-   `manual_cuda_graph_t` / 路由 `cuda_graph` 把求解步骤捕获进 CUDA Graph,捕获目标流取自
-   `handle.get_stream()`。我的 handle 原默认 `cuda_stream_default`(=0,legacy null 流)——
-   它有全局同步语义、**不能作 stream capture 的目标**,于是所有用图的路径在图内 cublasdot
-   报 `CUBLAS_STATUS_EXECUTION_FAILED` / `cudaErrorInvalidDevice`。改默认为
-   `cuda_stream_per_thread`(与 raft 一致、可捕获)后 PDLP_TEST/MIP_TEST/INCUMBENT_CALLBACK
-   等全部通过。
-2. **handle 拷贝须共享 cuBLAS/cuSPARSE 资源**(引用计数 `shared_ptr`)。raft 的拷贝共享底层
-   资源,我原来每拷贝新建会丢掉 cuOpt 经 init_handler 设的 device pointer mode。
-3. **CUDA Graph 需要可捕获分配器**:同步 cudaMalloc(非池化"cuda"模式)在 capture 中被禁止,
-   测试默认须用 `cudaMallocFromPoolAsync` 池。
-4. **池分配清零**(+1,LP_UNIT):driver mempool 复用 freed 块带残留内容,cuOpt 某些路径读
-   未初始化内存当索引→越界;对池分配 `cudaMemsetAsync` 清零(异步、基准无可测开销)。
+### 2.1 关键缺陷修复(一句话记录)
 
-## 2. 运行时依赖（ldd 实证）
+1. shim handle 默认流改为 `cuda_stream_per_thread`——legacy null 流不能作 CUDA
+   Graph 捕获目标(+7 测试)。
+2. handle 拷贝改为共享引用计数的 cuBLAS/cuSPARSE 句柄,保住 cuOpt 设定的
+   device pointer mode。
+3. 测试默认分配器须可捕获(同步 cudaMalloc 在 stream capture 中非法)。
+4. routing 的 move-candidates reset 由捕获重放 CUDA Graph 改为默认 eager 发射
+   ——重放型图与 shim 分配器组合下哨兵填充不生效(`CUOPT_USE_RESET_GRAPH`
+   保留为实验开关;arena 池落地后该路径仍异常,机制待查,eager 全绿)。
+5. `pool_memory_resource` 重写为 rmm 式 stream-ordered **arena**(大 slab 子分
+   配、析构前不解映射、per-stream event 键控 free list、跨流取块 WaitEvent、
+   地址序合并)——修复最后一例 ROUTING_UNIT 段错(cuOpt 既有 use-after-free
+   被解映射型分配器暴露,arena 与 rmm 同样使其良性)→ 137/137。
+6. rapids_logger shim 补命名级别方法(error/warn/info 等,gRPC server 直调)。
+7. 设备查询改为非抛出(无 GPU 返回 -1,镜像 rmm 的 release 语义)——修复
+   CPU-only 远程执行模式(`CUDA_VISIBLE_DEVICES=""`)。
+8. server 剥 rmm 时遗留一行引用已删变量的日志导致 worker 启动即崩,删除后
+   server 全套复测通过。
 
-移除前 libcuopt.so 链接：…… **librmm.so、librapids_logger.so** ……
-移除后 `ldd libcuopt.so`：
+## 3. 与 conda 版 cuOpt 的全栈功能对照
 
-```
-libcudart(static) libcublas libcublasLt libcusparse libnvJitLink
-libamd libsuitesparseconfig libtbb libgomp  (+ libc/libstdc++/libm)
-```
+“conda 版”指 cuDSS 期在 `cuopt-dev` conda 环境的全功能构建/官方 26.06 wheel
+(真 RAPIDS + cuDSS)。
 
-→ 两个 RAPIDS 运行时 .so 消失；体积 ~108MB → ~106MB。CCCL（thrust/cub/libcu++，
-非 RAPIDS）仍以平凡 FetchContent 拉取。
-
-## 3. 目标值对比（cuopt_cli，零回归）
-
-| 实例 | method | 基线目标 | 移除后目标 | 一致 |
-|---|---|---|---|---|
-| afiro | 3 barrier | -4.64753135e+02 | -4.64753135e+02 | ✅ 逐位 |
-| afiro | 1 PDLP | (Optimal) | -4.64761260e+02 | ✅ Optimal |
-| min_x_squared | 3 QP | +1.00000002e+00 | +1.00000002e+00 | ✅ 逐位 |
-| QP_Test_1 | 3 QP | -9.99600000e+01 | -9.99600000e+01 | ✅ 逐位 |
-| QP_Test_2 | 3 QP | +1.11111115e-01 | +1.11111115e-01 | ✅ 逐位 |
-
-求解时间相当或更快（移除后为热缓存测量）。无性能回退。
-
-## 4. shim 架构
-
-- **rmm（手写，cuda::mr-free）**：device_buffer/device_uvector/device_scalar 落在
-  `cudaMalloc`（默认资源，匹配 rmm 的 `initial_resource()`）/可选 `cudaMemPool_t` 池
-  （cuopt_cli、server、测试显式选）；用虚基类 `device_memory_resource` + 自有
-  `device_async_resource_ref` 取代 cuda::mr concept；exec_policy(sync+nosync) 用
-  池化 thrust 分配器；stream/stream_pool/error/aligned/cuda_device。
-- **raft core（手写触碰 rmm 的部分 + 逐字移植纯 CUDA 叶子）**：handle_t
-  （stream + thrust policy + 懒 cublas/cusparse + 拷贝构造 + comms 桩）、
-  span（裸指针 iterator、逐元素 ==、限定转换构造）、device_mdspan（cuda::std::mdspan）、
-  device_setter、nvtx(no-op)、logger(stub)；error/macros/math/operators/reduction/
-  warp_primitives/cudart_utils/cuda_utils 等逐字取自 raft 26.06（Apache-2.0，保浮点序）。
-- **raft 计算原语**：legacy 指针形式 linalg（binaryOp/ternaryOp/unaryOp/eltwise*/
-  divideScalar/transpose/reduce）手写 thrust/cub 封装；cublas/cusparse wrappers 逐字移植；
-  rng（PCGenerator/RngState 逐字移植，host uniform/uniformInt/make_blobs 手写指针版——
-  **非 bit-exact，影响 routing 合成数据生成的 golden**）。
-- **rapids_logger**：header-only shim，printf 风格 log，level_enum 数值 0..6 保持，
-  ostream/file/callback sink；logger_macros.hpp 静态化（替代 rapids-cmake 生成）。
-- **构建**：cpp/CMakeLists.txt 删 get_rmm/get_raft/rapids_logger 拉取与链接，加
-  vendor include 目录与 CUDA::cudart_static；CCCL/gtest 仍经 rapids-cmake 拉（rapids-cmake
-  作为纯构建工具暂留，4b 可进一步替换为平凡 FetchContent）。
-
-## 5. 失败诊断与修复记录（最终 137/137；CLI/DOC 为环境问题）
-
-跑 ctest 务必:`export PATH=$cpp/build:$PATH`(CLI 经 popen 调 `cuopt_cli`)、各测试目录放
-`datasets` 符号链接、清理 `/tmp/user_problem*.mps`。如此(routing 修复前)= **131/137**,
-eager-reset 修复后 = **136/137**,arena 池落地后 = **137/137**。
-
-**非 shim bug（测试环境）:**
-- **CLI_TEST**:`cli_test_t` 用 `popen("cuopt_cli …", "r")`(含 `2>&1`)调 PATH 中的
-  cuopt_cli。cuopt_cli 输出完全正确("Unknown argument: --dummy-argument"、"0 provided"+
-  "Usage"、"Error: …")——失败仅因 ctest 时 cuopt_cli 不在 PATH;PATH 含 build/ 后通过。
-- **DOC_EXAMPLE_TEST**:`docs.user_problem_file` 在 line 119 `EXPECT_FALSE(exists(
-  /tmp/user_problem.mps))`——求解本身成功(Optimal, obj 303.5),失败仅因上次运行残留该文件;
-  删除后通过。
-
-**已修复 5 个 routing 测试**(ROUTING_TEST、ROUTING_GES_TEST、VEHICLE_ORDER_TEST、
-VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST)→ 全量 ctest **136/137**。根因 = **CUDA Graph
-捕获/重放与 shim 分配器不兼容**,非数值 bug:
-
-- 现象链(设备侧 printf 实测,`double_test_pdp.GES_PDP`):`insert_graph_nodes_kernel` 读
-  `path[0]` 解出 `ejected_request_id.id()==0`(depot);`get_route_id(0)==-1`(depot 本就
-  unrouted)→ `solution.routes[-1]` 取到全零 view,`n_nodes==nullptr` → route.cuh:782
-  `get_num_nodes()` 解 NULL。坏边来自 `move_candidates.cycles` 含 depot 的非法环。
-- **真因**:`move_candidates.reset()` 把"哨兵填充"(`cost_counter = DBL_MAX` 等,经
-  `async_fill` 裸 kernel)**捕获进一个重放型 CUDA Graph**(`move_candidate_reset_graph`,
-  cudaStreamBeginCapture + cudaGraphExecUpdate)。shim 的默认 "pool" 资源由
-  `cudaMallocFromPoolAsync` 支撑,**该 graph 捕获与重放之间、其他无关的
-  cudaMallocAsync/cudaFreeAsync 流量会让被捕获的内存引用失效**,于是哨兵填充在重放时不生效
-  → cost_counter 残留有限代价 → top_k 选出非法候选(含 depot 列)→ 非法环 → 崩。
-  rmm 的 arena 式 `pool_memory_resource` 发的是稳定子分配,**不受影响**。
-- **逐一证伪的旧假说**:分配器清零(`RMM_SHIM_NO_ZERO` ON/OFF 完全相同)、RNG(PCGenerator
-  与 raft 26.06 逐字节相同、失败确定性)、对齐、per-thread 流、reduce/top_k(纯 CCCL block
-  primitive,bit-exact)、raft device util(reduction/warp/atomics 逐字节相同)、cub 流参(均
-  正确传 handle stream)。
-- **决定性实验**:在 `reset()` 旁路该 graph 改为 eager(直接发 kernel)→ **6 个测试全过**
-  (ROUTING 24 / GES 3 / VEHICLE_ORDER 4 / VEHICLE_TYPES 1 / OBJECTIVE_FUNCTION 2 /
-  ROUTING_UNIT 全过)。
-- **MVP 修复**(`move_candidates.cuh::reset`):默认走 eager reset(正确,开销相对 solve 可忽略);
-  reset graph 改为经 `CUOPT_USE_RESET_GRAPH` 显式开启,留待 shim 实现真正的 arena
-  `pool_memory_resource`(稳定子分配,对所有 routing graph 路径都 capture-safe)后再启用。
-- **剩余 1 个(ROUTING_UNIT_TEST `vehicle_breaks.non_uniform_breaks`)= 潜在 cuOpt
-  use-after-free,被 shim 暴露**(非 shim 自身 bug)。compute-sanitizer 报 **0 个 device
-  错误**;LD_PRELOAD backtrace 定位:测试校验代码 `check_route`(check_constraints.cu)经
-  `cuopt::host_copy<int>` → `raft::copy` → `cudaMemcpyAsync` 在**驱动内 segfault**,即读了一个
-  **已释放的 data_model device 指针**。
-  - **决定性对照**(同一二进制,改 `--rmm_mode`):`cuda`(同步 cudaMalloc)**段错**、
-    `pool`(cudaMallocAsync)**段错**、`managed`(cudaMallocManaged)**通过**。非 managed 内存
-    释放后 VA 被解除映射 → 读悬垂指针即崩;managed/arena 让 VA 始终可读 → 读到陈旧但合法数据 →
-    过。baseline(rmm 默认 = arena `pool_memory_resource`,从大块 cudaMalloc 子分配、永不解映射)
-    正是这样把这个潜在 UAF 掩盖掉的。
-  - 该 UAF 属 cuOpt 既有缺陷(读已释放指针),与 cuDSS 期记录的"被 rmm pool 掩盖的潜在 bug"同类。
-
-**根治已落地(→ 137/137)**:shim 实现了 rmm 式 stream-ordered **arena**
-`pool_memory_resource`(`cpp/vendor/include/rmm/mr/pool_memory_resource.hpp` 整体重写):
-- 大 slab(上游 cudaMalloc)子分配,析构前**永不真正释放** → 已释 VA 始终映射,与 rmm 一致地
-  掩盖上述 UAF;新 slab 一次性清零("first-touch zeroed"),回收块**不**再清零(同 rmm)。
-- 流序复用:free list 以 per-stream event 为键(per-thread 默认流用 thread-local event,
-  同 rmm);同流复用免同步;跨流取块先 `cudaStreamWaitEvent` 再整表合并;地址序相邻合并;
-  best-fit + 切分;倍增式增长 + 兜底精确尺寸,耗尽抛 `rmm::out_of_memory`。
-- base_fixture 的 `make_pool()`(默认 `--rmm_mode=pool`)改用该 arena(上游
-  `cuda_memory_resource`,初始 1 GiB)。
-- 验证:ROUTING_UNIT_TEST **57/57**(原段错例通过)、全量 ctest **137/137**、Python LP
-  重链后 14/14、afiro barrier 目标值仍逐位一致。
-- **被证伪的假设**:此前推测"arena 指针稳定后 reset graph 可重新启用"——实测
-  `CUOPT_USE_RESET_GRAPH=1` 在 arena 下 GES 仍失败,即 graph 重放问题并非(仅)分配器 VA
-  稳定性所致,机制仍未定位。**默认保持 eager reset**(对一切分配器正确,开销可忽略,全量
-  137/137);graph 路径重启用列为独立的后续课题。
-
-## 6. Python LP/MILP 路径（无 RAPIDS 包，已验证通过）
-
-**结论:LP/MILP 的 Python 绑定在零 RAPIDS 包(无 rmm/cudf/pylibraft)环境下构建并
-通过全部测试 —— `cuopt/tests/linear_programming` 51 passed / 9 skipped / 0 failed**
-(skip 均为特性门控,无一因 cudf/rmm 缺失)。afiro PDLP 目标值 `-4.64761260e+02` 与 C++
-基线逐位一致;tiny LP 返回正确 `numpy.ndarray`。
-
-源码改动(仅 LP/MILP 路径,routing 运行时 cudf 不动):
-- `solver.pxd`:删 `pylibraft.common.handle` 与 `rmm.librmm.device_buffer` 的 cimport;
-  就地 `cdef extern from "rmm/device_buffer.hpp"` 声明 `device_buffer`(只用 data()/size());
-  显式 `from libcpp.memory cimport unique_ptr`(原由 pylibraft 通配 cimport 传递提供)。
-- `solver_wrapper.pyx`:删未用的 pylibraft-handle / cupy / numba 导入;用 `_device_buffer_to_numpy`
-  (cudaMemcpy D2H + 前置 cudaDeviceSynchronize)替换 `DeviceBuffer.c_from_unique_ptr` +
-  `series_from_buf(...).to_numpy()` 的 rmm/cudf 往返;`type_cast` 先判 np.ndarray,仅 cudf 输入
-  才惰性 `import cudf`。
-- `utilities/utils.py`、`utilities/type_casting.py`:cudf/pylibcudf 惰性导入,numpy 路径零触碰。
-- `cuopt/__init__.py` 本就惰性导入子模块 → `import cuopt.linear_programming` 不拉 routing/cudf。
-- `libcuopt/load.py` 本就 `try/except ModuleNotFoundError` 包裹 rmm/raft/rapids_logger 预加载,
-  且新 libcuopt.so 不再 DT_NEEDED 它们 → 无需改。
-
-构建(MVP 暂以脚本绕过 rapids-cmake):
-- `python/cuopt/build_lp_modules_rapids_free.sh`:cython + g++(`-std=c++20`,因 cuopt 公共头用
-  std::span)把 5 个 LP 扩展(data_model_wrapper / solver_settings / parser_wrapper / internals /
-  solver_wrapper)编成 .so,链接 RAPIDS-free 的 libcuopt.so。验证:
-  `PYTHONPATH=python/cuopt RAPIDS_DATASET_ROOT_DIR=$PWD/datasets pytest python/cuopt/cuopt/tests/linear_programming`。
-- 干净环境只需非 RAPIDS 依赖:numpy/scipy/pandas/python-dateutil/msgpack(+ 构建用 cython)。
-
-## 7. 测试覆盖对比:baseline vs RAPIDS-free（全量审计,2026-06-12）
-
-> 多 agent 实证审计:双侧 `ctest -N` 对比、pytest `--collect-only`/`-rs` 实跑、ldd、
-> import 链逐项验证——非仅凭历史记录。baseline = `/home/cuopt-26.06`(同一代码、链接
-> 真实 RAPIDS;60059b3b = 本分支 598f51c6 + 1 个纯文档提交)。
-
-### 7.1 C++ ctest:双侧注册逐字节一致（139 = 137 可运行 + 2 禁用）
-
-| 域 | 测试(数) | baseline | RAPIDS-free |
+| 功能面 | conda 版 | RAPIDS-free 版 | 验证 |
 |---|---|---|---|
-| presolve(vendored PaPILO 三方库) | unit-test-*(107) | ✅ 全过 | ✅ 全过 |
-| MIP | MIP/DETERMINISM/INCUMBENT_CALLBACK/CUTS/PRESOLVE/SEMI_CONTINUOUS/DOC_EXAMPLE 等(15) | ✅ | ✅ |
-| LP | LP_UNIT、PDLP_TEST、MPS_PARSER(3) | ✅ | ✅ |
-| QP | QP_UNIT_TEST(1) | ✅ | ✅ |
-| SOCP/一般二次 | SOCP_TEST(1,含 Lorentz 锥、general_quadratic) | ✅ | ✅ |
-| 对偶单纯形+barrier+自研 LDLT | DUAL_SIMPLEX_TEST(1) | ✅ | ✅ |
-| C API | C_API_TEST(1,LP/MILP/barrier/回调) | ✅ | ✅ |
-| CLI | CLI_TEST(1) | ✅ | ✅ |
-| 距离引擎 C++ | WAYPOINT_MATRIXTEST(1) | ✅ | ✅ |
-| routing level0 | ROUTING/GES/VEHICLE_ORDER/VEHICLE_TYPES/OBJECTIVE_FUNCTION(5) | ✅ | ✅ |
-| routing 单元 | ROUTING_UNIT_TEST(57 例/14 套件) | ✅ | ✅ 57/57(arena 池修复后;此前 `vehicle_breaks.non_uniform_breaks` 段错,§5) |
-| **合计** | 139 注册 | **137/137** | **137/137**(arena 修复后;审计时为 136/137) |
+| LP — PDLP / 对偶单纯形 / Barrier(C++) | ✅ | ✅ 适配 | ctest + afiro/PDLP 目标逐位一致;基准 §5 |
+| MILP(分支定界/割平面/启发式)| ✅ | ✅ 适配 | 15 项 MIP ctest 含 DETERMINISM 全过 |
+| QP / SOCP(barrier,自研 LDLᵀ)| ✅(cuDSS 版为其原版)| ✅ 适配 | QP_UNIT/SOCP ctest + 11 题 QP 基准目标一致 |
+| C API(cuopt_c.h)| ✅ | ✅ 适配 | C_API_TEST(LP/MILP/barrier/回调/远程)通过 |
+| cuopt_cli | ✅ | ✅ 适配 | CLI_TEST + 基准全程使用 |
+| routing C++(VRP/PDP/breaks/异构车队等)| ✅ | ✅ 适配 | 全部 routing ctest 通过;注:reset 路径默认 eager(§2.1-4) |
+| 距离引擎(C++ waypoint matrix)| ✅ | ✅ 适配 | WAYPOINT_MATRIXTEST 通过 |
+| Python LP/MILP/QP/SOCP(numpy 进出,batch/warm-start/incumbent 回调)| ✅ | ✅ 适配(零 RAPIDS 包环境可运行)| 65/65 |
+| Python routing + distance_engine(cudf 进出)| ✅ | ✅ 适配(cudf 保留为 `[routing]` extra;rmm/pylibraft cimport 解耦)| 43/43 |
+| REST server(cuopt_server)| ✅ | ✅ 适配(功能零改动;rmm import 全部移除)| 94 + 7 skip(skip 与 conda 期相同,上游 #519)|
+| gRPC server(C++)+ Python 远程执行(CPU-only/TLS/mTLS)| ✅ | ✅ 适配 | 3 个 gRPC ctest + 11/11 远程测试通过,二进制零 RAPIDS |
+| self-hosted 客户端(cuopt_sh_client)| ✅ | ✅ 本就零 RAPIDS | 3/3(对运行中 server)|
+| pip wheel 打包 | rapids-build-backend | ✅ 适配:scikit-build-core / setuptools | cuopt/libcuopt wheel 构建通过(§6)|
+| **降级项** | — | NVTX 标注为 no-op;logger `set_pattern` 仅支持两种模式;rmm logging/statistics 适配器缺失(cuOpt 未用);host 端 make_blobs RNG 非逐位(运行覆盖绿,golden 未断言);comms 桩(单 GPU,同上游现状) | — |
+| **未适配项** | — | conda recipe/CI 打包未触及;routing 性能基准(CVRPLIB 等)双方均未例行化;HIP/MACA 后端(本工作为其前提,未开始) | — |
 
-双侧**同等跳过**(与 RAPIDS 移除无关):
-- 2 个上游无条件禁用:RETAIL_L1TEST、ROUTING_L1TEST(cpp/tests/routing/CMakeLists.txt:29)。
-- 3 个 gRPC C++ 测试(GRPC_CLIENT/PIPE_SERIALIZATION/INTEGRATION_TEST):双侧本地构建
-  CMakeCache 均 `SKIP_GRPC_BUILD=1`,未注册未构建。**后续已补齐:见 §7.6 的 gRPC 启用构建
-  (shim 树 conda 配置,142 注册、3 个 gRPC 测试全过)。**
+## 4. 测试对账(vs cuDSS 期 conda 门槛)
 
-baseline 137/137 的证据链:初跑 118/137,19 个失败全为 datasets 相对路径环境错;加
-`tests/**/datasets` 符号链接后清零(记录于 /tmp/baseline_bench.txt;最终清跑日志未保留,
-审计时单测复跑 MPS_PARSER_TEST 通过)。审计时 ROUTING_UNIT_TEST 是唯一 RAPIDS-free 特有
-失败;**随后 arena 池修复使其 57/57,双侧均为 137/137**(§5)。
+| 门槛 | cuDSS 期 conda 版 | RAPIDS-free 版 |
+|---|---|---|
+| C++ ctest(本地,SKIP_GRPC)| 137/137 | **137/137** |
+| C++ ctest(conda 配置,含 3 gRPC)| 139/140 | **139/140**(唯一失败 CUTS_TEST 为 1s 时限边缘抖动,目标值精确,串行复跑通过)|
+| Python cuopt 测试树(LP+QP+SOCP+routing)| 108/108 | **108/108**(60+1+4+43)|
+| cuopt_server | 94 + 7 skip | **94 + 7 skip**(skip 同为上游 #519)|
+| cuopt_self_hosted | 3/3 | **3/3** |
+| Python gRPC 远程(CPU-only/TLS/mTLS)| 含于上 | **11/11** |
 
-### 7.2 Python:全仓 38 个测试文件 / 190 个测试函数
+环境注意事项:测试目录需 `datasets` 符号链接;`PYTHONPATH` 须含
+`python/libcuopt`(否则命名空间包遮蔽);gRPC/server 测试须清除大小写
+`http(s)_proxy` 并设 `no_proxy=localhost,127.0.0.1,0.0.0.0`;conda 构建产物
+运行时须 `LD_LIBRARY_PATH=$build`(conda LDFLAGS 将 env lib 前置于 RUNPATH,
+其中装有旧版全 RAPIDS libcuopt)。
 
-| 套件 | 函数数(collected) | baseline(本项目) | RAPIDS-free | 不可跑原因(实证) |
+## 5. 性能基准(三方对比)
+
+方法:与 `docs/dev/cudss_replacement_benchmark.md` 同协议——Barrier
+(`--method 3`),LP `--time-limit 600`、QP 180s,solver 自报时间;同一 A100。
+三方:**本版**(RAPIDS-free shim,本次实测)、**06-11 版**(cuDSS 移除+LDLᵀ
+优化后、RAPIDS 移除前)、**cuDSS 原版**(官方 26.06 wheel,cuDSS 0.7.1)。
+
+### 5.1 LP(Mittelmann 子集,Barrier)
+
+| 实例 | 本版(shim) | 06-11 版 | cuDSS 原版 | 本版目标值 |
 |---|---|---|---|---|
-| linear_programming | 53(60) | 未跑¹ | ✅ 51 过/9 skip/0 败 | — |
-| quadratic_programming + socp | 1+4 | 未跑¹ | ✅ **5/5 过**(审计补跑) | — |
-| routing(含 distance_engine,9 文件) | 39 | 未跑¹ | ❌ 收集即失败 | `ModuleNotFoundError: cudf`(测试文件 + cuopt/routing/utils.py:11);且 routing/distance 扩展未编译(.pxd 仍 cimport rmm/pylibraft) |
-| cuopt_server | 90(19 文件) | 未跑¹ | ❌ 收集即失败 | 先卡 `msgpack_numpy`(普通 pip 包);根上 utils/solver.py:367 `import rmm`(**所有** solve 含 LP)、:392 `import cudf`、utils/routing/* 多处 |
-| cuopt_self_hosted(客户端) | 3 | 未跑¹ | ❌ 未跑 | 缺 `cuopt_sh_client` 安装(该包内部亦 import msgpack_numpy);客户端代码本身**零 RAPIDS**(纯 HTTP/msgpack),另需运行中的 server |
+| afiro | **0.09 s** | 0.093 s | 0.121 s | -464.753135(逐位同基线)|
+| graph40-40 | **0.99 s** | 0.87 s | 0.90 s | -300.000464 |
+| qap15 | **1.41 s** | 1.40 s | 1.09 s | 1041.00046 |
+| nug08-3rd | **6.23 s** | 6.24 s | 3.74 s | 214.000642 |
+| woodlands09 | **5.42 s** | 5.25 s | 4.13 s | 1.4e-07(≈0)|
+| scpm1 | **4.20 s** | 4.04 s | 3.71 s | 414.152071 |
 
-¹ baseline wheel 环境(.toolchain/baseline-venv,cuopt-cu12 26.6.0 + 全 RAPIDS 26.6.0)
-未装 pytest——本项目未对 baseline 跑过任何 python 测试,它仅作 import/求解参照。
+全部 Optimal。本版 vs 06-11 版:差异 ≤0.18 s(≤4%),在运行噪声内——
+**RAPIDS 移除对求解性能无可测回退**。本版 vs cuDSS 原版:维持 06-11 结论
+(afiro/graph40-40 同级或更快;填充重的 qap15/nug08/woodlands/scpm1 为
+1.1–1.7×,全部满足 ≥50% 性能目标)。
 
-- **LP 的 9 个 skip 全部来自 `test_cpu_only_execution.py`,唯一原因 `"cuopt_grpc_server
-  not found"`**(gRPC server 二进制未构建,SKIP_GRPC)——与 RAPIDS 移除无关,baseline 本地
-  构建同样会跳;该文件其余 2 例(SolutionInterfacePolymorphism)在进程内 GPU 上跑、计入 51 过。
-- LP 套件内含 5 个 QP 测试(test_python_API.py 的 quadratic_*,3 个做真实求解并断言已知最优),
-  均在 51 过内;专项 QP(1)+ SOCP(4,barrier/Lorentz 锥/二次约束)审计补跑 **5/5 过**。
-- 对照 cuDSS 期门槛(带全 RAPIDS,先于本移除):108/108 = **整个** python/cuopt 测试树
-  (LP+QP+SOCP+routing+gRPC 远程);server = 94 过 + 7 skip(全为上游 #519 禁用的
-  test_barrier_solver_options);self-hosted 3/3。即 **RAPIDS-free 已验证面 = LP/MILP/QP/SOCP;
-  routing/server/self-hosted/gRPC 远程未验证**。
+### 5.2 QP(QP_Test + Maros-Mészáros 子集,Barrier,180 s)
 
-### 7.3 基准/性能测试
+11/11 Optimal,目标值与文献/双基线一致(≤1e-9):
 
-实跑(双侧)= §3 的 5 实例 cuopt_cli 目标值对比(afiro barrier/PDLP、min_x_squared、
-QP_Test_1/2)——全部逐位一致;good_mip 仅 baseline 留档。shim 侧计时未持久化(热缓存
-"相当或更快")。**未设性能门槛(MVP 只记录)**;DETERMINISM_TEST(功能性)双侧通过。
+| 问题 | 本版目标值 | 本版耗时 | 06-11 版 | cuDSS 原版 |
+|---|---|---|---|---|
+| QP_Test_1 | -99.9600000 | 0.07 s | 0.04–0.09 s | 0.07–0.14 s |
+| HS35 | 0.111111115 | 0.05 s | 〃 | 〃 |
+| HS51 | 0.000000000 | 0.05 s | 〃 | 〃 |
+| HS52 | 5.32664756 | 0.04 s | 〃 | 〃 |
+| HS53 | 4.09302326 | 0.06 s | 〃 | 〃 |
+| HS76 | -4.68181817 | 0.05 s | 〃 | 〃 |
+| HS268 / S268 | 3.84e-09 | 0.06 s | 〃 | 〃 |
+| HS35MOD | 0.250000002 | 0.07 s | 〃 | 〃 |
+| QPTEST | 4.37187501 | 0.06 s | 〃 | 〃 |
+| ZECEVIC2 | -4.12499999 | 0.07 s | 〃 | 〃 |
 
-跳过(数据均在本地、非数据不可得,是范围决策):
-- **Mittelmann 600s 子集**(graph40-40/qap15/nug08-3rd/woodlands09/scpm1 等,2.6GB 已下载):
-  曾于 cuDSS-vs-LDLT 对比时跑过(cudss_replacement_benchmark.md,0.77x–1.67x),
-  **RAPIDS 切换后未重跑**。
-- **Maros-Meszaros 138 个 QPS @180s**:同上,切换后只重比了 3 个小 QP。
-- **MIP 实例集**(datasets/mip ~44 个):双侧均从未按实例基准化。
-- **routing 性能基准**(cvrp/cvrptw/solomon/tsp/pdptw 数据齐):双侧均未跑——routing 恰是
-  shim 风险区(graph/分配器),**价值最高的缺口**。
-- server 吞吐、批量 VRP、feasibility_jump 热路径微基准:计划中(plan §9)未执行。
+对照组(未受影响路径):PDLP afiro -4.64761260e+02 与基线逐位一致;
+对偶单纯形 afiro 0.03 s,行为与双基线一致。
 
-### 7.4 功能支持矩阵(RAPIDS-free)
+## 6. 构建与打包
 
-**✅ 支持且已测**:C++ LP(PDLP/对偶单纯形/barrier)、MILP、QP、SOCP、C API、cuopt_cli
-(含分配池配置,经 shim 类型零改动编译)、距离引擎 C++、Python LP/MILP/QP/SOCP
-(numpy 进出,含 batch solve、warm start、incumbent callback)。
+- **C++(本地)**:`.toolchain` cmake 3.30.8 + 系统 gcc11/CUDA12.1,
+  `cpp/build`;rapids-cmake 仅作为构建期工具保留(拉取 CCCL/gtest,可后续
+  替换为平凡 FetchContent)。
+- **C++(conda,含 gRPC)**:`cuopt-dev` 环境 gcc14/nvcc12.9/grpc1.78,
+  `cpp/build-conda`,`-DSKIP_GRPC_BUILD=0`。
+- **Python wheel**:`pip wheel ./python/libcuopt`(scikit-build-core,完整
+  C++ 构建,gRPC 可选)与 `pip wheel ./python/cuopt -C
+  cmake.args="-DCMAKE_PREFIX_PATH=<libcuopt 安装或 cpp/build>"`(8 个 Cython
+  模块);cuopt_server/self-hosted 为纯 setuptools。cudf 等 routing 依赖在
+  `cuopt[routing]` extra 中。
+- 开发期快捷脚本 `python/cuopt/build_lp_modules_rapids_free.sh`(就地编译
+  8 个扩展)继续可用。
 
-**❌ 不支持**:
-1. ~~Python routing API~~ **已支持并验证(2026-06-12,路线 a:保留 cudf 契约)**:解耦
-   rmm/pylibraft cimport(shim 本地声明 + D2H→cudf.Series 输出,见 §7.7),
-   `cuopt/tests/routing` 全套 **43/43 通过**(含 distance_engine/批量/重路由/合成数据生成);
-2. ~~Python distance_engine~~ **已支持并验证**——同上;
-3. ~~cuopt_server(REST)~~ **已支持并验证(2026-06-12)**,且按要求**全代码库 rmm 彻底剥离**
-   (4aa27bf6):cuopt 的 C++/Python/server/client 源码中 `import rmm`/pylibraft 引用 = **0**;
-   rmm 仅作为 cudf wheel 的内部依赖存在于环境中,与 cuopt 代码零接触,**无需改 cudf 源码**。
-   剥离内容:server 的 per-worker rmm 池初始化与池断言(shim libcuopt 不读真 rmm 注册表)、
-   sdk_tester 的 rmm.reinitialize、libcuopt/load.py 的 RAPIDS 预加载块、utilities 的死代码
-   series_from_buf。补 pip 依赖(fastapi/msgpack_numpy/uvicorn/jsonref/psutil)即可。
-   **剥离后全套复测:94 过 + 7 skip / 0 败(9m57s),与 cuDSS 期门槛逐项一致**(skip 全为
-   上游 #519);self-hosted 客户端 **3/3 过**。
-   注意:跑 server 测试需 `PYTHONPATH=python/libcuopt:python/cuopt:python/cuopt_server`
-   (libcuopt 包须显式上路径,否则 python/ 下的 libcuopt 目录会被当命名空间包);测试 POST 到
-   0.0.0.0,务必 unset 大小写 http(s)_proxy 并 `no_proxy=localhost,127.0.0.1,0.0.0.0`
-   (残留代理变量会黑洞请求、表现为挂死);
-4. ~~gRPC server(C++)~~ **已支持并验证**:见 §7.6——conda 配置构建,3 个 gRPC C++ 测试 +
-   Python 远程执行 11/11 全过,零 RAPIDS 链接;
-5. **pip wheel 安装**——pyproject 仍 rapids-build-backend + cudf/pylibraft/rmm 钉版;
-   现行路径仅 §6 的手工脚本(已含 routing/distance 共 8 模块);
-6. HIP/MACA(本就不在 MVP 范围,是后续动机)。
+## 7. 遗留与展望
 
-### 7.7 Python routing/distance_engine 解耦(2026-06-12,cudf 契约保留)
-
-**结论:`cuopt/tests/routing` 43/43 通过**(cudf-cu12 26.6.0 安装、shim libcuopt,6m37s)。
-- **为什么装着 RAPIDS 也必须解耦 cimport**:pylibraft `Handle`、rmm `DeviceBuffer`、
-  pylibcudf `Column.from_rmm_buffer` 的 Cython 声明/Python 类按**真** raft/rmm ABI 编译;
-  shim 的 `handle_t`/`device_buffer` 内存布局不同,跨界传递 = UB。wrapper 本就自建裸
-  `new handle_t()`(不经 pylibraft Python 对象),故照 LP 模式即可。
-- 改动:routing_utilities.pxd / waypoint_matrix.pxd 改 shim 本地 `cdef extern` 声明;
-  三个 wrapper 的输出路径(Solve + BatchSolve + 数据生成器 + waypoint 序列)用
-  `_device_buffer_to_series/_to_numpy`(cudaDeviceSynchronize + cudaMemcpy D2H,按
-  np.dtype.itemsize 定尺寸)替换 DeviceBuffer/series_from_buf,再包 cudf.Series /
-  cp.array(4 处带形状的 cupy 重建逐一保形)。
-- **ABI 隔离原则**:shim device_buffer 的析构全部发生在 cuopt 扩展 TU 内;cudf 用它自带的
-  真 rmm 管理自身内存——两边永不交换 C++ 对象。
-- 构建:`build_lp_modules_rapids_free.sh` 扩至 8 模块(含 routing×2 + distance×1)。
-
-**⚠️ 降级**:
-1. routing C++:CUDA-graph reset 默认关闭(eager reset;`CUOPT_USE_RESET_GRAPH` 实验性,
-   在 arena 下仍失败,见 §5)——微小性能路径损失;测试已 137/137 全过;
-2. NVTX = no-op(仅 profiler 标注缺失);
-3. rapids_logger `set_pattern` 仅支持 `%v` 与固定时间戳前缀两种;
-4. rmm logging/statistics 适配器缺失(cuOpt 未用到);
-5. cuda_async 资源池分配默认清零(`RMM_SHIM_NO_ZERO=1` 可关);arena 池仅新 slab 一次性清零
-   (同 rmm);
-6. host 端 make_blobs/uniform RNG 非逐位一致——注意它**有**运行覆盖
-   (generate_coordinates/generate_matrices 经 VEHICLE_TYPES_TEST 双侧绿),仅逐位 golden
-   无断言;generate_dataset 只被禁用的 RETAIL_L1TEST 使用;
-7. comms 桩(单 GPU,与 cuOpt 现状一致)。
-
-### 7.5 双侧共同盲区(两个构建都从未覆盖)
-
-- `ci/test_cpp_memcheck.sh`(compute-sanitizer memcheck/synccheck/racecheck 全套)从未跑——
-  对确证 §5 的 UAF 价值最高;
-- **OOM 路径**:`rmm::out_of_memory` 的两个 catch 点(barrier.cu:4681、
-  feasibility_jump.cu:1014)零测试覆盖(shim 异常契约经代码核对保持:detail/error.hpp 对
-  cudaErrorMemoryAllocation 抛 rmm::out_of_memory);
-- 日志行为(set_pattern/rapids_logger)在 cpp/tests 与 python/ 中零引用——shim 的 pattern
-  子集降级完全未测;
-- `ci/test_doc_examples.sh`(27 个 .py + 9 个 .c 文档示例,独立于 DOC_EXAMPLE_TEST)未跑——
-  其 convex/mip 子集 RAPIDS-free 即可跑;
-- 3 个 routing C++ example 二进制(cvrp_daily_deliveries 等)双侧已构建、从未执行
-  (便宜的补测点);
-- docs 构建(Sphinx)、wheel 校验(ci/validate_wheel.sh 等)、notebook(1 个,依赖 server)
-  未覆盖;
-- MPS parser 无 fuzz harness(仓库本就没有);
-- 多 GPU:无任何测试;cuopt_cli 的 per-device 池循环 >1 GPU 分支未走。
-
-### 7.6 gRPC 启用（2026-06-12 补齐;对齐 cuDSS 期 conda 门槛）
-
-在 `cuopt-dev` conda 环境(gcc14 conda 编译器、nvcc 12.9、grpc 1.78、Boost 1.91、Ninja)
-以 `SKIP_GRPC_BUILD=0` 重建 shim 树到 `cpp/build-conda`:
-
-- **整树在新工具链下只需一个 shim 修复**:rapids_logger shim 补命名级别方法
-  (trace/debug/info/warn/error/critical,gRPC server 的 SERVER_LOG_* 直接调用;主库走宏
-  所以此前未暴露)。
-- **142 个 ctest 注册**(139 + 3 gRPC)。正式 `-j4` 全量 = **139/140**,3 个 gRPC 测试
-  (GRPC_CLIENT / PIPE_SERIALIZATION / INTEGRATION)**全部通过**——与 cuDSS 期 conda 门槛
-  (139/140)持平。唯一失败 CUTS_TEST 为该工具链下的 1 秒时限边缘抖动:目标值每次精确 -28、
-  total_solve_time 骑线 0.99–1.25s,**串行重跑即过**(cuDSS 期对照二进制同样骑线 0.989s
-  仅余 11ms)→ 套件实际 **140/140 可绿**。ROUTING_UNIT(prize_collection)与 UNIT_TEST 为
-  `-j4` GPU 争抢 flake,单独跑 3/3 过。
-- `cuopt_grpc_server` 直接 NEEDED = libcuopt + grpc + protobuf,**零 RAPIDS**。
-- **第二个 shim 保真度修复(CPU-only 模式)**:rmm 的 get_current_cuda_device /
-  cuda_set_device_raii 用 RMM_ASSERT_CUDA_SUCCESS(release 下 no-op、无设备返回 -1 不抛),
-  shim 原用 RMM_CUDA_TRY 在 `CUDA_VISIBLE_DEVICES=""` 时抛 cudaErrorNoDevice,破坏 CPU-only
-  远程执行;改为镜像 rmm(吞错返 -1,per_device 表对 -1 钳位)。
-- **Python 远程执行路径打通**:`test_cpu_only_execution.py` **11/11 全过**(此前 9 个常年
-  skip)——gRPC 远程 LP/MIP solve、对偶解、warmstart、CLI remote 模式、TLS、mTLS。
-  LP/QP/SOCP 回归 19/19 仍绿。
-- 运行环境注意:conda LDFLAGS 把 env lib 排 RUNPATH 最前且 env 装有旧版全 RAPIDS libcuopt →
-  跑测试须 `LD_LIBRARY_PATH=$build`(LD_LIBRARY_PATH 优先于 RUNPATH);本机有
-  `http_proxy=127.0.0.1:3576` → gRPC localhost 连接须 unset 代理 + `no_proxy=localhost,...`
-  (与 cuDSS 期记录一致);python 扩展若加载 conda 构建的 libcuopt 须把
-  `/opt/conda/envs/cuopt-dev/lib` 加入 LD_LIBRARY_PATH(GLIBCXX_3.4.31)。
-
-## 8. 待办
-
-- ~~shim 实现 stream-ordered arena `pool_memory_resource`~~ **已完成 → 137/137**(§5)。
-  遗留子课题:reset graph 在 arena 下仍失败(假设被证伪),重放机制待独立定位;
-  当前默认 eager reset 正确且全绿。
-- **routing/distance_engine 的 Cython 解耦 + 整轮 wheel 构建**:这两模块运行时确需 cudf/rmm
-  (返回 cudf DataFrame、`DeviceBuffer.c_from_unique_ptr` 是 cdef API),要让整包在无 RAPIDS 下
-  cythonize 须把它们的输出路径也改 host 拷贝,或在 MVP wheel 中排除 routing/distance。
-- **python CMake 去 rapids-cmake/rapids-cython**:`rapids_config`/`rapids-cuda`/
-  `rapids_cython_create_modules`/`find_package(cuopt)` → 平凡 CMake;3 个 pyproject 的
-  `rapids-build-backend` → `scikit_build_core`、删 rmm/pylibraft/rapids-logger 依赖。届时
-  §6 的手工脚本可弃。
-- 补跑 §7.5 中便宜项:memcheck、doc examples 的 LP/MIP 子集、routing C++ examples;
-  以及 §7.3 的 RAPIDS 切换后 Mittelmann/QPS 重跑与 routing 性能基准。
-- 可选 4b:C++ 侧 rapids-cmake → 平凡 CMake/FetchContent。
-- HIP/MACA 后端(本 MVP 不含;shim 的 cuda::mr-free 设计是其前提)。
-
-## 9. 提交序列（本分支）
-
-1. `vendor cuda::mr-free rmm/raft shim headers` — rmm + raft core 两层手写 shim。
-2. `vendor raft compute primitives shim` — linalg/cublas/cusparse/rng。
-3. `vendor header-only rapids_logger shim`。
-4. `cut over to vendored shim — libcuopt builds RAPIDS-free` — CMake 切换，ldd 零 RAPIDS。
-5a. `green full build incl. tests + cuopt_cli` — 全量构建通过。
-5b. `match rmm default resource; non-pooled test allocator` — 121/137 通过 + 长尾表征。
-5c. `per-thread default stream + shared cuBLAS/cuSPARSE handles` — +7 测试(128/137)。
-5d. `zero stream-ordered pool allocations` — +1(LP_UNIT,129/137);后加 `RMM_SHIM_NO_ZERO` 开关。
-6. `docs: 131/137;CLI/DOC 为环境问题` + `routing: root-cause + RMM_SHIM_NO_ZERO`。
-7. `python(lp): decouple LP/MILP from rmm/pylibraft/cudf` + `unique_ptr fix` +
-   `verify 51 passed RAPIDS-free`(含 build_lp_modules_rapids_free.sh)。
-8. `routing: fix 5 tests via eager reset`(fb8c5e25)— CUDA-graph/分配器根因,131→136/137。
-9. `docs: confirm last routing failure is a latent cuOpt use-after-free`(b12d672d)。
-10. `docs: full coverage audit`(本节 §7,2026-06-12)。
-11. `shim: stream-ordered arena pool_memory_resource — full ctest 137/137`(262dc05d)——
-    重写 pool 为 rmm 式 arena,ROUTING_UNIT 57/57,全量 **137/137** 与 baseline 持平。
+- routing reset 的捕获重放 CUDA Graph 在 shim 下仍异常(默认 eager 全绿,
+  开关保留),机制待独立定位。
+- routing 性能基准(CVRPLIB Set-X / Solomon / Homberger)未例行化,为
+  最有价值的补测项;MIP 实例集与 server 吞吐基准同此。
+- cpp 侧 rapids-cmake → 平凡 FetchContent(纯构建工具替换,可选)。
+- HIP/MACA 后端移植:本工作消除了 cuda::mr/RAPIDS 障碍,后续主要工作为
+  warp64/平台运行时适配;routing Python 依赖目标平台的 cudf 移植版。
