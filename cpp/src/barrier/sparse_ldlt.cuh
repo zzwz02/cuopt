@@ -45,10 +45,77 @@ constexpr int factor_block_dim = 128;
 constexpr int dense_nb         = 64;  // panel width of the dense-tail factorization
 constexpr int ldlt_dense_nb_max = 64;  // compile-time bound for per-thread row buffers
 
+// Replacement pivot for dropped (numerically rank-deficient) columns of an
+// SPD system: dividing by it zeroes the column of L and the corresponding
+// solution component, so the redundant equation is dropped instead of
+// polluting the factor (PCx / LIPSOL treatment of degenerate normal
+// equations). Large enough to vanish, small enough that L(i,k)*D(k)*L(j,k)
+// stays finite.
+constexpr double drop_pivot_value = 1e128;
+
 template <typename f_t>
 struct abs_op {
   __host__ __device__ f_t operator()(f_t v) const { return v < f_t(0) ? -v : v; }
 };
+
+// Pivot acceptance rule shared by the sparse and dense-tail factor kernels.
+// Modes (selected by n_neg, see set_pivot_structure):
+//   n_neg <= -2  legacy: unsigned static pivoting at static_pivot_tol.
+//   n_neg ==  0  SPD (normal equations): pivots must be positive; a pivot
+//                below the tolerance is numerically rank deficient and is
+//                dropped (replaced by drop_pivot_value).
+//   n_neg  >  0  quasi-definite: original index < n_neg expects a negative
+//                pivot (variable block), >= n_neg a positive one (constraint
+//                block). The pivot is floored at the block's regularization
+//                magnitude with the expected sign; a sign violation is an
+//                inertia error and is counted in sign_corrections.
+// Returns 1 if the factorization must fail (non-finite pivot or, in legacy
+// positive-definite mode, a non-positive pivot). Counters are only updated
+// when count is true (one thread per column).
+template <typename i_t, typename f_t>
+__device__ inline i_t ldlt_pivot_rule(f_t& dj,
+                                      i_t orig,
+                                      i_t n_neg,
+                                      f_t neg_floor,
+                                      f_t pos_floor,
+                                      f_t static_pivot_tol,
+                                      bool positive_definite,
+                                      bool count,
+                                      i_t* static_pivot_count,
+                                      i_t* sign_corrections)
+{
+  if (!isfinite(dj)) { return 1; }
+  if (n_neg <= i_t(-2)) {
+    if (positive_definite && dj <= f_t(0)) { return 1; }
+    if (fabs(dj) < static_pivot_tol) {
+      dj = (dj < f_t(0)) ? -static_pivot_tol : static_pivot_tol;
+      if (count) { atomicAdd(static_pivot_count, i_t(1)); }
+    }
+    return 0;
+  }
+  if (n_neg == i_t(0)) {
+    if (dj < static_pivot_tol) {
+      if (count) {
+        if (dj < -static_pivot_tol) { atomicAdd(sign_corrections, i_t(1)); }
+        atomicAdd(static_pivot_count, i_t(1));
+      }
+      dj = f_t(drop_pivot_value);
+    }
+    return 0;
+  }
+  const bool neg  = orig < n_neg;
+  const f_t s     = neg ? f_t(-1) : f_t(1);
+  const f_t f_blk = neg ? neg_floor : pos_floor;
+  const f_t fl    = f_blk > f_t(0) ? f_blk : static_pivot_tol;
+  if (s * dj < fl) {
+    if (count) {
+      if (s * dj < f_t(0)) { atomicAdd(sign_corrections, i_t(1)); }
+      atomicAdd(static_pivot_count, i_t(1));
+    }
+    dj = s * fl;
+  }
+  return 0;
+}
 
 // Scatters the values of the analyzed matrix into the factor storage.
 // Lx, D and the dense tail must be zeroed beforehand: slots that receive no
@@ -91,7 +158,12 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
                                          i_t* fail_flag,
                                          i_t* static_pivot_count,
                                          f_t static_pivot_tol,
-                                         bool positive_definite)
+                                         bool positive_definite,
+                                         const i_t* perm,
+                                         i_t pivot_n_neg,
+                                         f_t pivot_neg_floor,
+                                         f_t pivot_pos_floor,
+                                         i_t* sign_corrections)
 {
   const i_t j       = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
   const i_t col_beg = Lp[j];
@@ -124,23 +196,23 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
     __syncthreads();
   }
 
-  f_t dj = D[j];
-  if (!isfinite(dj) || (positive_definite && dj <= f_t(0))) {
+  f_t dj             = D[j];
+  const f_t dj_in    = dj;
+  const i_t bad      = ldlt_pivot_rule(dj,
+                                  perm[j],
+                                  pivot_n_neg,
+                                  pivot_neg_floor,
+                                  pivot_pos_floor,
+                                  static_pivot_tol,
+                                  positive_definite,
+                                  threadIdx.x == 0,
+                                  static_pivot_count,
+                                  sign_corrections);
+  if (bad) {
     if (threadIdx.x == 0) { atomicCAS(fail_flag, i_t(0), j + 1); }
     return;
   }
-  if (fabs(dj) < static_pivot_tol) {
-    // Static pivoting: a (near-)zero pivot means the matrix is numerically
-    // rank deficient at this column (e.g. redundant rows in A*Dinv*A^T).
-    // Continue with a perturbed pivot; iterative refinement at the call site
-    // absorbs the perturbation.
-    dj = (dj < f_t(0)) ? -static_pivot_tol : static_pivot_tol;
-    if (threadIdx.x == 0) {
-      D[j] = dj;
-      atomicAdd(static_pivot_count, i_t(1));
-    }
-    __syncthreads();
-  }
+  if (dj != dj_in && threadIdx.x == 0) { D[j] = dj; }
   for (i_t p = col_beg + static_cast<i_t>(threadIdx.x); p < col_end;
        p += static_cast<i_t>(blockDim.x)) {
     Lx[p] /= dj;
@@ -209,22 +281,31 @@ __global__ void ldlt_factor_level_finalize_kernel(const i_t* level_cols,
                                                   i_t* fail_flag,
                                                   i_t* static_pivot_count,
                                                   f_t static_pivot_tol,
-                                                  bool positive_definite)
+                                                  bool positive_definite,
+                                                  const i_t* perm,
+                                                  i_t pivot_n_neg,
+                                                  f_t pivot_neg_floor,
+                                                  f_t pivot_pos_floor,
+                                                  i_t* sign_corrections)
 {
-  const i_t j = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
-  f_t dj      = D[j];
-  if (!isfinite(dj) || (positive_definite && dj <= f_t(0))) {
+  const i_t j     = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
+  f_t dj          = D[j];
+  const f_t dj_in = dj;
+  const i_t bad   = ldlt_pivot_rule(dj,
+                                  perm[j],
+                                  pivot_n_neg,
+                                  pivot_neg_floor,
+                                  pivot_pos_floor,
+                                  static_pivot_tol,
+                                  positive_definite,
+                                  threadIdx.x == 0,
+                                  static_pivot_count,
+                                  sign_corrections);
+  if (bad) {
     if (threadIdx.x == 0) { atomicCAS(fail_flag, i_t(0), j + 1); }
     return;
   }
-  if (fabs(dj) < static_pivot_tol) {
-    dj = (dj < f_t(0)) ? -static_pivot_tol : static_pivot_tol;
-    if (threadIdx.x == 0) {
-      D[j] = dj;
-      atomicAdd(static_pivot_count, i_t(1));
-    }
-    __syncthreads();
-  }
+  if (dj != dj_in && threadIdx.x == 0) { D[j] = dj; }
   for (i_t p = Lp[j] + static_cast<i_t>(threadIdx.x); p < Lp[j + 1];
        p += static_cast<i_t>(blockDim.x)) {
     Lx[p] /= dj;
@@ -420,7 +501,12 @@ __global__ void ldlt_dense_diag_kernel(f_t* S,
                                        i_t* fail_flag,
                                        i_t* static_pivot_count,
                                        f_t static_pivot_tol,
-                                       bool positive_definite)
+                                       bool positive_definite,
+                                       const i_t* perm,
+                                       i_t pivot_n_neg,
+                                       f_t pivot_neg_floor,
+                                       f_t pivot_pos_floor,
+                                       i_t* sign_corrections)
 {
   for (i_t c = 0; c < nb; c++) {
     const int64_t col_c = static_cast<int64_t>(p0 + c) * tail_dim;
@@ -429,12 +515,17 @@ __global__ void ldlt_dense_diag_kernel(f_t* S,
     // updates accumulated below. Fold and reset so the load is idempotent.
     if (threadIdx.x == 0) {
       S[col_c + p0 + c] = f_t(0);
-      if (!isfinite(dc) || (positive_definite && dc <= f_t(0))) {
-        atomicCAS(fail_flag, i_t(0), tail_start + p0 + c + 1);
-      } else if (fabs(dc) < static_pivot_tol) {
-        dc = (dc < f_t(0)) ? -static_pivot_tol : static_pivot_tol;
-        atomicAdd(static_pivot_count, i_t(1));
-      }
+      const i_t bad     = ldlt_pivot_rule(dc,
+                                      perm[tail_start + p0 + c],
+                                      pivot_n_neg,
+                                      pivot_neg_floor,
+                                      pivot_pos_floor,
+                                      static_pivot_tol,
+                                      positive_definite,
+                                      true,
+                                      static_pivot_count,
+                                      sign_corrections);
+      if (bad) { atomicCAS(fail_flag, i_t(0), tail_start + p0 + c + 1); }
       D[tail_start + p0 + c] = dc;
     }
     __syncthreads();
@@ -608,7 +699,8 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_a_values_(0, handle_ptr->get_stream()),
       d_work_(0, handle_ptr->get_stream()),
       d_fail_(handle_ptr->get_stream()),
-      d_static_pivots_(handle_ptr->get_stream())
+      d_static_pivots_(handle_ptr->get_stream()),
+      d_sign_corrections_(handle_ptr->get_stream())
   {
     settings_.log.printf("Sparse LDLT solver          : cuOpt built-in (%s numeric)\n",
                          use_host_numeric_ ? "host" : "device");
@@ -630,6 +722,23 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   {
     positive_definite_ = positive_definite;
   }
+
+  // Structured pivot handling (see ldlt_detail::ldlt_pivot_rule). n_negative
+  // == 0 selects the SPD drop rule (normal equations); n_negative > 0 selects
+  // the quasi-definite signed floors, where original indices < n_negative
+  // (the variable block of the augmented KKT system) expect negative pivots
+  // with magnitude >= negative_floor and the rest expect positive pivots
+  // >= positive_floor. Callable between factorizations (floors track the
+  // caller's adaptive regularization).
+  void set_pivot_structure(i_t n_negative, f_t negative_floor, f_t positive_floor) override
+  {
+    pivot_n_neg_     = n_negative;
+    pivot_neg_floor_ = negative_floor;
+    pivot_pos_floor_ = positive_floor;
+  }
+
+  // Number of expected-sign violations corrected during the last factorize.
+  i_t pivot_corrections() const override { return last_sign_corrections_; }
 
   i_t analyze(device_csr_matrix_t<i_t, f_t>& Arow) override
   {
@@ -1292,6 +1401,8 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     }
     d_fail_.set_value_to_zero_async(stream);
     d_static_pivots_.set_value_to_zero_async(stream);
+    d_sign_corrections_.set_value_to_zero_async(stream);
+    last_sign_corrections_ = 0;
 
     constexpr int block_dim = ldlt_detail::factor_block_dim;
     if (nnz_A_ > 0) {
@@ -1351,7 +1462,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                                  d_fail_.data(),
                                                  d_static_pivots_.data(),
                                                  static_pivot_tol,
-                                                 positive_definite_);
+                                                 positive_definite_,
+                                                 d_perm_.data(),
+                                                 pivot_n_neg_,
+                                                 pivot_neg_floor_,
+                                                 pivot_pos_floor_,
+                                                 d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
       } else {
         ldlt_detail::ldlt_factor_level_kernel<i_t, f_t>
@@ -1367,7 +1483,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                                  d_fail_.data(),
                                                  d_static_pivots_.data(),
                                                  static_pivot_tol,
-                                                 positive_definite_);
+                                                 positive_definite_,
+                                                 d_perm_.data(),
+                                                 pivot_n_neg_,
+                                                 pivot_neg_floor_,
+                                                 pivot_pos_floor_,
+                                                 d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
       }
       if ((l & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
@@ -1384,10 +1505,22 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       settings_.log.printf("Factorization failed: invalid pivot at column %d\n", fail - 1);
       return -1;
     }
-    i_t static_pivots = d_static_pivots_.value(stream);
+    i_t static_pivots      = d_static_pivots_.value(stream);
+    last_sign_corrections_ = d_sign_corrections_.value(stream);
+    if (std::getenv("CUOPT_LDLT_PIVDBG") != nullptr) {
+      fprintf(stderr,
+              "[ldlt] n_neg=%d static=%d signfix=%d tol=%.2e negf=%.2e posf=%.2e\n",
+              pivot_n_neg_,
+              static_pivots,
+              last_sign_corrections_,
+              static_pivot_tol,
+              pivot_neg_floor_,
+              pivot_pos_floor_);
+    }
     if (static_pivots > 0) {
-      settings_.log.debug("Static pivoting perturbed %d pivots (tol %.2e)\n",
+      settings_.log.debug("Static pivoting perturbed %d pivots (%d sign corrections, tol %.2e)\n",
                           static_pivots,
+                          last_sign_corrections_,
                           static_pivot_tol);
     }
     factor_time_ += toc(start_numeric);
@@ -1515,7 +1648,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                 d_fail_.data(),
                                 d_static_pivots_.data(),
                                 static_pivot_tol,
-                                positive_definite_);
+                                positive_definite_,
+                                d_perm_.data(),
+                                pivot_n_neg_,
+                                pivot_neg_floor_,
+                                pivot_pos_floor_,
+                                d_sign_corrections_.data());
       RAFT_CHECK_CUDA(stream);
       const i_t m_rest = d - p0 - nb_eff;
       if (m_rest > 0) {
@@ -1561,6 +1699,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     }
     const f_t static_pivot_tol = compute_static_pivot_tol(max_abs_diag);
     i_t static_pivots          = 0;
+    last_sign_corrections_     = 0;
 
     for (i_t j = 0; j < n_; j++) {
       // Apply updates from all columns k with L(j, k) != 0.
@@ -1579,26 +1718,49 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
           Lx_[it - Li_.begin()] -= c * Lx_[p];
         }
       }
-      // Pivot.
+      // Pivot (host mirror of ldlt_detail::ldlt_pivot_rule).
       f_t dj = D_[j];
-      if (!std::isfinite(dj) || (positive_definite_ && dj <= f_t(0))) {
+      if (!std::isfinite(dj)) {
         settings_.log.printf("Factorization failed: pivot %e at column %d\n", dj, j);
         return -1;
       }
-      if (std::abs(dj) < static_pivot_tol) {
-        // Static pivoting, see ldlt_factor_level_kernel.
-        dj    = (dj < f_t(0)) ? -static_pivot_tol : static_pivot_tol;
-        D_[j] = dj;
-        static_pivots++;
+      if (pivot_n_neg_ <= i_t(-2)) {
+        if (positive_definite_ && dj <= f_t(0)) {
+          settings_.log.printf("Factorization failed: pivot %e at column %d\n", dj, j);
+          return -1;
+        }
+        if (std::abs(dj) < static_pivot_tol) {
+          dj = (dj < f_t(0)) ? -static_pivot_tol : static_pivot_tol;
+          static_pivots++;
+        }
+      } else if (pivot_n_neg_ == i_t(0)) {
+        if (dj < static_pivot_tol) {
+          if (dj < -static_pivot_tol) { last_sign_corrections_++; }
+          dj = f_t(ldlt_detail::drop_pivot_value);
+          static_pivots++;
+        }
+      } else {
+        const bool neg  = perm_[j] < pivot_n_neg_;
+        const f_t s     = neg ? f_t(-1) : f_t(1);
+        const f_t f_blk = neg ? pivot_neg_floor_ : pivot_pos_floor_;
+        const f_t fl    = f_blk > f_t(0) ? f_blk : static_pivot_tol;
+        if (s * dj < fl) {
+          if (s * dj < f_t(0)) { last_sign_corrections_++; }
+          dj = s * fl;
+          static_pivots++;
+        }
       }
+      D_[j] = dj;
       for (i_t p = Lp_[j]; p < Lp_[j + 1]; p++) {
         Lx_[p] /= dj;
       }
       if ((j & 1023) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
     }
     if (static_pivots > 0) {
-      settings_.log.debug(
-        "Static pivoting perturbed %d pivots (tol %.2e)\n", static_pivots, static_pivot_tol);
+      settings_.log.debug("Static pivoting perturbed %d pivots (%d sign corrections, tol %.2e)\n",
+                          static_pivots,
+                          last_sign_corrections_,
+                          static_pivot_tol);
     }
 
     if (first_factor_) {
@@ -1774,6 +1936,13 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   bool positive_definite_;
   bool use_host_numeric_;
 
+  // Structured pivot handling (set_pivot_structure); -2 = legacy unsigned
+  // static pivoting.
+  i_t pivot_n_neg_{-2};
+  f_t pivot_neg_floor_{0};
+  f_t pivot_pos_floor_{0};
+  i_t last_sign_corrections_{0};
+
   // Permutation: perm_[k] = original index of the k-th pivot.
   std::vector<i_t> perm_;
   std::vector<i_t> perm_inv_;
@@ -1853,6 +2022,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   rmm::device_uvector<f_t> d_work_;
   rmm::device_scalar<i_t> d_fail_;
   rmm::device_scalar<i_t> d_static_pivots_;
+  rmm::device_scalar<i_t> d_sign_corrections_;
 };
 
 }  // namespace cuopt::linear_programming::dual_simplex

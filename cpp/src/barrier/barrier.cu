@@ -2240,15 +2240,21 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
   // Mask used by the two ADAT/augmented branches below to enforce z > 0.
   std::vector<i_t> nonnegative_z(lp.num_cols, 1);
 
-  // Perform a numerical factorization
+  // Perform a numerical factorization. The initial-point augmented system is
+  // built around D = -(I + E*E^T) (least-norm start), so its (1,1) block is
+  // not negative definite and the quasi-definite sign pattern of the
+  // iteration systems does not apply: keep the unsigned legacy pivot rule
+  // here. The ADAT system is SPD at the initial point as well.
   i_t status;
   if (use_augmented) {
+    data.chol->set_pivot_structure(-2, 0, 0);
     status = data.chol->factorize(data.device_augmented);
 
 #ifdef CHOLESKY_DEBUG_CHECK
     cholesky_debug_check(data, lp, use_augmented);
 #endif
   } else {
+    data.chol->set_pivot_structure(0, 0, 0);
     status = data.chol->factorize(data.device_ADAT);
   }
   if (status == CONCURRENT_HALT_RETURN) { return CONCURRENT_HALT_RETURN; }
@@ -2882,6 +2888,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
         return CONCURRENT_HALT_RETURN;
       }
+      data.chol->set_pivot_structure(lp.num_cols, data.dual_perturb, data.primal_perturb);
       status = data.chol->factorize(data.device_augmented);
 
 #ifdef CHOLESKY_DEBUG_CHECK
@@ -2897,6 +2904,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         return CONCURRENT_HALT_RETURN;
       }
       // factorize
+      data.chol->set_pivot_structure(0, 0, 0);
       status = data.chol->factorize(data.device_ADAT);
     }
     data.has_factorization = true;
@@ -3000,21 +3008,39 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         settings.log.printf("|| Aug (dx, dy) - aug_rhs || %e after IR\n", solve_err);
       }
 
-      // Adaptive regularization: increase/decrease based on IR quality.
-      // Only adapt on calls where we actually (re)factorized — the affine step.
-      if (did_factorize && data.has_cones()) {
-        constexpr f_t min_perturb = 1e-8;
-        constexpr f_t max_perturb = 1e-1;
-        if (solve_err > 1e-2) {
+      // Adaptive regularization, only on calls where we actually
+      // (re)factorized — the affine step. The IR operator multiplies by the
+      // *unregularized* KKT matrix, so solve_err >= perturb * ||soln|| even
+      // for a perfect factorization of the regularized system; solve_err is
+      // therefore only a meaningful instability signal for the cone path
+      // (which historically adapted on it with perturbations at 1e-8). For
+      // the linear/QP path, adapt on the factorization's expected-sign pivot
+      // corrections instead: an inertia error means the regularization sits
+      // below the factorization's noise floor. With a clean factorization the
+      // perturbations decay back, so healthy problems stay at the 1e-8/1e-6
+      // defaults and keep their original trajectory.
+      if (did_factorize) {
+        // Decay floors = the path's baseline perturbations (see the solve
+        // loop's initial values): healthy problems never leave them.
+        const f_t dual_floor       = 1e-8;
+        const f_t primal_floor     = data.has_cones() ? 1e-8 : 1e-6;
+        constexpr f_t max_perturb  = 1e-1;
+        const i_t sign_corrections = data.chol->pivot_corrections();
+        const bool unstable = sign_corrections > 0 || (data.has_cones() && solve_err > 1e-2);
+        const bool clean    = sign_corrections == 0 && (!data.has_cones() || solve_err < 1e-4);
+        if (unstable) {
           f_t old_dp     = dual_perturb;
-          dual_perturb   = std::min(max_perturb, std::max(min_perturb, dual_perturb * 10.0));
-          primal_perturb = std::min(max_perturb, std::max(min_perturb, primal_perturb * 10.0));
-          settings.log.debug(
-            "  reg UP: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
-        } else if (solve_err < 1e-4) {
+          dual_perturb   = std::min(max_perturb, std::max(dual_floor, dual_perturb * 10.0));
+          primal_perturb = std::min(max_perturb, std::max(primal_floor, primal_perturb * 10.0));
+          settings.log.debug("  reg UP: %e -> %e (solve_err=%e, sign corrections=%d)\n",
+                             old_dp,
+                             dual_perturb,
+                             solve_err,
+                             sign_corrections);
+        } else if (clean) {
           f_t old_dp     = dual_perturb;
-          dual_perturb   = std::max(min_perturb, dual_perturb / 10.0);
-          primal_perturb = std::max(min_perturb, primal_perturb / 10.0);
+          dual_perturb   = std::max(dual_floor, dual_perturb / 10.0);
+          primal_perturb = std::max(primal_floor, primal_perturb / 10.0);
           if (old_dp != dual_perturb) {
             settings.log.debug(
               "  reg DOWN: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
