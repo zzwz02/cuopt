@@ -10,9 +10,9 @@
 **核心目标达成。** libcuopt.so + cuopt_cli + 全部 40 个测试可执行文件构建通过、
 **零编译错误**，运行时**不再链接 librmm.so / libraft / librapids_logger.so**。
 cuopt_cli 的 barrier 与 PDLP 求解目标值与基线**逐位一致**。C++ 单元测试
-**136/137 (99%) 通过**(由 routing CUDA-graph 修复从 131/137 提升);剩余 1 个
-(ROUTING_UNIT_TEST 的 `vehicle_breaks.non_uniform_breaks`)是 host 侧 use-after-free,
-与 device 图问题同一根因(cudaMallocAsync vs arena pool),见 §5。CLI_TEST 与 DOC_EXAMPLE 的"失败"经查是测试环境问题(cuopt_cli 不在 PATH、/tmp 残留文件),非 shim bug。
+**137/137 (100%) 通过,与 baseline 完全持平**(演进:121→129→131→136→137;最后一步由
+shim 实现 rmm 式 stream-ordered **arena** `pool_memory_resource` 达成,见 §5)。CLI_TEST 与
+DOC_EXAMPLE 早期的"失败"经查是测试环境问题(cuopt_cli 不在 PATH、/tmp 残留文件),非 shim bug。
 **Python LP/MILP 路径已在零 RAPIDS 包环境构建并通过全部测试(51 passed / 0 failed,见 §6);
 QP/SOCP 专项 Python 套件同环境 5/5 通过。** 与 baseline 的全量测试覆盖对比、跳过项与
 不支持功能清单见 §7(2026-06-12 实证审计)。
@@ -84,11 +84,11 @@ libamd libsuitesparseconfig libtbb libgomp  (+ libc/libstdc++/libm)
   vendor include 目录与 CUDA::cudart_static；CCCL/gtest 仍经 rapids-cmake 拉（rapids-cmake
   作为纯构建工具暂留，4b 可进一步替换为平凡 FetchContent）。
 
-## 5. 失败诊断与修复记录（最终 136/137；CLI/DOC 为环境问题）
+## 5. 失败诊断与修复记录（最终 137/137；CLI/DOC 为环境问题）
 
 跑 ctest 务必:`export PATH=$cpp/build:$PATH`(CLI 经 popen 调 `cuopt_cli`)、各测试目录放
 `datasets` 符号链接、清理 `/tmp/user_problem*.mps`。如此(routing 修复前)= **131/137**,
-routing CUDA-graph 修复后 = **136/137**。
+eager-reset 修复后 = **136/137**,arena 池落地后 = **137/137**。
 
 **非 shim bug（测试环境）:**
 - **CLI_TEST**:`cli_test_t` 用 `popen("cuopt_cli …", "r")`(含 `2>&1`)调 PATH 中的
@@ -133,10 +133,23 @@ VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST)→ 全量 ctest **136/137**。根�
     释放后 VA 被解除映射 → 读悬垂指针即崩;managed/arena 让 VA 始终可读 → 读到陈旧但合法数据 →
     过。baseline(rmm 默认 = arena `pool_memory_resource`,从大块 cudaMalloc 子分配、永不解映射)
     正是这样把这个潜在 UAF 掩盖掉的。
-  - **根治** = shim 实现真正的 stream-ordered arena/caching `pool_memory_resource`(释放只回收进
-    free-list、不真正 cudaFree → VA 始终映射;同流复用保序、跨流不复用保安全)。它同时能:修掉本
-    测试、让 reset graph(及其它 routing graph)可经 `CUOPT_USE_RESET_GRAPH` 重新启用。见 task。
   - 该 UAF 属 cuOpt 既有缺陷(读已释放指针),与 cuDSS 期记录的"被 rmm pool 掩盖的潜在 bug"同类。
+
+**根治已落地(→ 137/137)**:shim 实现了 rmm 式 stream-ordered **arena**
+`pool_memory_resource`(`cpp/vendor/include/rmm/mr/pool_memory_resource.hpp` 整体重写):
+- 大 slab(上游 cudaMalloc)子分配,析构前**永不真正释放** → 已释 VA 始终映射,与 rmm 一致地
+  掩盖上述 UAF;新 slab 一次性清零("first-touch zeroed"),回收块**不**再清零(同 rmm)。
+- 流序复用:free list 以 per-stream event 为键(per-thread 默认流用 thread-local event,
+  同 rmm);同流复用免同步;跨流取块先 `cudaStreamWaitEvent` 再整表合并;地址序相邻合并;
+  best-fit + 切分;倍增式增长 + 兜底精确尺寸,耗尽抛 `rmm::out_of_memory`。
+- base_fixture 的 `make_pool()`(默认 `--rmm_mode=pool`)改用该 arena(上游
+  `cuda_memory_resource`,初始 1 GiB)。
+- 验证:ROUTING_UNIT_TEST **57/57**(原段错例通过)、全量 ctest **137/137**、Python LP
+  重链后 14/14、afiro barrier 目标值仍逐位一致。
+- **被证伪的假设**:此前推测"arena 指针稳定后 reset graph 可重新启用"——实测
+  `CUOPT_USE_RESET_GRAPH=1` 在 arena 下 GES 仍失败,即 graph 重放问题并非(仅)分配器 VA
+  稳定性所致,机制仍未定位。**默认保持 eager reset**(对一切分配器正确,开销可忽略,全量
+  137/137);graph 路径重启用列为独立的后续课题。
 
 ## 6. Python LP/MILP 路径（无 RAPIDS 包，已验证通过）
 
@@ -185,8 +198,8 @@ VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST)→ 全量 ctest **136/137**。根�
 | CLI | CLI_TEST(1) | ✅ | ✅ |
 | 距离引擎 C++ | WAYPOINT_MATRIXTEST(1) | ✅ | ✅ |
 | routing level0 | ROUTING/GES/VEHICLE_ORDER/VEHICLE_TYPES/OBJECTIVE_FUNCTION(5) | ✅ | ✅ |
-| routing 单元 | ROUTING_UNIT_TEST(57 例/14 套件) | ✅ | ❌ `vehicle_breaks.non_uniform_breaks` 段错(潜在 UAF,§5;其余 56 例过) |
-| **合计** | 139 注册 | **137/137** | **136/137** |
+| routing 单元 | ROUTING_UNIT_TEST(57 例/14 套件) | ✅ | ✅ 57/57(arena 池修复后;此前 `vehicle_breaks.non_uniform_breaks` 段错,§5) |
+| **合计** | 139 注册 | **137/137** | **137/137**(arena 修复后;审计时为 136/137) |
 
 双侧**同等跳过**(与 RAPIDS 移除无关):
 - 2 个上游无条件禁用:RETAIL_L1TEST、ROUTING_L1TEST(cpp/tests/routing/CMakeLists.txt:29)。
@@ -195,7 +208,8 @@ VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST)→ 全量 ctest **136/137**。根�
 
 baseline 137/137 的证据链:初跑 118/137,19 个失败全为 datasets 相对路径环境错;加
 `tests/**/datasets` 符号链接后清零(记录于 /tmp/baseline_bench.txt;最终清跑日志未保留,
-审计时单测复跑 MPS_PARSER_TEST 通过)。**ROUTING_UNIT_TEST 是唯一 RAPIDS-free 特有失败。**
+审计时单测复跑 MPS_PARSER_TEST 通过)。审计时 ROUTING_UNIT_TEST 是唯一 RAPIDS-free 特有
+失败;**随后 arena 池修复使其 57/57,双侧均为 137/137**(§5)。
 
 ### 7.2 Python:全仓 38 个测试文件 / 190 个测试函数
 
@@ -255,12 +269,13 @@ QP_Test_1/2)——全部逐位一致;good_mip 仅 baseline 留档。shim 侧计�
 6. HIP/MACA(本就不在 MVP 范围,是后续动机)。
 
 **⚠️ 降级**:
-1. routing C++:1 个潜在 UAF 测试段错(§5)+ CUDA-graph reset 默认关闭
-   (`CUOPT_USE_RESET_GRAPH` 可开)——微小性能路径损失;
+1. routing C++:CUDA-graph reset 默认关闭(eager reset;`CUOPT_USE_RESET_GRAPH` 实验性,
+   在 arena 下仍失败,见 §5)——微小性能路径损失;测试已 137/137 全过;
 2. NVTX = no-op(仅 profiler 标注缺失);
 3. rapids_logger `set_pattern` 仅支持 `%v` 与固定时间戳前缀两种;
 4. rmm logging/statistics 适配器缺失(cuOpt 未用到);
-5. 池分配默认清零(`RMM_SHIM_NO_ZERO=1` 可关);
+5. cuda_async 资源池分配默认清零(`RMM_SHIM_NO_ZERO=1` 可关);arena 池仅新 slab 一次性清零
+   (同 rmm);
 6. host 端 make_blobs/uniform RNG 非逐位一致——注意它**有**运行覆盖
    (generate_coordinates/generate_matrices 经 VEHICLE_TYPES_TEST 双侧绿),仅逐位 golden
    无断言;generate_dataset 只被禁用的 RETAIL_L1TEST 使用;
@@ -286,9 +301,9 @@ QP_Test_1/2)——全部逐位一致;good_mip 仅 baseline 留档。shim 侧计�
 
 ## 8. 待办
 
-- **shim 实现 stream-ordered arena `pool_memory_resource`**:释放只回收进 free-list、不真正
-  cudaFree(VA 始终映射)→ 修掉 ROUTING_UNIT_TEST 被暴露的 UAF 段错 + 重新启用 routing
-  CUDA graphs(`CUOPT_USE_RESET_GRAPH`)→ **137/137**。
+- ~~shim 实现 stream-ordered arena `pool_memory_resource`~~ **已完成 → 137/137**(§5)。
+  遗留子课题:reset graph 在 arena 下仍失败(假设被证伪),重放机制待独立定位;
+  当前默认 eager reset 正确且全绿。
 - **routing/distance_engine 的 Cython 解耦 + 整轮 wheel 构建**:这两模块运行时确需 cudf/rmm
   (返回 cudf DataFrame、`DeviceBuffer.c_from_unique_ptr` 是 cdef API),要让整包在无 RAPIDS 下
   cythonize 须把它们的输出路径也改 host 拷贝,或在 MVP wheel 中排除 routing/distance。
@@ -317,3 +332,5 @@ QP_Test_1/2)——全部逐位一致;good_mip 仅 baseline 留档。shim 侧计�
 8. `routing: fix 5 tests via eager reset`(fb8c5e25)— CUDA-graph/分配器根因,131→136/137。
 9. `docs: confirm last routing failure is a latent cuOpt use-after-free`(b12d672d)。
 10. `docs: full coverage audit`(本节 §7,2026-06-12)。
+11. `shim: stream-ordered arena pool_memory_resource — full ctest 137/137`(262dc05d)——
+    重写 pool 为 rmm 式 arena,ROUTING_UNIT 57/57,全量 **137/137** 与 baseline 持平。
