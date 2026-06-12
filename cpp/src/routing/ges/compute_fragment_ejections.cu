@@ -114,15 +114,6 @@ __global__ void kernel_get_best_insertion_ejection_solution(
 }
 
 template __global__ void
-kernel_get_best_insertion_ejection_solution<32, int, float, request_t::PDP>(
-  typename solution_t<int, float, request_t::PDP>::view_t solution,
-  const request_info_t<int, request_t::PDP>* request_id,
-  int* p_scores,
-  int fragment_size,
-  int fragment_step,
-  feasible_move_t feasible_candidates,
-  int64_t seed);
-template __global__ void
 kernel_get_best_insertion_ejection_solution<64, int, float, request_t::PDP>(
   typename solution_t<int, float, request_t::PDP>::view_t solution,
   const request_info_t<int, request_t::PDP>* request_id,
@@ -150,15 +141,6 @@ kernel_get_best_insertion_ejection_solution<512, int, float, request_t::PDP>(
   feasible_move_t feasible_candidates,
   int64_t seed);
 
-template __global__ void
-kernel_get_best_insertion_ejection_solution<32, int, float, request_t::VRP>(
-  typename solution_t<int, float, request_t::VRP>::view_t solution,
-  const request_info_t<int, request_t::VRP>* request_id,
-  int* p_scores,
-  int fragment_size,
-  int fragment_step,
-  feasible_move_t feasible_candidates,
-  int64_t seed);
 template __global__ void
 kernel_get_best_insertion_ejection_solution<64, int, float, request_t::VRP>(
   typename solution_t<int, float, request_t::VRP>::view_t solution,

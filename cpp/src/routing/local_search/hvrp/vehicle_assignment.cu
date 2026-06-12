@@ -137,7 +137,8 @@ template <typename i_t, typename f_t, request_t REQUEST>
 auto find_best_assignment(solution_t<i_t, f_t, REQUEST>& sol,
                           vehicle_assignment_t<i_t, f_t, REQUEST>& vehicle_assignment)
 {
-  auto constexpr TPB   = 32;
+  // One warp/wavefront: the kernel uses warp-wide ranked reduction.
+  auto constexpr TPB   = raft::WarpSize;
   auto constexpr shmem = 0;
   bool is_set          = set_shmem_of_kernel(find_best_assignment_kernel<i_t, f_t, REQUEST>, shmem);
   if (!is_set) { return false; }

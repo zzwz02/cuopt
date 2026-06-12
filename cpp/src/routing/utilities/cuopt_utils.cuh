@@ -49,7 +49,7 @@ struct objective_to_int {
 };
 
 template <typename T, typename i_t = int, typename f_t = float>
-__device__ inline T shfl(T val, i_t srcLane, i_t width = warp_size, uint mask = 0xffffffffu)
+__device__ inline T shfl(T val, i_t srcLane, i_t width = warp_size, raft::lane_mask_t mask = raft::LANE_MASK_ALL)
 {
   return __shfl_sync(mask, val, srcLane, width);
 }

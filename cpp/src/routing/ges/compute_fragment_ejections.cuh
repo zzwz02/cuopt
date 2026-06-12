@@ -111,7 +111,9 @@ DI i_t fill_to_delete(const typename solution_t<i_t, f_t, REQUEST>::view_t& solu
   // Check for fragement spanning to large (no looping around)
   // Range covered goes from intra_pickup_id to intra_pickup_id + blockDim.x
   // Not include threadIdx.x in loop to always have full warps for __ballot_sync and shared writes
-  __shared__ uint32_t s_pickups[BLOCK_SIZE / raft::WarpSize];
+  static_assert(BLOCK_SIZE % raft::WarpSize == 0,
+                "block must be a whole number of warps (wave64-safe)");
+  __shared__ raft::lane_mask_t s_pickups[BLOCK_SIZE / raft::WarpSize];
   uint32_t n_deletable_requests = 0;
   for (i_t i = intra_pickup_id; i < route_length; i += blockDim.x) {
     int is_pickup = 0;
@@ -120,13 +122,13 @@ DI i_t fill_to_delete(const typename solution_t<i_t, f_t, REQUEST>::view_t& solu
                    "Indexing should not be greater than max size");
       is_pickup = route.requests().is_pickup_node(threadIdx.x + i);
     }
-    const uint32_t pickups = __ballot_sync(~0, is_pickup);
+    const raft::lane_mask_t pickups = __ballot_sync(raft::LANE_MASK_ALL, is_pickup);
     if (threadIdx.x % raft::WarpSize == 0) s_pickups[threadIdx.x / raft::WarpSize] = pickups;
     __syncthreads();
 // Compute amount of requests on my right side including mine
 #pragma unroll
     for (int j = 0; j < BLOCK_SIZE / raft::WarpSize; ++j)
-      n_deletable_requests += __popc(s_pickups[j]);
+      n_deletable_requests += raft::lane_popc(s_pickups[j]);
     __syncthreads();  // To avoid race condition on next loop write
   }
 

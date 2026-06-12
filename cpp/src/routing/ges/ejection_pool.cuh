@@ -96,7 +96,7 @@ struct ejection_pool_t {
     DI void pop(elemt_t to_pop)
     {
       cuopt_assert(index_ >= 0, "Index needs to be superior or equal to 0");
-      cuopt_assert(__popc(__activemask() == 1),
+      cuopt_assert(raft::lane_popc(raft::activemask()) == 1,
                    "Ejection pool pop should be called by a single thread");
       int i = index_;
       while (i >= 0) {
@@ -113,7 +113,7 @@ struct ejection_pool_t {
     {
       cuopt_assert(index_ + 1 < max_ejection_pool_size,
                    "Trying to insert more than max size in ejection pool");
-      cuopt_assert(__popc(__activemask() == 1),
+      cuopt_assert(raft::lane_popc(raft::activemask()) == 1,
                    "Ejection pool push should be called by a single thread");
 
       if (index_ < max_stack_size - 1) {
@@ -133,7 +133,7 @@ struct ejection_pool_t {
     DI elemt_t pop()
     {
       cuopt_assert(index_ >= 0, "Index needs to be superior or equal to 0");
-      cuopt_assert(__popc(__activemask() == 1),
+      cuopt_assert(raft::lane_popc(raft::activemask()) == 1,
                    "Ejection pool pop should be called by a single thread");
       elemt_t elem = this->stack_[index_];
       --index_;

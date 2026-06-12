@@ -167,12 +167,12 @@ void calc_activity_heavy_cnst(managed_stream_pool& streams,
       auto num_heavy_cnst = cnst_bin_offsets.back() - heavy_cnst_beg_id;
       if (erase_inf_cnst) {
         finalize_calc_act_kernel<true, i_t, f_t, f_t2>
-          <<<num_heavy_cnst, 32, 0, heavy_cnst_stream>>>(
+          <<<num_heavy_cnst, raft::WarpSize, 0, heavy_cnst_stream>>>(
             heavy_cnst_beg_id, make_span(heavy_cnst_block_segments), tmp_cnst_act, view);
         RAFT_CHECK_CUDA(heavy_cnst_stream);
       } else {
         finalize_calc_act_kernel<false, i_t, f_t, f_t2>
-          <<<num_heavy_cnst, 32, 0, heavy_cnst_stream>>>(
+          <<<num_heavy_cnst, raft::WarpSize, 0, heavy_cnst_stream>>>(
             heavy_cnst_beg_id, make_span(heavy_cnst_block_segments), tmp_cnst_act, view);
         RAFT_CHECK_CUDA(heavy_cnst_stream);
       }
@@ -250,7 +250,7 @@ void calc_activity_sub_warp(managed_stream_pool& streams,
                             bool erase_inf_cnst,
                             bool dry_run)
 {
-  constexpr i_t block_dim         = 32;
+  constexpr i_t block_dim         = raft::WarpSize;
   auto cnst_per_block             = block_dim / threads_per_constraint;
   auto [cnst_id_beg, cnst_id_end] = get_id_range(cnst_bin_offsets, degree_beg, degree_end);
 
@@ -298,7 +298,7 @@ void calc_activity_sub_warp(managed_stream_pool& streams,
 {
   constexpr i_t block_dim = 256;
 
-  auto block_count = raft::ceildiv<i_t>(cnst_sub_warp_count * 32, block_dim);
+  auto block_count = raft::ceildiv<i_t>(cnst_sub_warp_count * raft::WarpSize, block_dim);
   if (block_count != 0) {
     auto sub_warp_stream = streams.get_stream();
     if (!dry_run) {
@@ -376,7 +376,7 @@ void create_activity_sub_warp(cudaGraph_t act_graph,
                               const std::vector<i_t>& cnst_bin_offsets,
                               bool erase_inf_cnst)
 {
-  constexpr i_t block_dim         = 32;
+  constexpr i_t block_dim         = raft::WarpSize;
   auto cnst_per_block             = block_dim / threads_per_constraint;
   auto [cnst_id_beg, cnst_id_end] = get_id_range(cnst_bin_offsets, degree_beg, degree_end);
 
@@ -447,7 +447,7 @@ void create_activity_sub_warp(cudaGraph_t act_graph,
 {
   constexpr i_t block_dim = 256;
 
-  auto block_count = raft::ceildiv<i_t>(cnst_sub_warp_count * 32, block_dim);
+  auto block_count = raft::ceildiv<i_t>(cnst_sub_warp_count * raft::WarpSize, block_dim);
   if (block_count != 0) {
     cudaGraphNode_t act_sub_warp_node;
     auto warp_cnst_offsets_span    = make_span(warp_cnst_offsets);
@@ -657,7 +657,7 @@ void create_activity_heavy_cnst(cudaGraph_t act_graph,
       cudaKernelNodeParams kernelNodeParams = {0};
 
       kernelNodeParams.gridDim        = dim3(num_heavy_cnst, 1, 1);
-      kernelNodeParams.blockDim       = dim3(32, 1, 1);
+      kernelNodeParams.blockDim       = dim3(raft::WarpSize, 1, 1);
       kernelNodeParams.sharedMemBytes = 0;
       kernelNodeParams.kernelParams   = (void**)kernelArgs;
       kernelNodeParams.extra          = NULL;
@@ -717,7 +717,7 @@ void upd_bounds_heavy_vars(managed_stream_pool& streams,
           view,
           tmp_vars_bnd);
       auto num_heavy_vars = vars_bin_offsets.back() - heavy_vars_beg_id;
-      finalize_upd_bnd_kernel<i_t, f_t, f_t2><<<num_heavy_vars, 32, 0, heavy_vars_stream>>>(
+      finalize_upd_bnd_kernel<i_t, f_t, f_t2><<<num_heavy_vars, raft::WarpSize, 0, heavy_vars_stream>>>(
         heavy_vars_beg_id, make_span(heavy_vars_block_segments), tmp_vars_bnd, view);
     }
   }
@@ -778,7 +778,7 @@ void upd_bounds_sub_warp(managed_stream_pool& streams,
                          const std::vector<i_t>& vars_bin_offsets,
                          bool dry_run)
 {
-  constexpr i_t block_dim         = 32;
+  constexpr i_t block_dim         = raft::WarpSize;
   auto vars_per_block             = block_dim / threads_per_variable;
   auto [vars_id_beg, vars_id_end] = get_id_range(vars_bin_offsets, degree_beg, degree_end);
 
@@ -802,7 +802,7 @@ void upd_bounds_sub_warp(managed_stream_pool& streams,
 {
   constexpr i_t block_dim = 256;
 
-  auto block_count = raft::ceildiv<i_t>(vars_sub_warp_count * 32, block_dim);
+  auto block_count = raft::ceildiv<i_t>(vars_sub_warp_count * raft::WarpSize, block_dim);
   if (block_count != 0) {
     auto sub_warp_stream = streams.get_stream();
     if (!dry_run) {
@@ -870,7 +870,7 @@ void create_update_bounds_sub_warp(cudaGraph_t upd_graph,
                                    i_t degree_end,
                                    const std::vector<i_t>& vars_bin_offsets)
 {
-  constexpr i_t block_dim         = 32;
+  constexpr i_t block_dim         = raft::WarpSize;
   auto vars_per_block             = block_dim / threads_per_variable;
   auto [vars_id_beg, vars_id_end] = get_id_range(vars_bin_offsets, degree_beg, degree_end);
 
@@ -933,7 +933,7 @@ void create_update_bounds_sub_warp(cudaGraph_t upd_graph,
 {
   constexpr i_t block_dim = 256;
 
-  auto block_count = raft::ceildiv<i_t>(vars_sub_warp_count * 32, block_dim);
+  auto block_count = raft::ceildiv<i_t>(vars_sub_warp_count * raft::WarpSize, block_dim);
   if (block_count != 0) {
     cudaGraphNode_t upd_bnd_sub_warp_node;
 
@@ -1131,7 +1131,7 @@ void create_update_bounds_heavy_vars(cudaGraph_t upd_graph,
 
       kernelNodeParams.func = (void*)finalize_upd_bnd_kernel<i_t, f_t, f_t2, bounds_update_view_t>;
       kernelNodeParams.gridDim        = dim3(num_heavy_vars, 1, 1);
-      kernelNodeParams.blockDim       = dim3(32, 1, 1);
+      kernelNodeParams.blockDim       = dim3(raft::WarpSize, 1, 1);
       kernelNodeParams.sharedMemBytes = 0;
       kernelNodeParams.kernelParams   = (void**)kernelArgs;
       kernelNodeParams.extra          = NULL;

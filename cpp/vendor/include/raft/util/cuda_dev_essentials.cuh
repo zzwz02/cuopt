@@ -6,6 +6,7 @@
 #pragma once
 
 #include <raft/core/detail/macros.hpp>
+#include <raft/util/warp_constants.hpp>
 
 #include <cuda_fp16.h>
 
@@ -70,15 +71,59 @@ constexpr HDI IntType log2(IntType num, IntType ret = IntType(0))
   return num <= IntType(1) ? ret : log2(num >> IntType(1), ++ret);
 }
 
-/** number of threads per warp */
-static const int WarpSize = 32;
-
 /** get the laneId of the current thread */
 DI int laneId()
 {
+#if defined(__HIP_DEVICE_COMPILE__)
+  return __lane_id();
+#else
   int id;
   asm("mov.s32 %0, %%laneid;" : "=r"(id));
   return id;
+#endif
+}
+
+/**
+ * @brief Number of set bits in a lane mask (ballot/activemask result).
+ * Compile-time dispatch on the platform's lane-mask width.
+ */
+DI int lane_popc(lane_mask_t mask)
+{
+  if constexpr (sizeof(lane_mask_t) == 8) {
+    return __popcll(static_cast<unsigned long long>(mask));
+  } else {
+    return __popc(static_cast<unsigned int>(mask));
+  }
+}
+
+/** @brief 1-based index of the lowest set lane bit; 0 when the mask is empty. */
+DI int lane_ffs(lane_mask_t mask)
+{
+  if constexpr (sizeof(lane_mask_t) == 8) {
+    return __ffsll(static_cast<long long>(mask));
+  } else {
+    return __ffs(static_cast<int>(mask));
+  }
+}
+
+/** @brief Index of the highest set lane bit; -1 when the mask is empty. */
+DI int lane_fls(lane_mask_t mask)
+{
+  if constexpr (sizeof(lane_mask_t) == 8) {
+    return mask == 0 ? -1 : 63 - __clzll(static_cast<long long>(mask));
+  } else {
+    return mask == 0 ? -1 : 31 - __clz(static_cast<int>(mask));
+  }
+}
+
+/** @brief Mask of currently-active lanes, in the platform's lane-mask width. */
+DI lane_mask_t activemask()
+{
+#if defined(__HIP_DEVICE_COMPILE__)
+  return __ballot(1);
+#else
+  return __activemask();
+#endif
 }
 
 /** Device function to apply the input lambda across threads in the grid */

@@ -84,9 +84,11 @@ DI i_t binary_block_reduce(int val)
 {
   static_assert(BLOCK_SIZE <= 1024);
   cuopt_assert(val == 0 || val == 1, "Binary block reduce only acceptes 0 or 1");
+  static_assert(BLOCK_SIZE % raft::WarpSize == 0,
+                "block must be a whole number of warps (wave64-safe)");
   __shared__ i_t shared[BLOCK_SIZE / raft::WarpSize];
-  const uint32_t mask                 = __ballot_sync(~0, val);
-  const uint32_t n_deletable_requests = __popc(mask);
+  const raft::lane_mask_t mask  = __ballot_sync(raft::LANE_MASK_ALL, val);
+  const i_t n_deletable_requests = raft::lane_popc(mask);
 
   // Each first thread of the warp
   if (threadIdx.x % raft::WarpSize == 0)

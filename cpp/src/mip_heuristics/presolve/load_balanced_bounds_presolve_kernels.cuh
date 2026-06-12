@@ -19,13 +19,13 @@ __device__ __forceinline__ void detect_range_sub_warp(i_t* id_warp_beg,
                                                       raft::device_span<i_t> bin_offsets)
 {
   i_t warp_id = (blockDim.x * blockIdx.x + threadIdx.x) / raft::WarpSize;
-  i_t lane_id = threadIdx.x & 31;
+  i_t lane_id = threadIdx.x & (raft::WarpSize - 1);
   bool pred   = false;
   if (lane_id < warp_offsets.size()) { pred = (warp_id >= warp_offsets[lane_id]); }
-  unsigned int m  = __ballot_sync(0xffffffff, pred);
-  i_t seg         = 31 - __clz(m);
-  i_t it_per_warp = (1 << (5 - seg));  // item per warp = raft::WarpSize/(2^seg)
-  if (5 - seg < 0) {
+  raft::lane_mask_t m = __ballot_sync(raft::LANE_MASK_ALL, pred);
+  i_t seg             = raft::lane_fls(m);  // highest set lane
+  i_t it_per_warp     = (1 << (raft::WarpSizeLog2 - seg));  // = raft::WarpSize/(2^seg)
+  if (raft::WarpSizeLog2 - seg < 0) {
     *threads_per_item = 0;
     return;
   }
@@ -107,7 +107,7 @@ __global__ void finalize_calc_act_kernel(i_t heavy_cnst_beg_id,
                                          raft::device_span<f_t2> tmp_act,
                                          activity_view_t view)
 {
-  using warp_reduce = cub::WarpReduce<f_t>;
+  using warp_reduce = cub::WarpReduce<f_t, raft::WarpSize>;
   __shared__ typename warp_reduce::TempStorage temp_storage;
   i_t idx                  = heavy_cnst_beg_id + blockIdx.x;
   i_t cnst_idx             = view.cnst_reorg_ids[idx];
@@ -283,7 +283,7 @@ template <bool erase_inf_cnst,
           typename activity_view_t>
 __device__ void calc_act_sub_warp(i_t id_warp_beg, i_t id_range_end, activity_view_t view)
 {
-  i_t lane_id = (threadIdx.x & 31);
+  i_t lane_id = (threadIdx.x & (raft::WarpSize - 1));
   i_t idx     = id_warp_beg + (lane_id / MAX_EDGE_PER_CNST);
   i_t cnst_idx;
   [[maybe_unused]] f_t eps = {};
@@ -462,7 +462,7 @@ __global__ void finalize_upd_bnd_kernel(i_t heavy_vars_beg_id,
                                         raft::device_span<f_t2> tmp_bnd,
                                         bounds_update_view_t view)
 {
-  using warp_reduce = cub::WarpReduce<f_t>;
+  using warp_reduce = cub::WarpReduce<f_t, raft::WarpSize>;
   __shared__ typename warp_reduce::TempStorage temp_storage;
   i_t idx     = heavy_vars_beg_id + blockIdx.x;
   i_t var_idx = view.vars_reorg_ids[idx];
@@ -569,7 +569,7 @@ template <typename i_t,
           typename bounds_update_view_t>
 __device__ void upd_bnd_sub_warp(i_t id_warp_beg, i_t id_range_end, bounds_update_view_t view)
 {
-  i_t lane_id = (threadIdx.x & 31);
+  i_t lane_id = (threadIdx.x & (raft::WarpSize - 1));
   i_t idx     = id_warp_beg + (lane_id / MAX_EDGE_PER_VAR);
   i_t var_idx;
   auto old_bounds =

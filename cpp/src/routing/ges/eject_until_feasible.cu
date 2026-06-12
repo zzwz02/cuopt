@@ -20,8 +20,8 @@ namespace detail {
 template <typename T, typename i_t = int, typename f_t = float>
 __device__ inline T shfl_sync(T val,
                               i_t srcLane,
-                              i_t width = raft::WarpSize,
-                              uint mask = 0xffffffffu)
+                              i_t width                  = raft::WarpSize,
+                              raft::lane_mask_t mask     = raft::LANE_MASK_ALL)
 {
   return __shfl_sync(mask, val, srcLane, width);
 }
@@ -359,7 +359,8 @@ void solution_t<i_t, f_t, REQUEST>::eject_until_feasible(bool add_slack_to_sol)
 {
   raft::common::nvtx::range fun_scope("eject_until_feasible");
   auto stream   = sol_handle->get_stream();
-  const i_t TPB = 32;
+  // One warp/wavefront per block: the kernel's reductions are warp-wide.
+  const i_t TPB = raft::WarpSize;
   compute_max_active();
   size_t sh_size = get_temp_route_shared_size();
   bool is_set    = set_shmem_of_kernel(eject_until_feasible_kernel<i_t, f_t, REQUEST>, sh_size);

@@ -266,7 +266,7 @@ class route_t {
                        bool update_global_arrs = true,
                        int nb_nodes            = 1)
     {
-      cuopt_assert(__popc(__activemask()) == 1, "eject_node should be single threaded");
+      cuopt_assert(raft::lane_popc(raft::activemask()) == 1, "eject_node should be single threaded");
       cuopt_assert(ejection_idx >= 0, "ejection_idx should be greater than 0");
       cuopt_assert(ejection_idx + nb_nodes - 1 < *n_nodes,
                    "ejection_idx should be smaller than n_nodes");
@@ -383,7 +383,7 @@ class route_t {
                         bool update_global_arrs = true,
                         i_t nb_nodes            = 1)
     {
-      cuopt_assert(__popc(__activemask()) == 1, "Insert node should be single threaded");
+      cuopt_assert(raft::lane_popc(raft::activemask()) == 1, "Insert node should be single threaded");
       cuopt_assert(insertion_idx >= 0, "insertion_idx should be greater than 0");
       cuopt_assert(insertion_idx <= *n_nodes, "insertion_idx should be less than n_nodes");
       cuopt_assert(*n_nodes + nb_nodes + 1 <= max_nodes_per_route(),
@@ -448,7 +448,7 @@ class route_t {
       auto delivery_location = request_location.delivery;
       auto pickup            = request_node.pickup;
       auto delivery          = request_node.delivery;
-      cuopt_assert(__popc(__activemask()) == 1, "Insert pickup delivery should be single threaded");
+      cuopt_assert(raft::lane_popc(raft::activemask()) == 1, "Insert pickup delivery should be single threaded");
       // TODO: fetch node for shared mem
 
       // Shift forward by two (to handle pickup) until delivery is reached
@@ -650,7 +650,7 @@ class route_t {
     DI thrust::tuple<objective_cost_t, infeasible_cost_t> compute_cost(
       bool check_single_threaded = true)
     {
-      cuopt_assert(!check_single_threaded || __popc(__activemask()) == 1,
+      cuopt_assert(!check_single_threaded || raft::lane_popc(raft::activemask()) == 1,
                    "Compute cost should be single threaded");
 
       // zero-out the cost. Since some routes are stored and shared memory and not explicitly
@@ -815,7 +815,7 @@ class route_t {
 
     DI void compute_actual_arrival_time()
     {
-      cuopt_assert(__popc(__activemask()) == 1,
+      cuopt_assert(raft::lane_popc(raft::activemask()) == 1,
                    "compute_actual_arrival_time should be single threaded");
       // start time is always greater than vehicle earliest
       // if there is an excess in the begining add it

@@ -169,8 +169,8 @@ DI i_t binaryBlockReduce(i_t val, i_t* shmem)
 {
   static_assert(BLOCK_SIZE <= 1024);
   assert(val == 0 || val == 1);
-  const uint32_t mask    = __ballot_sync(~0, val);
-  const uint32_t n_items = __popc(mask);
+  const lane_mask_t mask = __ballot_sync(LANE_MASK_ALL, val);
+  const i_t n_items      = lane_popc(mask);
 
   // Each first thread of the warp
   if (threadIdx.x % WarpSize == 0) { shmem[threadIdx.x / WarpSize] = n_items; }
@@ -233,8 +233,8 @@ DI void logicalWarpReduceVector(T* acc, int lane_id, ReduceLambda reduce_op)
 {
   static_assert(vecWidth > 0, "Vec width must be strictly positive.");
   static_assert(!(vecWidth & (vecWidth - 1)), "Vec width must be a power of two.");
-  static_assert(logicalWarpSize >= 2 && logicalWarpSize <= 32,
-                "Logical warp size must be between 2 and 32");
+  static_assert(logicalWarpSize >= 2 && logicalWarpSize <= WarpSize,
+                "Logical warp size must be between 2 and WarpSize");
   static_assert(!(logicalWarpSize & (logicalWarpSize - 1)),
                 "Logical warp size must be a power of two.");
 

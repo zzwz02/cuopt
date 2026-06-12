@@ -443,9 +443,9 @@ __global__ void load_balancing_mtm_compute_candidates(
 
     bool is_duplicate = false;
     // check across the warp to opportunistically eliminate duplicate candidate moves
-    uint32_t mask = __match_any_sync(__activemask(), delta);
-    if (__popc(mask) > 1) {
-      auto mask_ffs = __ffs(mask) - 1;
+    raft::lane_mask_t mask = __match_any_sync(raft::activemask(), delta);
+    if (raft::lane_popc(mask) > 1) {
+      auto mask_ffs = raft::lane_ffs(mask) - 1;
       is_duplicate  = lane_id != mask_ffs;
     }
 

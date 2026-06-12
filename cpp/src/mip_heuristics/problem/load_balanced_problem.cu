@@ -35,7 +35,7 @@ std::tuple<i_t, i_t, i_t, i_t> v_bin_meta(std::vector<i_t>& bins, i_t deg_beg, i
   for (i_t deg = deg_beg; deg <= deg_end; deg = deg * 2) {
     auto beg = ceil_log_2(deg);
     auto end = ceil_log_2(deg) + 1;
-    warp_total += (31 + (bins[end] - bins[beg]) * deg) / 32;
+    warp_total += (raft::WarpSize - 1 + (bins[end] - bins[beg]) * deg) / raft::WarpSize;
   }
   auto beg = ceil_log_2(deg_beg);
   auto end = ceil_log_2(deg_end) + 1;

@@ -45,21 +45,24 @@ DI void warpFence()
 }
 
 /** warp-wide any boolean aggregator */
-DI bool any(bool inFlag, uint32_t mask = 0xffffffffu)
+DI bool any(bool inFlag, lane_mask_t mask = LANE_MASK_ALL)
 {
   inFlag = __any_sync(mask, inFlag);
   return inFlag;
 }
 
 /** warp-wide all boolean aggregator */
-DI bool all(bool inFlag, uint32_t mask = 0xffffffffu)
+DI bool all(bool inFlag, lane_mask_t mask = LANE_MASK_ALL)
 {
   inFlag = __all_sync(mask, inFlag);
   return inFlag;
 }
 
 /** For every thread in the warp, set the corresponding bit to the thread's flag value.  */
-DI uint32_t ballot(bool inFlag, uint32_t mask = 0xffffffffu) { return __ballot_sync(mask, inFlag); }
+DI lane_mask_t ballot(bool inFlag, lane_mask_t mask = LANE_MASK_ALL)
+{
+  return __ballot_sync(mask, inFlag);
+}
 
 template <typename T>
 struct is_shuffleable {
@@ -85,7 +88,7 @@ template <typename T>
 DI std::enable_if_t<is_shuffleable_v<T>, T> shfl(T val,
                                                  int srcLane,
                                                  int width     = WarpSize,
-                                                 uint32_t mask = 0xffffffffu)
+                                                 lane_mask_t mask = LANE_MASK_ALL)
 {
   return __shfl_sync(mask, val, srcLane, width);
 }
@@ -95,7 +98,7 @@ template <typename T>
 DI std::enable_if_t<!is_shuffleable_v<T>, T> shfl(T val,
                                                   int srcLane,
                                                   int width     = WarpSize,
-                                                  uint32_t mask = 0xffffffffu)
+                                                  lane_mask_t mask = LANE_MASK_ALL)
 {
   using UnitT =
     std::conditional_t<is_multiple_v<T, int>,
@@ -134,7 +137,7 @@ template <typename T>
 DI std::enable_if_t<is_shuffleable_v<T>, T> shfl_up(T val,
                                                     int delta,
                                                     int width     = WarpSize,
-                                                    uint32_t mask = 0xffffffffu)
+                                                    lane_mask_t mask = LANE_MASK_ALL)
 {
   return __shfl_up_sync(mask, val, delta, width);
 }
@@ -144,7 +147,7 @@ template <typename T>
 DI std::enable_if_t<!is_shuffleable_v<T>, T> shfl_up(T val,
                                                      int delta,
                                                      int width     = WarpSize,
-                                                     uint32_t mask = 0xffffffffu)
+                                                     lane_mask_t mask = LANE_MASK_ALL)
 {
   using UnitT =
     std::conditional_t<is_multiple_v<T, int>,
@@ -183,7 +186,7 @@ template <typename T>
 DI std::enable_if_t<is_shuffleable_v<T>, T> shfl_xor(T val,
                                                      int laneMask,
                                                      int width     = WarpSize,
-                                                     uint32_t mask = 0xffffffffu)
+                                                     lane_mask_t mask = LANE_MASK_ALL)
 {
   return __shfl_xor_sync(mask, val, laneMask, width);
 }
@@ -193,7 +196,7 @@ template <typename T>
 DI std::enable_if_t<!is_shuffleable_v<T>, T> shfl_xor(T val,
                                                       int laneMask,
                                                       int width     = WarpSize,
-                                                      uint32_t mask = 0xffffffffu)
+                                                      lane_mask_t mask = LANE_MASK_ALL)
 {
   using UnitT =
     std::conditional_t<is_multiple_v<T, int>,

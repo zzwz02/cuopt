@@ -8,6 +8,7 @@
 #include <raft/core/detail/macros.hpp>
 #include <raft/core/error.hpp>
 #include <raft/util/cuda_rt_essentials.hpp>
+#include <raft/util/warp_constants.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -28,9 +29,10 @@
 namespace RAFT_EXPORT raft {
 
 /** Helper method to get to know warp size in device code */
-__host__ __device__ constexpr inline int warp_size() { return 32; }
+__host__ __device__ constexpr inline int warp_size() { return WarpSize; }
 
-__host__ __device__ constexpr inline unsigned int warp_full_mask() { return 0xffffffff; }
+/** All-lanes mask in the platform's lane-mask width (64-bit on wave64). */
+__host__ __device__ constexpr inline lane_mask_t warp_full_mask() { return LANE_MASK_ALL; }
 
 /**
  * @brief A kernel grid configuration construction gadget for simple one-dimensional mapping
