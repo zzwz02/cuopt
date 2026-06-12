@@ -185,6 +185,39 @@ class logger {
     }
   }
 
+  // Named-level conveniences, matching rapids_logger's API (used e.g. by the
+  // cuOpt gRPC server logger; the core cuOpt logger goes through macros).
+  template <typename... Args>
+  void trace(std::string const& format, Args&&... args)
+  {
+    log(level_enum::trace, format, std::forward<Args>(args)...);
+  }
+  template <typename... Args>
+  void debug(std::string const& format, Args&&... args)
+  {
+    log(level_enum::debug, format, std::forward<Args>(args)...);
+  }
+  template <typename... Args>
+  void info(std::string const& format, Args&&... args)
+  {
+    log(level_enum::info, format, std::forward<Args>(args)...);
+  }
+  template <typename... Args>
+  void warn(std::string const& format, Args&&... args)
+  {
+    log(level_enum::warn, format, std::forward<Args>(args)...);
+  }
+  template <typename... Args>
+  void error(std::string const& format, Args&&... args)
+  {
+    log(level_enum::error, format, std::forward<Args>(args)...);
+  }
+  template <typename... Args>
+  void critical(std::string const& format, Args&&... args)
+  {
+    log(level_enum::critical, format, std::forward<Args>(args)...);
+  }
+
   template <typename... Args>
   void log(level_enum lvl, std::string const& format, Args&&... args)
   {
