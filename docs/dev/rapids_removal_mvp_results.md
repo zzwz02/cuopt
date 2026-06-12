@@ -10,7 +10,9 @@
 **核心目标达成。** libcuopt.so + cuopt_cli + 全部 40 个测试可执行文件构建通过、
 **零编译错误**，运行时**不再链接 librmm.so / libraft / librapids_logger.so**。
 cuopt_cli 的 barrier 与 PDLP 求解目标值与基线**逐位一致**。C++ 单元测试
-**131/137 (96%) 通过**;剩余 6 个全部是同一 routing 问题(见 §5)。CLI_TEST 与 DOC_EXAMPLE 的"失败"经查是测试环境问题(cuopt_cli 不在 PATH、/tmp 残留文件),非 shim bug。
+**136/137 (99%) 通过**(由 routing CUDA-graph 修复从 131/137 提升);剩余 1 个
+(ROUTING_UNIT_TEST 的 `vehicle_breaks.non_uniform_breaks`)是 host 侧 use-after-free,
+与 device 图问题同一根因(cudaMallocAsync vs arena pool),见 §5。CLI_TEST 与 DOC_EXAMPLE 的"失败"经查是测试环境问题(cuopt_cli 不在 PATH、/tmp 残留文件),非 shim bug。
 **Python LP/MILP 路径已在零 RAPIDS 包环境构建并通过全部测试(51 passed / 0 failed,见 §6)。**
 
 ### 通过率演进与真实根因（诊断记录）
@@ -93,27 +95,35 @@ libamd libsuitesparseconfig libtbb libgomp  (+ libc/libstdc++/libm)
   /tmp/user_problem.mps))`——求解本身成功(Optimal, obj 303.5),失败仅因上次运行残留该文件;
   删除后通过。
 
-**真实失败:6 个 routing 测试**(ROUTING_TEST、ROUTING_GES_TEST、VEHICLE_ORDER_TEST、
-VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST、ROUTING_UNIT_TEST),共一个根因 —— **GES
-最小代价环(min-cost cycle)构造把 depot(node 0)当作被弹出节点(ejected node)写进 move path**:
-- 现象链(设备侧 printf 实测,`ROUTING_GES_TEST` `double_test_pdp.GES_PDP`):
-  `insert_graph_nodes_kernel`(perform_moves.cu)读 `path[0]`,解出 `ejected_request_id.id()==0`
-  (即 depot);`route_node_map.get_route_id(0) == -1`(depot 本就 unrouted);于是
-  `global_route = solution.routes[-1]` 拿到全零 view,其 `n_nodes==nullptr`,在 route.cuh:782
-  `get_num_nodes()` 解引用 NULL(`Address 0x0`)。实测打印:
-  `ejected blk=0 route_id=-1 n_routes=13 ejected=0 n_orders=101`。
-- move path 的坏边来自上游 `populate_move_path_kernel` 走 `move_candidates.cycles`(GES 找到的
-  环),环里含 node 0;即 **GES 环查找产出了一条包含 depot 的非法环**。
-- **已排除(逐一证伪)**:
-  - 分配器模式 / 未初始化读 —— 新增 `RMM_SHIM_NO_ZERO` 开关,**池清零 ON/OFF 现象完全相同**
-    (`ejected=0` 不变),排除"池脏数据被当索引/代价"假说;清零与 routing 无关。
-  - RNG —— `raft/random/detail/rng_device.cuh` 的 PCGenerator 与 raft 26.06 源 **逐字节相同**
-    (20223B,diff 空);失败**确定性复现**(多次同值),排除 `perform_moves.cu:341` 那条
-    `clock64()` 播种的 cross 路径(那条才是非确定的)。
-  - 对齐、per-thread 流 —— 同前次诊断已排除。
-- **后续方向(单一、隔离的深挖)**:对同一输入 dump shim 与 baseline 的
-  `move_candidates.cycles.paths/offsets`,定位环查找(代价图松弛 / block_reduce 归约序 /
-  thrust scan)在哪一步让 depot 进入环。属 GES 环构造的数值/顺序分歧,非容器或 RNG 问题。
+**已修复 5 个 routing 测试**(ROUTING_TEST、ROUTING_GES_TEST、VEHICLE_ORDER_TEST、
+VEHICLE_TYPES_TEST、OBJECTIVE_FUNCTION_TEST)→ 全量 ctest **136/137**。根因 = **CUDA Graph
+捕获/重放与 shim 分配器不兼容**,非数值 bug:
+
+- 现象链(设备侧 printf 实测,`double_test_pdp.GES_PDP`):`insert_graph_nodes_kernel` 读
+  `path[0]` 解出 `ejected_request_id.id()==0`(depot);`get_route_id(0)==-1`(depot 本就
+  unrouted)→ `solution.routes[-1]` 取到全零 view,`n_nodes==nullptr` → route.cuh:782
+  `get_num_nodes()` 解 NULL。坏边来自 `move_candidates.cycles` 含 depot 的非法环。
+- **真因**:`move_candidates.reset()` 把"哨兵填充"(`cost_counter = DBL_MAX` 等,经
+  `async_fill` 裸 kernel)**捕获进一个重放型 CUDA Graph**(`move_candidate_reset_graph`,
+  cudaStreamBeginCapture + cudaGraphExecUpdate)。shim 的默认 "pool" 资源由
+  `cudaMallocFromPoolAsync` 支撑,**该 graph 捕获与重放之间、其他无关的
+  cudaMallocAsync/cudaFreeAsync 流量会让被捕获的内存引用失效**,于是哨兵填充在重放时不生效
+  → cost_counter 残留有限代价 → top_k 选出非法候选(含 depot 列)→ 非法环 → 崩。
+  rmm 的 arena 式 `pool_memory_resource` 发的是稳定子分配,**不受影响**。
+- **逐一证伪的旧假说**:分配器清零(`RMM_SHIM_NO_ZERO` ON/OFF 完全相同)、RNG(PCGenerator
+  与 raft 26.06 逐字节相同、失败确定性)、对齐、per-thread 流、reduce/top_k(纯 CCCL block
+  primitive,bit-exact)、raft device util(reduction/warp/atomics 逐字节相同)、cub 流参(均
+  正确传 handle stream)。
+- **决定性实验**:在 `reset()` 旁路该 graph 改为 eager(直接发 kernel)→ **6 个测试全过**
+  (ROUTING 24 / GES 3 / VEHICLE_ORDER 4 / VEHICLE_TYPES 1 / OBJECTIVE_FUNCTION 2 /
+  ROUTING_UNIT 全过)。
+- **MVP 修复**(`move_candidates.cuh::reset`):默认走 eager reset(正确,开销相对 solve 可忽略);
+  reset graph 改为经 `CUOPT_USE_RESET_GRAPH` 显式开启,留待 shim 实现真正的 arena
+  `pool_memory_resource`(稳定子分配,对所有 routing graph 路径都 capture-safe)后再启用。
+- **剩余 1 个(ROUTING_UNIT_TEST `vehicle_breaks.non_uniform_breaks`)**:compute-sanitizer
+  报 **0 个 device 错误**,是 **host 侧 segfault**(与上面 device 非法地址不同类),仍在排查;
+  其余 56 个 ROUTING_UNIT 子测试已通过。这很可能是 breaks 路径用到的*另一个* CUDA graph
+  (sliding_window / nodes_to_search / vrp find_kernel),进一步印证 arena 分配器才是根治。
 
 ## 6. Python LP/MILP 路径（无 RAPIDS 包，已验证通过）
 

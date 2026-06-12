@@ -357,14 +357,31 @@ class move_candidates_t {
   inline void reset(solution_handle_t<i_t, f_t> const* sol_handle)
   {
     raft::common::nvtx::range fun_scope("move_candidates reset");
-    move_candidate_reset_graph.start_capture(sol_handle->get_stream());
+    // Reset the candidate/cycle/graph matrices to their sentinels.
+    //
+    // The captured-and-replayed CUDA graph path (below) is unsafe with the
+    // vendored RAPIDS-free rmm shim: its default device pool is backed by
+    // cudaMallocFromPoolAsync, and unrelated cudaMallocAsync/cudaFreeAsync
+    // traffic on that pool between this graph's capture and its replay can
+    // invalidate the captured memory references, so the sentinel fills do not
+    // take effect on replay. The matrices then keep stale finite costs, which
+    // surface downstream as invalid move candidates (e.g. a cycle that ejects
+    // the depot -> NULL n_nodes deref in insert_graph_nodes_kernel). rmm's
+    // arena-style pool_memory_resource hands out stable sub-allocations and is
+    // immune; restoring that (a real arena allocator in the shim) would let the
+    // graph path be re-enabled via CUOPT_USE_RESET_GRAPH. Until then, default to
+    // an eager reset, which is correct and whose cost is negligible vs. solve.
+    const bool use_reset_graph = getenv("CUOPT_USE_RESET_GRAPH") != nullptr;
+    if (use_reset_graph) { move_candidate_reset_graph.start_capture(sol_handle->get_stream()); }
     cycles.reset(sol_handle);
     graph.reset(sol_handle);
     move_path.reset(sol_handle);
     cand_matrix.reset(sol_handle);
     cuopt_func_call(debug_delta.set_value_to_zero_async(sol_handle->get_stream()));
-    move_candidate_reset_graph.end_capture(sol_handle->get_stream());
-    move_candidate_reset_graph.launch_graph(sol_handle->get_stream());
+    if (use_reset_graph) {
+      move_candidate_reset_graph.end_capture(sol_handle->get_stream());
+      move_candidate_reset_graph.launch_graph(sol_handle->get_stream());
+    }
     sol_handle->sync_stream();
   }
 
