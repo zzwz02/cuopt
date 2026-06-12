@@ -81,6 +81,7 @@ __device__ inline i_t ldlt_pivot_rule(f_t& dj,
                                       f_t neg_floor,
                                       f_t pos_floor,
                                       f_t static_pivot_tol,
+                                      f_t diag0_j,
                                       bool positive_definite,
                                       bool count,
                                       i_t* static_pivot_count,
@@ -96,9 +97,13 @@ __device__ inline i_t ldlt_pivot_rule(f_t& dj,
     return 0;
   }
   if (n_neg == i_t(0)) {
-    if (dj < static_pivot_tol) {
+    // Detection at the column's own scale: a global max-relative threshold
+    // mass-drops legitimate pivots when the diagonal spans many orders of
+    // magnitude (late-IPM ADAT diagonals reach 1e14+).
+    const f_t tol_j = f_t(1e-14) * fabs(diag0_j) + f_t(1e-30);
+    if (dj < tol_j) {
       if (count) {
-        if (dj < -static_pivot_tol) { atomicAdd(sign_corrections, i_t(1)); }
+        if (dj < -tol_j) { atomicAdd(sign_corrections, i_t(1)); }
         atomicAdd(static_pivot_count, i_t(1));
       }
       dj = f_t(drop_pivot_value);
@@ -165,6 +170,7 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
                                          i_t pivot_n_neg,
                                          f_t pivot_neg_floor,
                                          f_t pivot_pos_floor,
+                                         const f_t* diag0,
                                          i_t* sign_corrections)
 {
   const i_t j       = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
@@ -206,6 +212,7 @@ __global__ void ldlt_factor_level_kernel(const i_t* level_cols,
                                   pivot_neg_floor,
                                   pivot_pos_floor,
                                   static_pivot_tol,
+                                  diag0[j],
                                   positive_definite,
                                   threadIdx.x == 0,
                                   static_pivot_count,
@@ -288,6 +295,7 @@ __global__ void ldlt_factor_level_finalize_kernel(const i_t* level_cols,
                                                   i_t pivot_n_neg,
                                                   f_t pivot_neg_floor,
                                                   f_t pivot_pos_floor,
+                                                  const f_t* diag0,
                                                   i_t* sign_corrections)
 {
   const i_t j     = level_cols[level_start + static_cast<i_t>(blockIdx.x)];
@@ -299,6 +307,7 @@ __global__ void ldlt_factor_level_finalize_kernel(const i_t* level_cols,
                                   pivot_neg_floor,
                                   pivot_pos_floor,
                                   static_pivot_tol,
+                                  diag0[j],
                                   positive_definite,
                                   threadIdx.x == 0,
                                   static_pivot_count,
@@ -434,6 +443,7 @@ __global__ void ldlt_factor_bundle_kernel(const i_t* level_ptr,
                                           i_t pivot_n_neg,
                                           f_t pivot_neg_floor,
                                           f_t pivot_pos_floor,
+                                          const f_t* diag0,
                                           i_t* sign_corrections)
 {
   const i_t lane    = static_cast<i_t>(threadIdx.x) & (raft::WarpSize - 1);
@@ -480,6 +490,7 @@ __global__ void ldlt_factor_bundle_kernel(const i_t* level_ptr,
                                       pivot_neg_floor,
                                       pivot_pos_floor,
                                       static_pivot_tol,
+                                      diag0[j],
                                       positive_definite,
                                       threadIdx.x == 0,
                                       static_pivot_count,
@@ -530,6 +541,7 @@ __global__ void ldlt_factor_bundle_kernel(const i_t* level_ptr,
                                         pivot_neg_floor,
                                         pivot_pos_floor,
                                         static_pivot_tol,
+                                        diag0[j],
                                         positive_definite,
                                         lane == 0,
                                         static_pivot_count,
@@ -611,6 +623,7 @@ __global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
                                          i_t pivot_n_neg,
                                          f_t pivot_neg_floor,
                                          f_t pivot_pos_floor,
+                                         const f_t* diag0,
                                          i_t* sign_corrections)
 {
   __shared__ i_t s_cols[chain_window];
@@ -618,6 +631,7 @@ __global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
   __shared__ i_t s_fopoff[chain_window + 1];
   __shared__ i_t s_perm[chain_window];
   __shared__ f_t s_d[chain_window];
+  __shared__ f_t s_d0[chain_window];
   __shared__ i_t s_li[chain_smem];
   __shared__ f_t s_lx[chain_smem];
   __shared__ i_t s_op_slot[chain_smem];
@@ -638,6 +652,7 @@ __global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
       s_fopoff[c]  = fop_off[w0 + c] - fop_off[w0];
       s_perm[c]    = perm[j];
       s_d[c]       = D[j];
+      s_d0[c]      = diag0[j];
       if (c == we - 1) {
         s_smoff[we]  = smoff[w0 + we - 1] + (Lp[j + 1] - Lp[j]);
         s_fopoff[we] = fop_off[w0 + we] - fop_off[w0];
@@ -704,6 +719,7 @@ __global__ void ldlt_factor_chain_kernel(const i_t* chain_cols,
                                         pivot_neg_floor,
                                         pivot_pos_floor,
                                         static_pivot_tol,
+                                        s_d0[c],
                                         positive_definite,
                                         lane == 0,
                                         static_pivot_count,
@@ -1065,6 +1081,7 @@ __global__ void ldlt_dense_diag_kernel(f_t* S,
                                        i_t pivot_n_neg,
                                        f_t pivot_neg_floor,
                                        f_t pivot_pos_floor,
+                                       const f_t* diag0,
                                        i_t* sign_corrections)
 {
   for (i_t c = 0; c < nb; c++) {
@@ -1080,6 +1097,7 @@ __global__ void ldlt_dense_diag_kernel(f_t* S,
                                       pivot_neg_floor,
                                       pivot_pos_floor,
                                       static_pivot_tol,
+                                      diag0[tail_start + p0 + c],
                                       positive_definite,
                                       true,
                                       static_pivot_count,
@@ -1358,6 +1376,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_D_(0, handle_ptr->get_stream()),
       d_a_values_(0, handle_ptr->get_stream()),
       d_work_(0, handle_ptr->get_stream()),
+      d_diag0_(0, handle_ptr->get_stream()),
       d_fail_(handle_ptr->get_stream()),
       d_static_pivots_(handle_ptr->get_stream()),
       d_sign_corrections_(handle_ptr->get_stream())
@@ -2312,6 +2331,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       d_Lx_.resize(nnz_L_, stream);
       d_D_.resize(n_, stream);
       d_work_.resize(n_, stream);
+      d_diag0_.resize(n_, stream);
       raft::copy(d_Lp_.data(), Lp_.data(), Lp_.size(), stream);
       raft::copy(d_Li_.data(), Li_.data(), Li_.size(), stream);
       raft::copy(d_rp_ptr_.data(), rp_ptr_.data(), rp_ptr_.size(), stream);
@@ -2492,6 +2512,10 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         d_D_.data());
       RAFT_CHECK_CUDA(stream);
     }
+    // Snapshot of the assembled (pre-update) diagonal: per-column scale for
+    // the SPD drop test.
+    RAFT_CUDA_TRY(cudaMemcpyAsync(
+      d_diag0_.data(), d_D_.data(), sizeof(f_t) * n_, cudaMemcpyDeviceToDevice, stream));
 
     // Static pivoting threshold relative to the largest diagonal magnitude of
     // the (permuted) input.
@@ -2534,6 +2558,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                             pivot_n_neg_,
                                             pivot_neg_floor_,
                                             pivot_pos_floor_,
+                                            d_diag0_.data(),
                                             d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
         if ((seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
@@ -2560,6 +2585,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                             pivot_n_neg_,
                                             pivot_neg_floor_,
                                             pivot_pos_floor_,
+                                            d_diag0_.data(),
                                             d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
         if ((seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
@@ -2600,6 +2626,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                                  pivot_n_neg_,
                                                  pivot_neg_floor_,
                                                  pivot_pos_floor_,
+                                                 d_diag0_.data(),
                                                  d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
       } else {
@@ -2621,6 +2648,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                                  pivot_n_neg_,
                                                  pivot_neg_floor_,
                                                  pivot_pos_floor_,
+                                                 d_diag0_.data(),
                                                  d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
       }
@@ -2787,6 +2815,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                 pivot_n_neg_,
                                 pivot_neg_floor_,
                                 pivot_pos_floor_,
+                                d_diag0_.data(),
                                 d_sign_corrections_.data());
       RAFT_CHECK_CUDA(stream);
       const i_t m_rest = d - p0 - nb_eff;
@@ -2831,6 +2860,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     for (i_t j = 0; j < n_; j++) {
       max_abs_diag = std::max(max_abs_diag, std::abs(D_[j]));
     }
+    const std::vector<f_t> diag0(D_.begin(), D_.end());
     const f_t static_pivot_tol = compute_static_pivot_tol(max_abs_diag);
     i_t static_pivots          = 0;
     last_sign_corrections_     = 0;
@@ -2868,8 +2898,9 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
           static_pivots++;
         }
       } else if (pivot_n_neg_ == i_t(0)) {
-        if (dj < static_pivot_tol) {
-          if (dj < -static_pivot_tol) { last_sign_corrections_++; }
+        const f_t tol_j = f_t(1e-14) * std::abs(diag0[j]) + f_t(1e-30);
+        if (dj < tol_j) {
+          if (dj < -tol_j) { last_sign_corrections_++; }
           dj = f_t(ldlt_detail::drop_pivot_value);
           static_pivots++;
         }
@@ -3248,6 +3279,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   rmm::device_uvector<f_t> d_D_;
   rmm::device_uvector<f_t> d_a_values_;
   rmm::device_uvector<f_t> d_work_;
+  rmm::device_uvector<f_t> d_diag0_;
   rmm::device_scalar<i_t> d_fail_;
   rmm::device_scalar<i_t> d_static_pivots_;
   rmm::device_scalar<i_t> d_sign_corrections_;
