@@ -1710,6 +1710,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     std::vector<int64_t> fwd_work(n_head_levels_, 0);
     std::vector<int64_t> bwd_work(n_head_levels_, 0);
     std::vector<i_t> width(n_head_levels_, 0);
+    std::vector<i_t> max_col(n_head_levels_, 0);
     std::vector<char> chain_ok(n_head_levels_, 0);
     for (i_t l = 0; l < n_head_levels_; l++) {
       width[l] = head_level_ptr_[l + 1] - head_level_ptr_[l];
@@ -1721,9 +1722,17 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         for (i_t u = rp_ptr_[j]; u < rp_ptr_[j + 1]; u++) {
           scatter += Lp_[rp_col_[u] + 1] - rp_pos_[u] - 1;
         }
-        factor_work[l] += rp_len + scatter + c_len;
+        // Each scatter target is a binary search over the (global-memory)
+        // column pattern inside a single block: weight by the search depth so
+        // long-column levels price themselves out of bundles.
+        i_t search_depth = 1;
+        while ((i_t(1) << search_depth) < c_len) {
+          search_depth++;
+        }
+        factor_work[l] += rp_len + scatter * search_depth + c_len;
         fwd_work[l] += rp_len;
         bwd_work[l] += c_len;
+        max_col[l] = std::max(max_col[l], c_len);
         if (width[l] == 1) {
           chain_ok[l] = rp_len <= ldlt_detail::chain_col_cap && c_len <= ldlt_detail::chain_col_cap;
         }
@@ -1735,25 +1744,34 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       chain_run[l] = chain_ok[l] ? chain_run[l + 1] + 1 : 0;
     }
 
-    auto build = [&](std::vector<level_seg_t>& segs, const std::vector<int64_t>& work) {
+    // The factor bundle scatters through per-entry binary searches over the
+    // target column in global memory: long columns cost ~log2(len) global
+    // round-trips per entry inside a single block (no latency hiding), so
+    // factor bundles additionally require short columns. The solve bundles
+    // read their entries directly (no searches) and stay length-agnostic.
+    auto build = [&](std::vector<level_seg_t>& segs,
+                     const std::vector<int64_t>& work,
+                     i_t col_cap) {
       auto chain_here = [&](i_t l) { return chain_ok[l] && chain_run[l] >= chain_min_levels; };
-      i_t l           = 0;
+      auto ok         = [&](i_t l) {
+        return width[l] <= max_bundle_cols && work[l] <= max_bundle_work &&
+               (col_cap <= 0 || max_col[l] <= col_cap);
+      };
+      i_t l = 0;
       while (l < n_head_levels_) {
         if (chain_here(l)) {
           segs.push_back({l, l + chain_run[l], 2, ldlt_detail::bundle_block_dim});
           l += chain_run[l];
           continue;
         }
-        const bool can_bundle = width[l] <= max_bundle_cols && work[l] <= max_bundle_work;
-        if (!can_bundle) {
+        if (!ok(l)) {
           segs.push_back({l, l + 1, 0, 0});
           l++;
           continue;
         }
         i_t hi           = l;
         int64_t seg_work = 0;
-        while (hi < n_head_levels_ && width[hi] <= max_bundle_cols &&
-               work[hi] <= max_bundle_work && seg_work + work[hi] <= max_seg_work &&
+        while (hi < n_head_levels_ && ok(hi) && seg_work + work[hi] <= max_seg_work &&
                !chain_here(hi)) {
           seg_work += work[hi];
           hi++;
@@ -1762,9 +1780,9 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         l = hi;
       }
     };
-    build(factor_segs_, factor_work);
-    build(fwd_segs_, fwd_work);
-    build(bwd_segs_, bwd_work);
+    build(factor_segs_, factor_work, 0);
+    build(fwd_segs_, fwd_work, 0);
+    build(bwd_segs_, bwd_work, 0);
 
     // Chain window metadata: window boundaries (shared-memory capacity
     // driven), per-column data offsets inside the window buffer, the window
@@ -3340,10 +3358,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     }
     raft::copy(d_x, d_solve_x_.data(), n_, stream);
 
-    if (stats_enabled_) {
-      RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-      solve_time_ += toc(t_solve_start);
-    }
+    // Drain the stream: the barrier's per-iteration host<->device traffic
+    // uses pageable staging, and an ever-deepening async queue makes every
+    // later cudaMemcpyAsync call block for ~25us (staging-ring exhaustion) -
+    // measurably slower than the explicit synchronize.
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+    if (stats_enabled_) { solve_time_ += toc(t_solve_start); }
     n_solve_calls_++;
     if (halted()) { return CONCURRENT_HALT_RETURN; }
     return 0;

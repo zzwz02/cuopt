@@ -999,9 +999,20 @@ void mps_parser_t<i_t, f_t>::parse_rhs(std::string_view line)
     i_t first_field_start = 0;
     auto first_field      = get_next_string(line, first_field_start, pos);
     if (first_field == objective_name || row_names_map.count(std::string(first_field))) {
-      // first field corresponds to a row name, therefore we can assume that there is no RHS name
-      // field. Reset pos.
-      pos = 0;
+      // The first field is also a row name: the line is ambiguous (an RHS set
+      // name may shadow a row name, e.g. numerically named rows). Disambiguate
+      // by token parity: with a set name the line holds 1 + 2k fields, without
+      // it 2k ("name row val" = 3 vs "row val [row val]" = 2 or 4).
+      i_t n_fields = 0;
+      for (i_t p2 = 0, e2 = 0;;) {
+        auto field = get_next_string(line, p2, e2);
+        if (field.empty() || field[0] == '$') { break; }
+        n_fields++;
+      }
+      if (n_fields % 2 == 0) {
+        // even field count: no RHS set name; re-read from the start
+        pos = 0;
+      }
     }
     pos = read_rhs_row_and_value(line, pos);
     if (pos == -1) return;
