@@ -2109,6 +2109,14 @@ void pdlp_solver_t<i_t, f_t>::transpose_problem_fields(bool to_row)
   auto transpose_field = [&](rmm::device_uvector<f_t>& field, i_t rows) {
     if (field.size() <= static_cast<size_t>(rows)) return;
     rmm::device_uvector<f_t> transposed(field.size(), stream_view_);
+#if defined(CUOPT_USE_MACA_CCCL)
+    rmm::device_uvector<f_t> geam_zero(field.size(), stream_view_);
+    RAFT_CUDA_TRY(
+      cudaMemsetAsync(geam_zero.data(), 0, sizeof(f_t) * geam_zero.size(), stream_view_));
+    const f_t* geam_zero_data = geam_zero.data();
+#else
+    const f_t* geam_zero_data = nullptr;
+#endif
     auto batch_size = static_cast<i_t>(climber_strategies_.size());
     auto input_ld   = to_row ? &rows : &batch_size;
     auto output_ld  = to_row ? &batch_size : &rows;
@@ -2121,7 +2129,7 @@ void pdlp_solver_t<i_t, f_t>::transpose_problem_fields(bool to_row)
                                  field.data(),
                                  *input_ld,
                                  reusable_device_scalar_value_0_.data(),
-                                 nullptr,
+                                 geam_zero_data,
                                  *output_ld,
                                  transposed.data(),
                                  *output_ld));
@@ -2145,55 +2153,65 @@ void pdlp_solver_t<i_t, f_t>::transpose_primal_dual_to_row(
   rmm::device_uvector<f_t>& dual_slack_to_transpose)
 {
   bool is_dual_slack_empty = dual_slack_to_transpose.size() == 0;
+  const auto batch_size     = static_cast<i_t>(climber_strategies_.size());
   rmm::device_uvector<f_t> primal_transposed(primal_size_h_ * climber_strategies_.size(),
                                              stream_view_);
   rmm::device_uvector<f_t> dual_transposed(dual_size_h_ * climber_strategies_.size(), stream_view_);
   rmm::device_uvector<f_t> dual_slack_transposed(
     is_dual_slack_empty ? 0 : primal_size_h_ * climber_strategies_.size(), stream_view_);
+#if defined(CUOPT_USE_MACA_CCCL)
+  rmm::device_uvector<f_t> geam_zero(
+    static_cast<size_t>(std::max(primal_size_h_, dual_size_h_)) * batch_size, stream_view_);
+  RAFT_CUDA_TRY(
+    cudaMemsetAsync(geam_zero.data(), 0, sizeof(f_t) * geam_zero.size(), stream_view_));
+  const f_t* geam_zero_data = geam_zero.data();
+#else
+  const f_t* geam_zero_data = nullptr;
+#endif
 
   RAFT_CUBLAS_TRY(cublasSetStream(handle_ptr_->get_cublas_handle(), stream_view_));
   CUBLAS_CHECK(cublasGeam<f_t>(handle_ptr_->get_cublas_handle(),
                                CUBLAS_OP_T,
                                CUBLAS_OP_N,
-                               climber_strategies_.size(),
+                               batch_size,
                                primal_size_h_,
                                reusable_device_scalar_value_1_.data(),
                                primal_to_transpose.data(),
                                primal_size_h_,
                                reusable_device_scalar_value_0_.data(),
-                               nullptr,
-                               climber_strategies_.size(),
+                               geam_zero_data,
+                               batch_size,
                                primal_transposed.data(),
-                               climber_strategies_.size()));
+                               batch_size));
 
   if (!is_dual_slack_empty) {
     CUBLAS_CHECK(cublasGeam<f_t>(handle_ptr_->get_cublas_handle(),
                                  CUBLAS_OP_T,
                                  CUBLAS_OP_N,
-                                 climber_strategies_.size(),
+                                 batch_size,
                                  primal_size_h_,
                                  reusable_device_scalar_value_1_.data(),
                                  dual_slack_to_transpose.data(),
                                  primal_size_h_,
                                  reusable_device_scalar_value_0_.data(),
-                                 nullptr,
-                                 climber_strategies_.size(),
+                                 geam_zero_data,
+                                 batch_size,
                                  dual_slack_transposed.data(),
-                                 climber_strategies_.size()));
+                                 batch_size));
   }
   CUBLAS_CHECK(cublasGeam<f_t>(handle_ptr_->get_cublas_handle(),
                                CUBLAS_OP_T,
                                CUBLAS_OP_N,
-                               climber_strategies_.size(),
+                               batch_size,
                                dual_size_h_,
                                reusable_device_scalar_value_1_.data(),
                                dual_to_transpose.data(),
                                dual_size_h_,
                                reusable_device_scalar_value_0_.data(),
-                               nullptr,
-                               climber_strategies_.size(),
+                               geam_zero_data,
+                               batch_size,
                                dual_transposed.data(),
-                               climber_strategies_.size()));
+                               batch_size));
 
   // Copy that holds the tranpose to the original vector
   raft::copy(primal_to_transpose.data(),
@@ -2224,23 +2242,33 @@ void pdlp_solver_t<i_t, f_t>::transpose_primal_dual_back_to_col(
   rmm::device_uvector<f_t>& dual_slack_to_transpose)
 {
   bool is_dual_slack_empty = dual_slack_to_transpose.size() == 0;
+  const auto batch_size     = static_cast<i_t>(climber_strategies_.size());
   rmm::device_uvector<f_t> primal_transposed(primal_size_h_ * climber_strategies_.size(),
                                              stream_view_);
   rmm::device_uvector<f_t> dual_transposed(dual_size_h_ * climber_strategies_.size(), stream_view_);
   rmm::device_uvector<f_t> dual_slack_transposed(
     is_dual_slack_empty ? 0 : primal_size_h_ * climber_strategies_.size(), stream_view_);
+#if defined(CUOPT_USE_MACA_CCCL)
+  rmm::device_uvector<f_t> geam_zero(
+    static_cast<size_t>(std::max(primal_size_h_, dual_size_h_)) * batch_size, stream_view_);
+  RAFT_CUDA_TRY(
+    cudaMemsetAsync(geam_zero.data(), 0, sizeof(f_t) * geam_zero.size(), stream_view_));
+  const f_t* geam_zero_data = geam_zero.data();
+#else
+  const f_t* geam_zero_data = nullptr;
+#endif
 
   RAFT_CUBLAS_TRY(cublasSetStream(handle_ptr_->get_cublas_handle(), stream_view_));
   CUBLAS_CHECK(cublasGeam<f_t>(handle_ptr_->get_cublas_handle(),
                                CUBLAS_OP_T,
                                CUBLAS_OP_N,
                                primal_size_h_,
-                               climber_strategies_.size(),
+                               batch_size,
                                reusable_device_scalar_value_1_.data(),
                                primal_to_transpose.data(),
-                               climber_strategies_.size(),
+                               batch_size,
                                reusable_device_scalar_value_0_.data(),
-                               nullptr,
+                               geam_zero_data,
                                primal_size_h_,
                                primal_transposed.data(),
                                primal_size_h_));
@@ -2250,12 +2278,12 @@ void pdlp_solver_t<i_t, f_t>::transpose_primal_dual_back_to_col(
                                  CUBLAS_OP_T,
                                  CUBLAS_OP_N,
                                  primal_size_h_,
-                                 climber_strategies_.size(),
+                                 batch_size,
                                  reusable_device_scalar_value_1_.data(),
                                  dual_slack_to_transpose.data(),
-                                 climber_strategies_.size(),
+                                 batch_size,
                                  reusable_device_scalar_value_0_.data(),
-                                 nullptr,
+                                 geam_zero_data,
                                  primal_size_h_,
                                  dual_slack_transposed.data(),
                                  primal_size_h_));
@@ -2265,12 +2293,12 @@ void pdlp_solver_t<i_t, f_t>::transpose_primal_dual_back_to_col(
                                CUBLAS_OP_T,
                                CUBLAS_OP_N,
                                dual_size_h_,
-                               climber_strategies_.size(),
+                               batch_size,
                                reusable_device_scalar_value_1_.data(),
                                dual_to_transpose.data(),
-                               climber_strategies_.size(),
+                               batch_size,
                                reusable_device_scalar_value_0_.data(),
-                               nullptr,
+                               geam_zero_data,
                                dual_size_h_,
                                dual_transposed.data(),
                                dual_size_h_));
