@@ -100,14 +100,22 @@ __device__ inline i_t ldlt_pivot_rule(f_t& dj,
   if (n_neg == i_t(0)) {
     // Detection at the column's own scale: a global max-relative threshold
     // mass-drops legitimate pivots when the diagonal spans many orders of
-    // magnitude (late-IPM ADAT diagonals reach 1e14+).
+    // magnitude (late-IPM ADAT diagonals reach 1e14+). Only tiny POSITIVE
+    // pivots are dropped (numerical rank deficiency, e.g. redundant rows);
+    // negative pivots are cancellation-born on fill-heavy SPD systems
+    // (nug08-3rd computes thousands per factorization) and the indefinite
+    // factor that keeps them is far more accurate than dropping the rows -
+    // they are only floored away from zero.
     const f_t tol_j = f_t(1e-14) * fabs(diag0_j) + f_t(1e-30);
-    if (dj < tol_j) {
+    if (dj >= f_t(0) && dj < tol_j) {
+      if (count) { atomicAdd(static_pivot_count, i_t(1)); }
+      dj = f_t(drop_pivot_value);
+    } else if (dj < f_t(0) && -dj < tol_j) {
       if (count) {
-        if (dj < -tol_j) { atomicAdd(sign_corrections, i_t(1)); }
+        atomicAdd(sign_corrections, i_t(1));
         atomicAdd(static_pivot_count, i_t(1));
       }
-      dj = f_t(drop_pivot_value);
+      dj = -tol_j;
     }
     return 0;
   }
@@ -1649,15 +1657,28 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     const char* tau_env = std::getenv("CUOPT_LDLT_TAIL_DENSITY");
     const double tau    = tau_env != nullptr ? std::atof(tau_env) : 0.5;
 
-    int64_t suffix_nnz = 0;  // strict-lower entries of columns >= t (all live in the block)
+    // Marginal-density scan: extend the block downward only while the columns
+    // being added are themselves dense (windowed). An average-density rule
+    // lets a dense core subsidize thousands of mediocre columns, and the
+    // Schur assembly then pays 2*d^2 flops per coupled head column
+    // (CVXQP1_L grew a 3117-wide tail with ~2e11 Schur flops per factorize).
+    constexpr i_t mw   = 64;  // marginal window
+    int64_t win_nnz    = 0;
+    int64_t win_area   = 0;
     i_t best_t         = n_;
     for (i_t t = n_ - 1; t >= 0 && n_ - t <= d_cap; t--) {
-      suffix_nnz += col_counts_[t] - 1;
-      const i_t d = n_ - t;
-      if (d >= 128) {
-        const double area = 0.5 * static_cast<double>(d) * static_cast<double>(d - 1);
-        if (static_cast<double>(suffix_nnz) >= tau * area) { best_t = t; }
+      win_nnz += col_counts_[t] - 1;
+      win_area += n_ - t - 1;
+      if (n_ - t > mw) {
+        const i_t drop = t + mw;  // column leaving the window
+        win_nnz -= col_counts_[drop] - 1;
+        win_area -= n_ - drop - 1;
       }
+      const i_t d = n_ - t;
+      if (win_area > 0 && static_cast<double>(win_nnz) < tau * static_cast<double>(win_area)) {
+        break;  // the columns being added are no longer dense
+      }
+      if (d >= 128) { best_t = t; }
     }
     if (best_t < n_) {
       tail_start_ = best_t;
@@ -3074,9 +3095,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
         }
       } else if (pivot_n_neg_ == i_t(0)) {
         const f_t tol_j = f_t(1e-14) * std::abs(diag0[j]) + f_t(1e-30);
-        if (dj < tol_j) {
-          if (dj < -tol_j) { last_sign_corrections_++; }
+        if (dj >= f_t(0) && dj < tol_j) {
           dj = f_t(ldlt_detail::drop_pivot_value);
+          static_pivots++;
+        } else if (dj < f_t(0) && -dj < tol_j) {
+          last_sign_corrections_++;
+          dj = -tol_j;
           static_pivots++;
         }
       } else {
