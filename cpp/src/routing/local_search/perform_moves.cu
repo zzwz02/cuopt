@@ -295,11 +295,14 @@ __global__ void populate_cross_list_kernel(
       first_cand, second_cand, first_node, second_node);
 
     if (cross_cand.cost_counter.cost < best_values_per_route[second_route].cost_counter.cost) {
-      acquire_lock_block(&locks_per_route[second_route]);
-      if (cross_cand.cost_counter.cost < best_values_per_route[second_route].cost_counter.cost) {
-        best_values_per_route[second_route] = cross_cand;
-      }
-      release_lock_block(&locks_per_route[second_route]);
+      // with_lock_block: get_route_id maps several second_nodes to the same second_route,
+      // so same-warp lanes contend for locks_per_route[second_route] and would deadlock on
+      // lock-step SIMT GPUs (C500/warp64) with the blocking acquire_lock_block idiom.
+      with_lock_block(&locks_per_route[second_route], [&] __device__() {
+        if (cross_cand.cost_counter.cost < best_values_per_route[second_route].cost_counter.cost) {
+          best_values_per_route[second_route] = cross_cand;
+        }
+      });
     }
   }
   __syncthreads();

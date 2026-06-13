@@ -251,10 +251,10 @@ class cand_matrix_t {
       cuopt_assert(source < matrix_height, "Source should be smaller than matrix_height!");
       // an early check before acquiring the mutex
       if (cand.cost_counter.cost < cost_counter[source * matrix_width + sink].cost) {
-        acquire_lock(&cand_locks[source * matrix_width + sink]);
-        record_if_better(cand, source, sink);
-
-        release_lock(&cand_locks[source * matrix_width + sink]);
+        // with_lock (not acquire_lock/release_lock) so same-warp lanes contending for the
+        // same (source,sink) cell don't deadlock on lock-step SIMT GPUs (C500/warp64).
+        with_lock(&cand_locks[source * matrix_width + sink],
+                  [&] __device__() { record_if_better(cand, source, sink); });
       }
     }
 

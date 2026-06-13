@@ -60,6 +60,44 @@ DI void release_lock(i_t* lock)
   atomicExch(lock, 0);
 }
 
+/**
+ * Lock-step-SIMT-safe critical section.
+ *
+ * The idiom `acquire_lock(L); <critical>; release_lock(L);` deadlocks on GPUs
+ * without independent thread scheduling (ITS) -- e.g. MetaX C500 / warp64 -- when
+ * two or more lanes of the same warp contend for the same lock `L`. The lane that
+ * wins the CAS exits acquire_lock()'s internal spin loop and parks at the loop's
+ * reconvergence point while the losing lanes keep spinning; because the warp runs
+ * in lock-step the winner can never advance to release_lock(), so the warp hangs
+ * forever (no error, just a livelock at 100% util). NVIDIA Volta+ avoids this only
+ * because ITS lets the winner make independent forward progress.
+ *
+ * with_lock() instead performs the critical section AND the release *inside* the
+ * winning-CAS branch, before the loop's back-edge, so a lane that holds the lock
+ * never waits on a same-warp lane that is still spinning. This is correct on every
+ * architecture (with or without ITS).
+ *
+ * `critical_section` is invoked while the lock is held; it must not transfer
+ * control out of itself (no return/break/continue targeting the caller). For
+ * critical sections that need to `return` from the enclosing function, inline the
+ * `while (!done) { if (atomicCAS(L,0,1)==0) { ...; atomicExch(L,0); done=true; } }`
+ * pattern by hand instead.
+ */
+template <typename i_t, typename critical_fn_t>
+DI void with_lock(i_t* lock, critical_fn_t&& critical_section)
+{
+  bool done = false;
+  while (!done) {
+    if (atomicCAS(lock, 0, 1) == 0) {
+      __threadfence();
+      critical_section();
+      __threadfence();
+      atomicExch(lock, 0);
+      done = true;
+    }
+  }
+}
+
 template <typename i_t>
 DI bool try_acquire_lock_block(i_t* lock)
 {
@@ -87,6 +125,27 @@ DI void release_lock_block(i_t* lock)
 {
   __threadfence_block();
   atomicExch_block(lock, 0);
+}
+
+/**
+ * Block-scope counterpart of with_lock() (uses atomicCAS_block / atomicExch_block).
+ * Same rationale: the acquire_lock_block(L); <critical>; release_lock_block(L);
+ * idiom deadlocks on lock-step SIMT GPUs without ITS (C500/warp64) when same-warp
+ * lanes contend for the same block-scope lock. See with_lock() for details.
+ */
+template <typename i_t, typename critical_fn_t>
+DI void with_lock_block(i_t* lock, critical_fn_t&& critical_section)
+{
+  bool done = false;
+  while (!done) {
+    if (atomicCAS_block(lock, 0, 1) == 0) {
+      __threadfence_block();
+      critical_section();
+      __threadfence_block();
+      atomicExch_block(lock, 0);
+      done = true;
+    }
+  }
 }
 
 template <typename T>

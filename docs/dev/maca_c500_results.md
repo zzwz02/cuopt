@@ -24,7 +24,7 @@
 | QP / SOCP(barrier,自研 LDLᵀ) | ✅ | ✅ | QP_UNIT 7/7、SOCP 28/28 |
 | C API(cuopt_c.h) | ✅ | ✅ | C_API_TEST 61 run / 0 fail |
 | cuopt_cli | ✅ | ✅ | LP/QP 烟测目标值精确;CLI_TEST 7/7(需 `cuopt_cli` 在 PATH:`export PATH=$PWD/cpp/build_maca:$PATH`)|
-| routing C++(VRP/PDP/breaks/异构) | ✅ | ⚠ ATU 根因已修(`span<bool const>` 花括号),uniform_breaks 仍挂起 | §4:`span.hpp` 花括号→圆括号修复 order_match 野指针;含最小复现 |
+| routing C++(VRP/PDP/breaks/异构) | ✅ | ⚠ ROUTING_UNIT 13/14 套件绿;`span<bool>` + warp 自旋锁两大根因已修;余 1 例 OOB(`test_heterogeneous_breaks`)| §4:span 花括号→圆括号(§4.0)+ warp 协作自旋锁串行化(§4.0b);余 `insert_graph_nodes_kernel` OOB(§4.0c) |
 | 距离引擎(C++ waypoint) | ✅ | ✅ | WAYPOINT_MATRIXTEST 6/6 |
 | examples(cvrp/pdptw/service) | ✅ | ⏳ 待建/待测 | — |
 | Python LP/MILP/QP/SOCP(numpy) | ✅ | ⏳ 待建/待测 | Cython 扩展未构建 |
@@ -45,6 +45,16 @@
   MIP_TEST(3)· INCUMBENT_CALLBACK(3)· PRESOLVE(1)· C_API(61)·
   DUAL_SIMPLEX(30)· SOCP(28)。
 - 关键运行依赖:`MACA_DIRECT_DISPATCH=1`(已写入 maca_env.sh)。
+
+### W1 — routing C++ 死锁根因修复(本次 commit)
+- **修复 1**:`span<bool const>` 花括号初始化 → 圆括号(§4.0,前序 commit `87d84042`)。
+- **修复 2**:warp 协作自旋锁在 C500(lock-step、无 ITS)死锁/泄漏(§4.0b)。
+  改动 6 文件:`cuda_helpers.cuh`(新增 `with_lock`/`with_lock_block`)、
+  `vrp_move_candidates.cuh`、`move_candidates.cuh`、`prize_collection.cu`、
+  `perform_moves.cu`(in-branch 释放);`device_map.cuh`(warp 内 lane 串行化)。
+- 验证:`ROUTING_UNIT_TEST` **13/14 套件绿**(§4 结果表);整个 `vehicle_breaks`
+  套件 6/6 通过(含 `uniform_breaks`)。余 1 例 `test_heterogeneous_breaks` 为独立
+  OOB(§4.0c,待办)。
 
 ## 4. routing C++ 调查
 
@@ -71,8 +81,75 @@
 
 **修复**:`span.hpp` 中把 `base_{...}` 改为圆括号 `base_(...)`(direct-init,强制
 走 `(ptr,count)` 构造),对所有 span 正确。修复后 `vehicle_time_windows` 等通过、
-ATU 陷阱消失。**遗留**:`vehicle_breaks.uniform_breaks` 仍挂起(GPU 46%、无陷阱),
-为独立问题,待后续。
+ATU 陷阱消失。
+
+### 4.0b 已修复:`vehicle_breaks.uniform_breaks` 挂起 = warp 协作自旋锁在 C500 死锁/泄漏
+
+**(此前「局部搜索不收敛」的判断是错的。)** 真因是 **warp 协作自旋锁
+(`acquire_lock`/`release_lock`,`cpp/src/utilities/cuda_helpers.cuh`)在 C500 上
+死锁或泄漏**。该锁是教科书式 Volta-ITS 自旋锁:
+`while (atomicCAS(lock,0,1)) __nanosleep(100); __threadfence();`,依赖 NVIDIA
+Volta(sm_70)引入的**独立线程调度(ITS)**。C500 是 **lock-step SIMT、无 ITS**
+(`warp64`),因此**同一 warp 内有 ≥2 个 lane 争用同一把锁**时,赢得 CAS 的 lane
+被停在自旋循环的重汇聚点,而输的 lane 永远自旋——赢家永不执行 `release_lock`。
+表现:GPU 100% util、无进展、**无 trap、无报错、与 CUDA Graph 无关**(看起来与卡死
+内核完全一样;须确认 `~/mxlog/umd/trapInfo.*` 是**旧的**才能排除 OOB)。
+
+**两条死锁链**(printf 在 host 调用边界二分 + kernel 内 while 自旋加计数器定位):
+1. `find_vrp_moves` → `find_vrp_moves_kernel`(TPB=96=1.5×warp64)→
+   `record_candidate`(`vrp_move_candidates.cuh`,按 `node_id_1`/`route_pair_idx`
+   加锁,多 lane 撞同一 node 即争用)。数据相关:n_blocks=2546 通过、5360 挂。
+2. `find_best_negative_cycles` → cycle-finder `find_kernel` → `device_map_t::add`
+   (`device_map.cuh` 哈希插入的逐槽锁)。**更恶劣的泄漏型**:lane 赢 CAS 后在
+   `release_lock` 前被停 → 该槽锁**永久泄漏** → 后续探测到该槽的 lane 永远自旋
+   (实测数百 lane 各自卡在**各自不同**的 index;`max_available=400000` 远未填满)。
+
+**仅多-lane-同锁的站点受影响**;`if(threadIdx.x==0)`/`lane_id==0`/block-reduce 胜者
+(`reduction_idx==threadIdx.x`)守护的、以及每 lane 锁不同 index 的站点都安全(只剩
+跨-warp 争用,跨 warp 各自推进)。审计全部 ~18 处 `acquire_lock`:MIP 各处均单-lane
+→ 安全;多-lane 的 5 处全部修复。
+
+**修复**(`with_lock`/`with_lock_block` 助手,置于 `acquire_lock` 旁):
+- **简单单一固定锁**:把临界区+释放放进**赢得 CAS 的分支内**——
+  `while(!done){ if(atomicCAS(L,0,1)==0){ __threadfence(); crit; __threadfence(); atomicExch(L,0); done=true; } }`。修了 `record_candidate`、`record_candidate_thread_safe`、`prize_collection`、`perform_moves`(scross)。
+- **探测/多锁哈希插入**(`device_map_t::add`):in-branch 释放**不够**(泄漏型仍发生),
+  改为**按 warp 内 lane 串行化**——
+  `for (int turn=0; turn<raft::WarpSize; ++turn) if (raft::laneId()==turn) add_impl(...);`
+  (无 `__syncwarp`,对发散调用方安全;只一个 lane 进锁,只剩跨-warp 争用)。
+
+修复后 `vehicle_breaks` 全 6 例通过(`uniform_breaks` 30 s 通过,完成 cycle-finder
+全部 level)。**通用规律已写入 c500 skill**。诊断手法:host 调用边界 fprintf 二分 +
+kernel 内每个 while 自旋加「越界即 printf 并 break」的计数器,触发的即元凶循环。
+
+**ROUTING_UNIT_TEST 全套件结果(逐套件单跑,每套件 240 s 超时):13/14 套件绿。**
+
+| 套件 | 结果 | | 套件 | 结果 |
+|---|---|---|---|---|
+| vehicle_types | ✅ 2 | | heterogenous | ✅ 6 |
+| vehicle_breaks | ✅ 6 | | prize_collection | ✅ 3 |
+| heterogenous_breaks | ⚠ 1/2(`test_heterogeneous_breaks` OOB)| | objective_function | ✅ 2 |
+| vehicle_fixed_costs | ✅ 3 | | batch_tsp | ✅ 1 |
+| vehicle_order_match | ✅ 2 | | set_shmem_of_kernel | ✅ 5 |
+| order_locations | ✅ 4 | | top_k/top_cand_test | ✅ 18 |
+| horizontal_loading | ✅ 2 | | route_constraints | ✅ 1 |
+
+(对照:此前 span 修复前为 5 passed / 105 failed 的级联崩溃;自旋锁修复前 `vehicle_breaks`
+等多套件挂死。)
+
+### 4.0c 遗留:`heterogenous_breaks.test_heterogeneous_breaks` 在 `insert_graph_nodes_kernel` OOB
+
+自旋锁修复后该用例不再挂死,但**暴露出一个此前被死锁掩盖的独立越界**(非回归——
+我的改动只动锁,且其余 13 套件全绿;此 OOB 一直存在,只是之前 cycle-finder 死锁使其
+不可达)。
+- 性质:`Memory Violation(0x4)` 陷阱(非死锁),`~/mxlog/umd/trapInfo.*` 给出元凶内核
+  `cuopt::routing::detail::insert_graph_nodes_kernel<int,float,request_t(1)>`
+  ——cycle-finder 找到负环后据 move-path 落子的内核。
+- 线索:`move_candidates.cuh::reset()` 注释已提示该内核的已知风险——「弹出 depot 的
+  环 → `insert_graph_nodes_kernel` 解引用 NULL `n_nodes`」。疑为异构(non-uniform
+  break)下 cycle-finder 产出的环含非法节点 → 落子时越界。属与 span/AtY 同类的
+  「NVIDIA 良性、C500 触发 ATU」数据类问题。
+- 下一步:trap-log 已定位内核;用 printf 注入 + `-DASSERT_MODE` 收窄 OOB 的具体索引;
+  与 A100 对拍 cycle-finder 在该用例的环输出。
 
 ### 4.1 调查过程记录
 

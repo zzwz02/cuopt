@@ -63,11 +63,14 @@ __global__ void get_best_move_per_route(
       auto updated_cand = prize_cand_t(
         pickup_insertion, delivery_insertion, ejected_node_id, insertion_node_id, cost_delta);
 
-      acquire_lock(&route_locks[route_id]);
-      if (curr_cand.cost_counter.cost < best_cand_per_route[route_id].cost) {
-        best_cand_per_route[route_id] = updated_cand;
-      }
-      release_lock(&route_locks[route_id]);
+      // with_lock (not acquire_lock/release_lock): different `i` in this grid-stride loop
+      // can map to the same route_id, so same-warp lanes contend for route_locks[route_id]
+      // and would deadlock on lock-step SIMT GPUs (C500/warp64).
+      with_lock(&route_locks[route_id], [&] __device__() {
+        if (curr_cand.cost_counter.cost < best_cand_per_route[route_id].cost) {
+          best_cand_per_route[route_id] = updated_cand;
+        }
+      });
     }
   }
 }

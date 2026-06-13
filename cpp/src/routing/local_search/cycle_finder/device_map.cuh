@@ -72,7 +72,32 @@ struct device_map_t {
   }
 
   struct view_t {
+    // NOTE(MACA/C500): serialize add() across the lanes of the warp.
+    //
+    // add() uses a per-slot spin-lock (acquire_lock/release_lock) to claim a hash
+    // slot. On lock-step SIMT GPUs without independent thread scheduling (C500 /
+    // warp64), running the spin-lock concurrently across lanes of the same warp does
+    // not just risk same-lock contention -- a lane that wins a CAS (sets lock=1) can
+    // be parked at a divergent-reconvergence point *before* it executes release_lock,
+    // permanently leaking the lock. Every later probe that lands on that slot then
+    // spins forever on a CAS that can never succeed (observed: hundreds of lanes each
+    // stuck on their *own distinct* index in the cycle-finder's find_kernel at
+    // graph40-class sizes -> 100% util, no progress, no trap).
+    //
+    // Letting exactly one lane of the warp run the locked insert at a time removes all
+    // intra-warp lock pathology: the slot lock is then contended only across *warps*,
+    // which make independent forward progress, so it neither deadlocks nor leaks. The
+    // O(WarpSize) turn loop has no __syncwarp(), so it is safe for the divergent
+    // callers of add() (only a subset of lanes may call it). On NVIDIA (ITS) this is
+    // merely a minor serialization; on C500 it is required for correctness.
     DI void add(map_key_t const key, value_t const value, uint32_t const pred)
+    {
+      for (int turn = 0; turn < raft::WarpSize; ++turn) {
+        if (raft::laneId() == turn) { add_impl(key, value, pred); }
+      }
+    }
+
+    DI void add_impl(map_key_t const key, value_t const value, uint32_t const pred)
     {
       size_t index    = hash(key) % max_available;
       auto curr_value = values[index];

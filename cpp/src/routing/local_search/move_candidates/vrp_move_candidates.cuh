@@ -70,28 +70,50 @@ class vrp_move_candidates_t {
                              raft::device_span<i_t>& active_nodes_impacted)
     {
       // we want to store the best per node, to retry the moves on changed routes
+      // NOTE(MACA/C500): The critical section must live *inside* the winning-CAS branch.
+      // The separate acquire_lock();...;release_lock() idiom relies on Volta+ independent
+      // thread scheduling; on lock-step SIMT GPUs (C500/warp64, no ITS) the lock winner is
+      // parked at the spin loop's post-dominator while same-warp losers spin forever, so it
+      // never reaches release_lock -> deadlock. Doing the critical section + release in the
+      // taken branch keeps it warp-safe on every architecture.
       if (cost_delta_ < best_cost_delta_per_node[node_id_1_]) {
-        acquire_lock(&locks_per_node[node_id_1_]);
-        if (cost_delta_ < best_cost_delta_per_node[node_id_1_]) {
-          best_id_per_node[node_id_1_]         = node_id_2_;
-          best_cost_delta_per_node[node_id_1_] = cost_delta_;
+        bool done = false;
+        while (!done) {
+          if (atomicCAS(&locks_per_node[node_id_1_], 0, 1) == 0) {
+            __threadfence();
+            if (cost_delta_ < best_cost_delta_per_node[node_id_1_]) {
+              best_id_per_node[node_id_1_]         = node_id_2_;
+              best_cost_delta_per_node[node_id_1_] = cost_delta_;
+            }
+            __threadfence();
+            atomicExch(&locks_per_node[node_id_1_], 0);
+            done = true;
+          }
         }
-        release_lock(&locks_per_node[node_id_1_]);
       }
       // atomicExch(&active_nodes_impacted[node_id_1_], 1);
 
       if (cost_delta_ > cost_delta[route_pair_idx]) return;
-      acquire_lock(&locks_per_route_pair[route_pair_idx]);
-      if (cost_delta_ < cost_delta[route_pair_idx]) {
-        node_id_1[route_pair_idx]     = node_id_1_;
-        node_id_2[route_pair_idx]     = node_id_2_;
-        frag_size_1[route_pair_idx]   = frag_size_1_;
-        frag_size_2[route_pair_idx]   = frag_size_2_;
-        move_type[route_pair_idx]     = move_type_;
-        insert_offset[route_pair_idx] = insert_offset_;
-        cost_delta[route_pair_idx]    = cost_delta_;
+      {
+        bool done = false;
+        while (!done) {
+          if (atomicCAS(&locks_per_route_pair[route_pair_idx], 0, 1) == 0) {
+            __threadfence();
+            if (cost_delta_ < cost_delta[route_pair_idx]) {
+              node_id_1[route_pair_idx]     = node_id_1_;
+              node_id_2[route_pair_idx]     = node_id_2_;
+              frag_size_1[route_pair_idx]   = frag_size_1_;
+              frag_size_2[route_pair_idx]   = frag_size_2_;
+              move_type[route_pair_idx]     = move_type_;
+              insert_offset[route_pair_idx] = insert_offset_;
+              cost_delta[route_pair_idx]    = cost_delta_;
+            }
+            __threadfence();
+            atomicExch(&locks_per_route_pair[route_pair_idx], 0);
+            done = true;
+          }
+        }
       }
-      release_lock(&locks_per_route_pair[route_pair_idx]);
     }
 
     DI i_t get_route_pair_idx(i_t r_1, i_t r_2, i_t n_routes)
