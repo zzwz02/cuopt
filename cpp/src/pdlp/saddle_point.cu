@@ -56,7 +56,20 @@ saddle_point_state_t<i_t, f_t>::saddle_point_state_t(
   RAFT_CUDA_TRY(cudaMemsetAsync(
     dual_gradient_.data(), 0, sizeof(f_t) * dual_gradient_.size(), handle_ptr->get_stream()));
 
-  // No need to 0 init current/next AtY, they are directlty written as result of SpMV
+  // current/next AtY must be zero-initialized too. The assumption that the SpMV
+  // always writes them before any read holds in single-climber mode, but NOT in
+  // batch mode: update_solution swaps current_AtY_/next_AtY_ each accepted step,
+  // so the reflected-primal projection can read entries that this iteration's SpMM
+  // did not (re)write. On a fresh allocation those read as zero, but when the rmm
+  // pool hands back memory freed by an earlier (e.g. per-climber objective) solve,
+  // the stale contents corrupt the iterate and the batch solve fails to converge.
+  // Zeroing here makes the first read deterministic and removes the cross-solve
+  // contamination (observed on C500 as PDLP batch tests failing only after a prior
+  // per-climber-objective batch solve in the same process).
+  RAFT_CUDA_TRY(cudaMemsetAsync(
+    current_AtY_.data(), 0, sizeof(f_t) * current_AtY_.size(), handle_ptr->get_stream()));
+  RAFT_CUDA_TRY(cudaMemsetAsync(
+    next_AtY_.data(), 0, sizeof(f_t) * next_AtY_.size(), handle_ptr->get_stream()));
 }
 
 template <typename i_t, typename f_t>

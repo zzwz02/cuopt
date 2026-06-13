@@ -280,6 +280,10 @@ pdlp_restart_strategy_t<i_t, f_t>::pdlp_restart_strategy_t(
     const int nb_block_to_launch =
       std::min(deviceProp.multiProcessorCount * numBlocksPerSm,
                (primal_size_h_ + dual_size_h_ + numThreads - 1) / numThreads);
+    // On MACA/C500 this block count is used to launch ordinary (non-cooperative)
+    // kernels in a host-driven loop (see solve_bound_constrained_trust_region),
+    // so it does not need to be cooperatively co-resident; on NVIDIA it is the
+    // cooperative grid. Either way it sizes the per-block reduction accumulator.
     shared_live_kernel_accumulator_.resize(nb_block_to_launch, handle_ptr->get_stream());
   }
 
@@ -1791,6 +1795,152 @@ DI void update_range_low(
   cg::this_grid().sync();
 }
 
+#if defined(CUOPT_USE_MACA_CCCL)
+// ---------------------------------------------------------------------------
+// MACA/C500 host-driven trust-region bisection.
+//
+// Cooperative grid launches (cudaLaunchCooperativeKernel + cg::this_grid().sync())
+// deadlock on C500: cudaOccupancyMaxActiveBlocksPerMultiprocessor over-reports
+// co-residency (it ignores register/shared-mem pressure, and the true cooperative
+// residency is lower still), and cudaLaunchCooperativeKernel does not validate the
+// grid size, so the surplus blocks never become resident and every grid sync hangs.
+// Instead of one persistent cooperative kernel, the bisection loop is driven from
+// the host and each former cg::this_grid().sync() becomes a kernel-launch boundary.
+// These are ordinary launches, so the grid may be over-subscribed (blocks run in
+// waves) with no co-residency requirement -- robust under any GPU concurrency.
+// ---------------------------------------------------------------------------
+
+// Median breakpoint of the active range, written to *out_test_threshold.
+template <typename i_t, typename f_t>
+__global__ void maca_tr_median_kernel(typename pdlp_restart_strategy_t<i_t, f_t>::view_t v,
+                                      const i_t* range_low,
+                                      const i_t* range_high,
+                                      f_t* out_test_threshold)
+{
+  const i_t lo   = *range_low;
+  const i_t hi   = *range_high;
+  const i_t size = hi - lo;
+  if ((size & 1) == 0)
+    *out_test_threshold = f_t(0.5) * (v.threshold[lo + size / 2 - 1] + v.threshold[lo + size / 2]);
+  else
+    *out_test_threshold = v.threshold[lo + size / 2];
+}
+
+// test_point[i] = clamp(center[i] + tt * direction[i], lower[i], upper[i]) over [lo, hi).
+template <typename i_t, typename f_t>
+__global__ void maca_tr_clamp_kernel(typename pdlp_restart_strategy_t<i_t, f_t>::view_t v,
+                                     i_t lo,
+                                     i_t hi,
+                                     const f_t* test_threshold)
+{
+  const f_t tt = *test_threshold;
+  for (i_t i = blockIdx.x * blockDim.x + threadIdx.x + lo; i < hi; i += blockDim.x * gridDim.x) {
+    v.test_point[i] =
+      raft::min<f_t>(raft::max<f_t>(v.center_point[i] + tt * v.direction_full[i], v.lower_bound[i]),
+                     v.upper_bound[i]);
+  }
+}
+
+// Per-block weighted-square partial sum over [lo, hi) into the accumulator.
+// mode 0: (test_point - center)^2 * w   mode 1: (direction_full)^2 * w.
+// Every launched block writes its slot (0 if it covers no index) so the matching
+// final-reduce can sum a fixed block count regardless of the sub-range size.
+template <typename i_t, typename f_t, int BLOCK_SIZE>
+__global__ void maca_tr_partial_norm_kernel(typename pdlp_restart_strategy_t<i_t, f_t>::view_t v,
+                                            i_t lo,
+                                            i_t hi,
+                                            int mode)
+{
+  __shared__ f_t shared[BLOCK_SIZE / raft::WarpSize];
+  f_t local = f_t(0);
+  for (i_t i = blockIdx.x * blockDim.x + threadIdx.x + lo; i < hi; i += blockDim.x * gridDim.x) {
+    const f_t d = (mode == 0) ? (v.test_point[i] - v.center_point[i]) : v.direction_full[i];
+    local += d * d * v.weights[i];
+  }
+  local = deterministic_block_reduce<f_t, BLOCK_SIZE>(
+    raft::device_span<f_t>{shared, BLOCK_SIZE / raft::WarpSize}, local);
+  if (threadIdx.x == 0) v.shared_live_kernel_accumulator[blockIdx.x] = local;
+}
+
+// Reduce the first nb_blocks accumulator slots into *out (optionally accumulating).
+template <typename i_t, typename f_t, int BLOCK_SIZE>
+__global__ void maca_tr_final_reduce_kernel(typename pdlp_restart_strategy_t<i_t, f_t>::view_t v,
+                                            f_t* out,
+                                            int nb_blocks,
+                                            bool add)
+{
+  __shared__ f_t shared[BLOCK_SIZE / raft::WarpSize];
+  f_t local = f_t(0);
+  for (int i = threadIdx.x; i < nb_blocks; i += BLOCK_SIZE)
+    local += v.shared_live_kernel_accumulator[i];
+  local = deterministic_block_reduce<f_t, BLOCK_SIZE>(
+    raft::device_span<f_t>{shared, BLOCK_SIZE / raft::WarpSize}, local);
+  if (threadIdx.x == 0) {
+    if (add)
+      *out += local;
+    else
+      *out = local;
+  }
+}
+
+// new_high = min index in [lo, hi) with threshold[i] >= tt; atomicMin into *testing_range_high.
+template <typename i_t, typename f_t>
+__global__ void maca_tr_update_range_high_kernel(
+  typename pdlp_restart_strategy_t<i_t, f_t>::view_t v,
+  i_t lo,
+  i_t hi,
+  const f_t* test_threshold,
+  i_t* testing_range_high)
+{
+  __shared__ i_t shared_index;
+  __shared__ bool has_found;
+  if (threadIdx.x == 0) {
+    shared_index = std::numeric_limits<i_t>::max();
+    has_found    = false;
+  }
+  __syncthreads();
+  const f_t tt = *test_threshold;
+  for (i_t i = blockIdx.x * blockDim.x + threadIdx.x + lo; i < hi; i += blockDim.x * gridDim.x) {
+    if (v.threshold[i] >= tt) {
+      raft::myAtomicMin(&shared_index, i);
+      has_found = true;
+      break;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && has_found) raft::myAtomicMin(testing_range_high, shared_index);
+}
+
+// new_low = (max index in [lo, hi) with threshold[i] <= tt) + 1; atomicMax into *testing_range_low.
+template <typename i_t, typename f_t>
+__global__ void maca_tr_update_range_low_kernel(
+  typename pdlp_restart_strategy_t<i_t, f_t>::view_t v,
+  i_t lo,
+  i_t hi,
+  const f_t* test_threshold,
+  i_t* testing_range_low)
+{
+  __shared__ i_t shared_index;
+  __shared__ bool has_found;
+  if (threadIdx.x == 0) {
+    shared_index = std::numeric_limits<i_t>::min();
+    has_found    = false;
+  }
+  __syncthreads();
+  const f_t tt = *test_threshold;
+  for (i_t i = hi - 1 - (blockIdx.x * blockDim.x + threadIdx.x); i >= lo;
+       i -= blockDim.x * gridDim.x) {
+    if (v.threshold[i] <= tt) {
+      raft::myAtomicMax(&shared_index, i);
+      has_found = true;
+      break;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && has_found) raft::myAtomicMax(testing_range_low, shared_index + 1);
+}
+#endif
+
 // Range low/high are passed as parameter so that function can be reused accross primal / dual
 template <typename i_t, typename f_t, int BLOCK_SIZE>
 __global__ void solve_bound_constrained_trust_region_kernel(
@@ -2085,15 +2235,86 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
                  "Threshold vector should not contain inf or NaN values");
 
     // Init parameters for live kernel
-    // Has to do this to pass lvalues (and not rvalue) to void* kernel_args
     auto restart_view        = this->view();
-    auto op_view             = problem_ptr->view();
-    i_t* testing_range_low   = testing_range_low_.data();
-    i_t* testing_range_high  = testing_range_high_.data();
     f_t* test_radius_squared = test_radius_squared_.data();
     f_t* low_radius_squared  = low_radius_squared_.data();
     f_t* high_radius_squared = high_radius_squared_.data();
-    f_t* distance_traveled   = duality_gap.distance_traveled_.data();
+    constexpr int numThreads = 128;
+#if defined(CUOPT_USE_MACA_CCCL)
+    // Host-driven bisection (see the maca_tr_* kernels above), replacing the
+    // persistent cooperative kernel that deadlocks on C500. Each iteration halves
+    // the active [low, high) range using ordinary kernel launches; the kernel
+    // boundaries provide the grid-wide synchronization the cooperative version
+    // got from cg::this_grid().sync(). low_radius_squared_/high_radius_squared_
+    // were reset to 0 above and accumulate across iterations on the device.
+    {
+      f_t* test_threshold       = test_threshold_.data();
+      i_t* testing_range_low_p  = testing_range_low_.data();
+      i_t* testing_range_high_p = testing_range_high_.data();
+      const int nb_blocks       = static_cast<int>(shared_live_kernel_accumulator_.size());
+      const dim3 grid(nb_blocks, 1, 1);
+      const dim3 block(numThreads, 1, 1);
+      // target_radius is the distance travelled since the last restart; constant here.
+      const f_t target = duality_gap.distance_traveled_.value(stream_view_);
+
+      i_t h_low      = testing_range_low_.value(stream_view_);
+      i_t h_high     = testing_range_high_.value(stream_view_);
+      int safe_guard = 0;
+      while (h_low != h_high) {
+        // Forward progress is guaranteed (the range halves each step); the guard is
+        // pure defence so a hypothetical edge case degrades to a clamp, not a hang.
+        if (++safe_guard > 1024) break;
+
+        maca_tr_median_kernel<i_t, f_t><<<1, 1, 0, stream_view_>>>(
+          restart_view, testing_range_low_p, testing_range_high_p, test_threshold);
+        maca_tr_clamp_kernel<i_t, f_t>
+          <<<grid, block, 0, stream_view_>>>(restart_view, h_low, h_high, test_threshold);
+        // test radius over [h_low, h_high) of (test_point - center)^2 * weight
+        maca_tr_partial_norm_kernel<i_t, f_t, numThreads>
+          <<<grid, block, 0, stream_view_>>>(restart_view, h_low, h_high, /*mode=*/0);
+        maca_tr_final_reduce_kernel<i_t, f_t, numThreads><<<1, block, 0, stream_view_>>>(
+          restart_view, test_radius_squared, nb_blocks, /*add=*/false);
+
+        const f_t tt        = test_threshold_.value(stream_view_);
+        const f_t test_r    = test_radius_squared_.value(stream_view_);
+        const f_t low_r     = low_radius_squared_.value(stream_view_);
+        const f_t high_r    = high_radius_squared_.value(stream_view_);
+        const bool too_high = low_r + test_r + (tt * tt) * high_r >= (target * target);
+
+        if (too_high) {
+          maca_tr_update_range_high_kernel<i_t, f_t><<<grid, block, 0, stream_view_>>>(
+            restart_view, h_low, h_high, test_threshold, testing_range_high_p);
+          const i_t new_high = testing_range_high_.value(stream_view_);
+          cuopt_assert(new_high != h_high, "New range high can't be same as old");
+          if (h_high - new_high > 0) {  // accumulate high radius over the discarded range
+            maca_tr_partial_norm_kernel<i_t, f_t, numThreads>
+              <<<grid, block, 0, stream_view_>>>(restart_view, new_high, h_high, /*mode=*/1);
+            maca_tr_final_reduce_kernel<i_t, f_t, numThreads><<<1, block, 0, stream_view_>>>(
+              restart_view, high_radius_squared, nb_blocks, /*add=*/true);
+          }
+          h_high = new_high;
+        } else {
+          maca_tr_update_range_low_kernel<i_t, f_t><<<grid, block, 0, stream_view_>>>(
+            restart_view, h_low, h_high, test_threshold, testing_range_low_p);
+          const i_t new_low = testing_range_low_.value(stream_view_);
+          cuopt_assert(new_low != h_low, "New range low can't be same as old");
+          if (new_low - h_low > 0) {  // accumulate low radius over the discarded range
+            maca_tr_partial_norm_kernel<i_t, f_t, numThreads>
+              <<<grid, block, 0, stream_view_>>>(restart_view, h_low, new_low, /*mode=*/0);
+            maca_tr_final_reduce_kernel<i_t, f_t, numThreads><<<1, block, 0, stream_view_>>>(
+              restart_view, low_radius_squared, nb_blocks, /*add=*/true);
+          }
+          h_low = new_low;
+        }
+      }
+      RAFT_CUDA_TRY(cudaPeekAtLastError());
+    }
+#else
+    // Has to do this to pass lvalues (and not rvalue) to void* kernel_args
+    auto op_view            = problem_ptr->view();
+    i_t* testing_range_low  = testing_range_low_.data();
+    i_t* testing_range_high = testing_range_high_.data();
+    f_t* distance_traveled  = duality_gap.distance_traveled_.data();
 
     void* kernel_args[] = {
       &restart_view,
@@ -2105,7 +2326,6 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
       &high_radius_squared,
       &distance_traveled,
     };
-    constexpr int numThreads = 128;
     dim3 dimBlock(numThreads, 1, 1);
     // shared_live_kernel_accumulator_.size() contains deviceProp.multiProcessorCount *
     // numBlocksPerSm
@@ -2118,6 +2338,7 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
       kernel_args,
       0,
       stream_view_));
+#endif
 
     // Find max threshold for the join problem
     const f_t* max_threshold =

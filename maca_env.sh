@@ -7,6 +7,11 @@ export MACA_PATH="${MACA_PATH:-/opt/maca}"
 export CUCC_PATH="${CUCC_PATH:-${MACA_PATH}/tools/cu-bridge}"
 export CUCC_TARGETS="${CUCC_TARGETS:-xcore1000}"
 
+# Force MACA to dispatch kernels directly instead of through its deferred/queued
+# path. Required for cuOpt on C500: the queued dispatch path causes cross-kernel
+# ordering hangs and wrong results (seen in PDLP batch tests run back-to-back).
+export MACA_DIRECT_DISPATCH="${MACA_DIRECT_DISPATCH:-1}"
+
 # cu-bridge writes a transient CUDA toolkit shim. Keep it in the workspace so
 # builds do not depend on write access to $HOME.
 export CUBRIDGE_HOME="${CUBRIDGE_HOME:-${ROOT}/.maca_cu_bridge}"
