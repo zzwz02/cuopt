@@ -18,6 +18,7 @@
 
 #include <thrust/device_ptr.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/sort.h>
 #include <thrust/tabulate.h>
@@ -69,20 +70,20 @@ struct transform_reduce_helper_t {
                        i_t size,
                        rmm::cuda_stream_view stream_view)
   {
-    cub::DeviceReduce::TransformReduce(
-      nullptr, buffer_size, input, out.data(), size, reduce_op, transform_op, init, stream_view);
+    auto transformed_input = thrust::make_transform_iterator(input, transform_op);
+    cub::DeviceReduce::Reduce(
+      nullptr, buffer_size, transformed_input, out.data(), size, reduce_op, init, stream_view);
 
     buffer_data.resize(buffer_size, stream_view);
 
-    cub::DeviceReduce::TransformReduce(buffer_data.data(),
-                                       buffer_size,
-                                       input,
-                                       out.data(),
-                                       size,
-                                       reduce_op,
-                                       transform_op,
-                                       init,
-                                       stream_view);
+    cub::DeviceReduce::Reduce(buffer_data.data(),
+                              buffer_size,
+                              transformed_input,
+                              out.data(),
+                              size,
+                              reduce_op,
+                              init,
+                              stream_view);
 
     return out.value(stream_view);
   }

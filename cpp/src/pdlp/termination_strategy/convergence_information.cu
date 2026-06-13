@@ -346,7 +346,7 @@ template <typename i_t, typename f_t>
 void convergence_information_t<i_t, f_t>::set_relative_primal_tolerance_factor(
   f_t primal_tolerance_factor)
 {
-  cub::DeviceTransform::Transform(thrust::make_constant_iterator(primal_tolerance_factor),
+  cuopt::device_transform(thrust::make_constant_iterator(primal_tolerance_factor),
                                   l2_norm_primal_right_hand_side_.data(),
                                   l2_norm_primal_right_hand_side_.size(),
                                   cuda::std::identity{},
@@ -432,7 +432,7 @@ void convergence_information_t<i_t, f_t>::compute_convergence_information(
       l2_primal_residual_.data(),
       climber_strategies_.size(),
       dual_size_h_);
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       l2_primal_residual_.data(),
       l2_primal_residual_.data(),
       l2_primal_residual_.size(),
@@ -484,7 +484,7 @@ void convergence_information_t<i_t, f_t>::compute_convergence_information(
       l2_dual_residual_.data(),
       climber_strategies_.size(),
       primal_size_h_);
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       l2_dual_residual_.data(),
       l2_dual_residual_.data(),
       l2_dual_residual_.size(),
@@ -582,7 +582,7 @@ void convergence_information_t<i_t, f_t>::compute_primal_residual(
 #ifdef CUPDLP_DEBUG_MODE
     print("tmp_dual", tmp_dual);
 #endif
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(tmp_dual.data(),
                             problem_wrap_container(problem_ptr->constraint_lower_bounds),
                             problem_wrap_container(problem_ptr->constraint_upper_bounds),
@@ -710,7 +710,7 @@ void convergence_information_t<i_t, f_t>::compute_dual_residual(
 
   // Substract with the objective vector manually to avoid possible cusparse bug w/ nonzero beta and
   // len(X)=1
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(problem_wrap_container(problem_ptr->objective_coefficients),
                           tmp_primal.data()),
     tmp_primal.data(),
@@ -719,7 +719,7 @@ void convergence_information_t<i_t, f_t>::compute_dual_residual(
     stream_view_);
 
   if (hyper_params_.use_reflected_primal_dual) {
-    cub::DeviceTransform::Transform(cuda::std::make_tuple(tmp_primal.data(), dual_slack.data()),
+    cuopt::device_transform(cuda::std::make_tuple(tmp_primal.data(), dual_slack.data()),
                                     dual_residual_.data(),
                                     dual_residual_.size(),
                                     cuda::std::minus<>{},
@@ -812,7 +812,7 @@ void convergence_information_t<i_t, f_t>::compute_dual_objective(
         primal_slack_.data(), sum_primal_slack_.data(), climber_strategies_.size(), dual_size_h_);
     }
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(dual_dot_.data(), sum_primal_slack_.data()),
       dual_objective_.data(),
       dual_objective_.size(),
@@ -843,7 +843,7 @@ void convergence_information_t<i_t, f_t>::compute_reduced_cost_from_primal_gradi
   raft::common::nvtx::range fun_scope("compute_reduced_cost_from_primal_gradient");
 
   using f_t2 = typename type_2<f_t>::type;
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(primal_gradient.data(), problem_ptr->variable_bounds.data()),
     bound_value_.data(),
     primal_size_h_,
@@ -876,7 +876,7 @@ void convergence_information_t<i_t, f_t>::compute_reduced_costs_dual_objective_c
   using f_t2 = typename type_2<f_t>::type;
   // if reduced cost is positive -> lower bound, negative -> upper bounds, 0 -> 0
   // if bound_val is not finite let element be -inf, otherwise bound_value*reduced_cost
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(reduced_cost_.data(), problem_ptr->variable_bounds.data()),
     bound_value_.data(),
     primal_size_h_,

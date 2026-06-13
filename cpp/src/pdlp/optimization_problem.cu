@@ -15,6 +15,7 @@
 #include <cuopt/linear_programming/io/writer.hpp>
 #include <mip_heuristics/mip_constants.hpp>
 #include <utilities/copy_helpers.hpp>
+#include <utilities/device_transform.cuh>
 #include <utilities/logger.hpp>
 #include <utilities/sparse_matrix_helpers.hpp>
 
@@ -42,7 +43,6 @@
 #include <thrust/tuple.h>
 
 #include <cuda_profiler_api.h>
-#include <cub/device/device_transform.cuh>
 
 #include <algorithm>
 #include <cmath>
@@ -75,6 +75,7 @@ optimization_problem_t<i_t, f_t>::optimization_problem_t(
   const optimization_problem_t<i_t, f_t>& other)
   : handle_ptr_(other.get_handle_ptr()),
     stream_view_(handle_ptr_->get_stream()),
+    problem_category_{other.get_problem_category()},
     maximize_{other.get_sense()},
     n_vars_{other.get_n_variables()},
     n_constraints_{other.get_n_constraints()},
@@ -89,6 +90,7 @@ optimization_problem_t<i_t, f_t>::optimization_problem_t(
     Q_offsets_{other.get_quadratic_objective_offsets()},
     Q_indices_{other.get_quadratic_objective_indices()},
     Q_values_{other.get_quadratic_objective_values()},
+    quadratic_constraints_{other.get_quadratic_constraints()},
     variable_lower_bounds_{other.get_variable_lower_bounds(), stream_view_},
     variable_upper_bounds_{other.get_variable_upper_bounds(), stream_view_},
     constraint_lower_bounds_{other.get_constraint_lower_bounds(), stream_view_},
@@ -97,10 +99,8 @@ optimization_problem_t<i_t, f_t>::optimization_problem_t(
     variable_types_{other.get_variable_types(), stream_view_},
     objective_name_{other.get_objective_name()},
     problem_name_{other.get_problem_name()},
-    problem_category_{other.get_problem_category()},
     var_names_{other.get_variable_names()},
-    row_names_{other.get_row_names()},
-    quadratic_constraints_{other.get_quadratic_constraints()}
+    row_names_{other.get_row_names()}
 {
 }
 
@@ -208,8 +208,7 @@ void optimization_problem_t<i_t, f_t>::set_quadratic_objective_matrix(
 
 template <typename i_t, typename f_t>
 void optimization_problem_t<i_t, f_t>::set_quadratic_constraints(
-  std::vector<typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t>
-    constraints)
+  std::vector<typename optimization_problem_t<i_t, f_t>::quadratic_constraint_t> constraints)
 {
   quadratic_constraints_ = std::move(constraints);
 }
@@ -613,7 +612,7 @@ bool optimization_problem_t<i_t, f_t>::has_quadratic_objective() const
 }
 
 template <typename i_t, typename f_t>
-const std::vector<typename optimization_problem_interface_t<i_t, f_t>::quadratic_constraint_t>&
+const std::vector<typename optimization_problem_t<i_t, f_t>::quadratic_constraint_t>&
 optimization_problem_t<i_t, f_t>::get_quadratic_constraints() const
 {
   return quadratic_constraints_;
@@ -1538,8 +1537,9 @@ rmm::device_uvector<To> gpu_cast(const rmm::device_uvector<From>& src, rmm::cuda
 {
   rmm::device_uvector<To> dst(src.size(), stream);
   if (src.size() > 0) {
-    RAFT_CUDA_TRY(cub::DeviceTransform::Transform(
-      src.data(), dst.data(), src.size(), cast_op<From, To>{}, stream.value()));
+    auto const transform_status =
+      cuopt::device_transform(src.data(), dst.data(), src.size(), cast_op<From, To>{}, stream.value());
+    RAFT_CUDA_TRY(transform_status);
   }
   return dst;
 }

@@ -1,0 +1,36 @@
+/*
+ * cuOpt MACA cuda:: compatibility overlay.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#pragma once
+
+#include_next <cuda/functional>
+
+#if defined(CUOPT_USE_MACA_CCCL)
+
+namespace cuda {
+
+template <typename T>
+class fast_mod_div {
+ public:
+  __host__ __device__ explicit fast_mod_div(T divisor) : divisor_{divisor} {}
+
+  template <typename R>
+  __host__ __device__ friend auto operator/(R dividend, fast_mod_div div)
+  {
+    return dividend / div.divisor_;
+  }
+
+  template <typename R>
+  __host__ __device__ friend auto operator%(R dividend, fast_mod_div div)
+  {
+    return dividend % div.divisor_;
+  }
+
+ private:
+  T divisor_;
+};
+
+}  // namespace cuda
+
+#endif

@@ -10,6 +10,7 @@
 #include <pdlp/swap_and_resize_helper.cuh>
 #include <pdlp/utilities/ping_pong_graph.cuh>
 #include <pdlp/utils.cuh>
+#include <utilities/device_transform.cuh>
 
 #include <raft/core/device_span.hpp>
 
@@ -432,7 +433,7 @@ void pdhg_solver_t<i_t, f_t>::compute_next_dual_solution(rmm::device_uvector<f_t
   // positive.
 
   // All is fused in a single call to limit number of read / write in memory
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(current_saddle_point_state_.get_dual_solution().data(),
                           current_saddle_point_state_.get_dual_gradient().data(),
                           problem_ptr->constraint_lower_bounds.data(),
@@ -611,7 +612,7 @@ void pdhg_solver_t<i_t, f_t>::compute_primal_projection_with_gradient(
 
   using f_t2 = typename type_2<f_t>::type;
   // All is fused in a single call to limit number of read / write in memory
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(current_saddle_point_state_.get_primal_solution().data(),
                           problem_ptr->objective_coefficients.data(),
                           current_saddle_point_state_.get_current_AtY().data(),
@@ -1004,12 +1005,12 @@ struct refine_primal_projection_major_bulk_op {
     f_t y_aty           = Aty[global_idx];
     f_t tau             = primal_step_size[c];
 
-    auto [next_clamped, delta_primal, reflected_primal_value] =
+    auto projection =
       primal_reflected_major_projection_batch<f_t>{}(x, objective_coeff, y_aty, {l, u}, tau);
 
-    potential_next[global_idx]   = next_clamped;
-    dual_slack[global_idx]       = delta_primal;
-    reflected_primal[global_idx] = reflected_primal_value;
+    potential_next[global_idx]   = thrust::get<0>(projection);
+    dual_slack[global_idx]       = thrust::get<1>(projection);
+    reflected_primal[global_idx] = thrust::get<2>(projection);
   }
 };
 
@@ -1119,7 +1120,7 @@ void pdhg_solver_t<i_t, f_t>::compute_next_primal_dual_solution_reflected(
     graph_all.run(should_major, [&]() {
       compute_At_y();
       if (!batch_mode_) {
-        cub::DeviceTransform::Transform(
+        cuopt::device_transform(
           cuda::std::make_tuple(current_saddle_point_state_.get_primal_solution().data(),
                                 problem_ptr->objective_coefficients.data(),
                                 current_saddle_point_state_.get_current_AtY().data(),
@@ -1188,7 +1189,7 @@ void pdhg_solver_t<i_t, f_t>::compute_next_primal_dual_solution_reflected(
       compute_A_x();
 
       if (!batch_mode_) {
-        cub::DeviceTransform::Transform(
+        cuopt::device_transform(
           cuda::std::make_tuple(current_saddle_point_state_.get_dual_solution().data(),
                                 current_saddle_point_state_.get_dual_gradient().data(),
                                 problem_ptr->constraint_lower_bounds.data(),
@@ -1233,7 +1234,7 @@ void pdhg_solver_t<i_t, f_t>::compute_next_primal_dual_solution_reflected(
 #endif
 
       if (!batch_mode_) {
-        cub::DeviceTransform::Transform(
+        cuopt::device_transform(
           cuda::std::make_tuple(current_saddle_point_state_.get_primal_solution().data(),
                                 problem_ptr->objective_coefficients.data(),
                                 current_saddle_point_state_.get_current_AtY().data(),
@@ -1302,7 +1303,7 @@ void pdhg_solver_t<i_t, f_t>::compute_next_primal_dual_solution_reflected(
       compute_A_x();
 
       if (!batch_mode_) {
-        cub::DeviceTransform::Transform(
+        cuopt::device_transform(
           cuda::std::make_tuple(current_saddle_point_state_.get_dual_solution().data(),
                                 current_saddle_point_state_.get_dual_gradient().data(),
                                 problem_ptr->constraint_lower_bounds.data(),

@@ -80,3 +80,5 @@ cpp/vendor/smoke_*.cu
 cpp/vendor/smoke_*.cpp
 cpp/build2/
 cpp/build3/
+cpp/build_maca/
+.maca_cu_bridge/

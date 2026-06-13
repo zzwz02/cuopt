@@ -33,6 +33,8 @@
 
 #include <cub/cub.cuh>
 
+#include <cuda/functional>
+
 #include <thrust/count.h>
 #include <thrust/extrema.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -397,7 +399,7 @@ void pdlp_solver_t<i_t, f_t>::set_initial_primal_solution(
                "Initial primal solution size must be divisible by primal_size_h_");
   initial_primal_.resize(primal_size_h_ * climber_strategies_.size(), stream_view_);
   // In batch case initial_primal_ can be larger than the given initial_primal_solution
-  cub::DeviceTransform::Transform(problem_wrap_container(initial_primal_solution),
+  cuopt::device_transform(problem_wrap_container(initial_primal_solution),
                                   initial_primal_.data(),
                                   initial_primal_.size(),
                                   cuda::std::identity{},
@@ -411,7 +413,7 @@ void pdlp_solver_t<i_t, f_t>::set_initial_dual_solution(
   cuopt_assert(initial_dual_solution.size() % dual_size_h_ == 0,
                "Initial dual solution size must be divisible by dual_size_h_");
   initial_dual_.resize(dual_size_h_ * climber_strategies_.size(), stream_view_);
-  cub::DeviceTransform::Transform(problem_wrap_container(initial_dual_solution),
+  cuopt::device_transform(problem_wrap_container(initial_dual_solution),
                                   initial_dual_.data(),
                                   initial_dual_.size(),
                                   cuda::std::identity{},
@@ -2008,13 +2010,13 @@ void pdlp_solver_t<i_t, f_t>::compute_fixed_error(std::vector<int>& has_restarte
 
   // Computing the deltas
   // TODO batch mdoe: this only works if everyone restarts
-  cub::DeviceTransform::Transform(cuda::std::make_tuple(pdhg_solver_.get_reflected_primal().data(),
+  cuopt::device_transform(cuda::std::make_tuple(pdhg_solver_.get_reflected_primal().data(),
                                                         pdhg_solver_.get_primal_solution().data()),
                                   pdhg_solver_.get_saddle_point_state().get_delta_primal().data(),
                                   pdhg_solver_.get_primal_solution().size(),
                                   cuda::std::minus<f_t>{},
                                   stream_view_.value());
-  cub::DeviceTransform::Transform(cuda::std::make_tuple(pdhg_solver_.get_reflected_dual().data(),
+  cuopt::device_transform(cuda::std::make_tuple(pdhg_solver_.get_reflected_dual().data(),
                                                         pdhg_solver_.get_dual_solution().data()),
                                   pdhg_solver_.get_saddle_point_state().get_delta_dual().data(),
                                   pdhg_solver_.get_dual_solution().size(),
@@ -2451,7 +2453,7 @@ optimization_problem_solution_t<i_t, f_t> pdlp_solver_t<i_t, f_t>::run_solver(co
     if (batch_mode_) {
       // In batch mode variable_bounds are shared and only the bound rescaling is per climber.
       // Apply it here too so the initial point is projected into the correct saacled space
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(
           pdhg_solver_.get_primal_solution().data(),
           thrust::make_transform_iterator(
@@ -2465,7 +2467,7 @@ optimization_problem_solution_t<i_t, f_t> pdlp_solver_t<i_t, f_t>::run_solver(co
         clamp<f_t, f_t2>(),
         stream_view_.value());
     } else {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(pdhg_solver_.get_primal_solution().data(),
                               problem_wrap_container(op_problem_scaled_.variable_bounds)),
         pdhg_solver_.get_primal_solution().data(),
@@ -2481,7 +2483,7 @@ optimization_problem_solution_t<i_t, f_t> pdlp_solver_t<i_t, f_t>::run_solver(co
       cuopt_expects(!batch_mode_,
                     cuopt::error_type_t::ValidationError,
                     "Restart to average not supported in batch mode");
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(unscaled_primal_avg_solution_.data(),
                               op_problem_scaled_.variable_bounds.data()),
         unscaled_primal_avg_solution_.data(),
@@ -2862,7 +2864,7 @@ void pdlp_solver_t<i_t, f_t>::halpern_update()
 #endif
 
   // Update primal
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(pdhg_solver_.get_reflected_primal().data(),
                           pdhg_solver_.get_saddle_point_state().get_primal_solution().data(),
                           restart_strategy_.last_restart_duality_gap_.primal_solution_.data()),
@@ -2886,7 +2888,7 @@ void pdlp_solver_t<i_t, f_t>::halpern_update()
 #endif
 
   // Update dual
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(pdhg_solver_.get_reflected_dual().data(),
                           pdhg_solver_.get_saddle_point_state().get_dual_solution().data(),
                           restart_strategy_.last_restart_duality_gap_.dual_solution_.data()),
@@ -3011,7 +3013,7 @@ void pdlp_solver_t<i_t, f_t>::compute_initial_step_size()
       cuopt_assert(norm_q.value(stream_view_) != f_t(0), "norm q can't be 0");
 
       // d_q *= 1 / norm_q
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         d_q.data(),
         d_q.data(),
         d_q.size(),
@@ -3053,7 +3055,7 @@ void pdlp_solver_t<i_t, f_t>::compute_initial_step_size()
                                                       sigma_max_sq.data(),
                                                       stream_view_.value()));
 
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(d_q.data(), d_z.data()),
         d_q.data(),
         d_q.size(),

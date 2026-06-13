@@ -74,7 +74,7 @@ constexpr HDI IntType log2(IntType num, IntType ret = IntType(0))
 /** get the laneId of the current thread */
 DI int laneId()
 {
-#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__MACA_ARCH__)
   return __lane_id();
 #else
   int id;

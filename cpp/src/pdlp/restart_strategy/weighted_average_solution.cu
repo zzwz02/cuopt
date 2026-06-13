@@ -72,14 +72,14 @@ void weighted_average_solution_t<i_t, f_t>::add_current_solution_to_weighted_ave
   // different)
 
   graph.run(total_pdlp_iterations, [&]() {
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(sum_primal_solutions_.data(), primal_solution),
       sum_primal_solutions_.data(),
       primal_size_h_,
       a_add_scalar_times_b<f_t>(weight.data()),
       stream_view_.value());
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(sum_dual_solutions_.data(), dual_solution),
       sum_dual_solutions_.data(),
       dual_size_h_,

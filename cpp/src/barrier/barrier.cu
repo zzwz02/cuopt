@@ -33,6 +33,7 @@
 
 #include <utilities/copy_helpers.hpp>
 #include <utilities/cuda_helpers.cuh>
+#include <utilities/device_transform.cuh>
 #include <utilities/logger.hpp>
 #include <utilities/macros.cuh>
 
@@ -92,7 +93,7 @@ template <typename f_t>
 [[maybe_unused]] static void pairwise_multiply(
   f_t* a, f_t* b, f_t* out, int size, rmm::cuda_stream_view stream)
 {
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(a, b), out, size, cuda::std::multiplies<>{}, stream.value());
 }
 
@@ -101,7 +102,7 @@ template <typename f_t>
 [[maybe_unused]] static void pairwise_multiply_skip_direct_free_linear(
   f_t* a, f_t* b, int* is_direct_free_linear, f_t* out, int size, rmm::cuda_stream_view stream)
 {
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(a, b, is_direct_free_linear),
     out,
     size,
@@ -113,7 +114,7 @@ template <typename f_t>
 [[maybe_unused]] static void axpy(
   f_t alpha, f_t* x, f_t beta, f_t* y, f_t* out, int size, rmm::cuda_stream_view stream)
 {
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(x, y),
     out,
     size,
@@ -161,7 +162,7 @@ static void recover_linear_orthant_dz(raft::device_span<const f_t> target,
 {
   if (dz.empty()) return;
 
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(
       target.data(), z.data(), dx.data(), x.data(), is_direct_free_linear.data()),
     dz.data(),
@@ -180,7 +181,7 @@ static void negate_complementarity_rhs(raft::device_span<f_t> out,
                                        rmm::cuda_stream_view stream)
 {
   if (out.empty()) return;
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     residual.data(), out.data(), out.size(), [] HD(f_t rhs) { return -rhs; }, stream.value());
 }
 
@@ -193,7 +194,7 @@ static void fill_linear_cc_rhs(raft::device_span<f_t> out,
                                rmm::cuda_stream_view stream)
 {
   if (out.empty()) return;
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(dx_aff.data(), dz_aff.data(), is_direct_free_linear.data()),
     out.data(),
     out.size(),
@@ -1772,7 +1773,7 @@ class iteration_data_t {
     cusparse_view.transpose_spmv(1.0, cusparse_y, 0.0, cusparse_u);
 
     // u = Dinv * u
-    cub::DeviceTransform::Transform(cuda::std::make_tuple(u.data(), d_inv_diag.data()),
+    cuopt::device_transform(cuda::std::make_tuple(u.data(), d_inv_diag.data()),
                                     u.data(),
                                     u.size(),
                                     cuda::std::multiplies<>{},
@@ -2536,7 +2537,7 @@ void barrier_solver_t<i_t, f_t>::gpu_compute_residuals(const rmm::device_uvector
 
   // Compute bound_residual = E'*u - w - E'*x
   if (data.n_upper_bounds > 0) {
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         thrust::make_permutation_iterator(data.d_upper_.data(), data.d_upper_bounds_.data()),
         d_w.data(),
@@ -2556,7 +2557,7 @@ void barrier_solver_t<i_t, f_t>::gpu_compute_residuals(const rmm::device_uvector
   } else {
     raft::copy(data.d_c_.data(), data.c.data(), data.c.size(), stream_view_);
   }
-  cub::DeviceTransform::Transform(cuda::std::make_tuple(data.d_c_.data(), data.d_z_.data()),
+  cuopt::device_transform(cuda::std::make_tuple(data.d_c_.data(), data.d_z_.data()),
                                   data.d_dual_residual_.data(),
                                   data.d_dual_residual_.size(),
                                   cuda::std::minus<>{},
@@ -2568,7 +2569,7 @@ void barrier_solver_t<i_t, f_t>::gpu_compute_residuals(const rmm::device_uvector
   data.cusparse_view_.transpose_spmv(-1.0, cusparse_d_y, 1.0, descr_dual_residual);
 
   if (data.n_upper_bounds > 0) {
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(thrust::make_permutation_iterator(data.d_dual_residual_.data(),
                                                               data.d_upper_bounds_.data()),
                             d_v.data()),
@@ -2580,14 +2581,14 @@ void barrier_solver_t<i_t, f_t>::gpu_compute_residuals(const rmm::device_uvector
   }
 
   // Compute complementarity_xz_residual = x.*z
-  cub::DeviceTransform::Transform(cuda::std::make_tuple(d_x.data(), d_z.data()),
+  cuopt::device_transform(cuda::std::make_tuple(d_x.data(), d_z.data()),
                                   data.d_complementarity_xz_residual_.data(),
                                   data.d_complementarity_xz_residual_.size(),
                                   cuda::std::multiplies<>{},
                                   stream_view_.value());
   RAFT_CHECK_CUDA(stream_view_);
   // Compute complementarity_wv_residual = w.*v
-  cub::DeviceTransform::Transform(cuda::std::make_tuple(d_w.data(), d_v.data()),
+  cuopt::device_transform(cuda::std::make_tuple(d_w.data(), d_v.data()),
                                   data.d_complementarity_wv_residual_.data(),
                                   data.d_complementarity_wv_residual_.size(),
                                   cuda::std::multiplies<>{},
@@ -2771,7 +2772,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
 
     // Linear orthant barrier on [0, linear_size); direct-free vars get D = 0 here.
     if (has_direct_free_linear) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(
           data.d_z_.data(), data.d_x_.data(), data.d_is_direct_free_linear_.data()),
         data.d_diag_.data(),
@@ -2782,7 +2783,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         },
         stream_view_.value());
     } else {
-      cub::DeviceTransform::Transform(cuda::std::make_tuple(data.d_z_.data(), data.d_x_.data()),
+      cuopt::device_transform(cuda::std::make_tuple(data.d_z_.data(), data.d_x_.data()),
                                       data.d_diag_.data(),
                                       linear_size,
                                       cuda::std::divides<>{},
@@ -2798,7 +2799,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
 
     // Upper-bound slacks: D_j += v_k/w_k.
     if (data.n_upper_bounds > 0) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(
           data.d_v_.data(),
           data.d_w_.data(),
@@ -2813,7 +2814,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
     // ADAT-only: fold diagonal Q and direct-free regularization (augmented KKT keeps Q explicit).
     if (!use_augmented) {
       if (data.Q.n > 0 && data.Q_diagonal) {
-        cub::DeviceTransform::Transform(
+        cuopt::device_transform(
           cuda::std::make_tuple(data.d_Q_diag_.data(), data.d_diag_.data()),
           data.d_diag_.data(),
           data.d_diag_.size(),
@@ -2824,7 +2825,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
 
       constexpr f_t free_var_reg = 1e-7;
       if (data.Q.n > 0 && data.Q_diagonal) {
-        cub::DeviceTransform::Transform(
+        cuopt::device_transform(
           cuda::std::make_tuple(
             data.d_diag_.data(), data.d_is_direct_free_linear_.data(), data.d_Q_diag_.data()),
           data.d_diag_.data(),
@@ -2835,7 +2836,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
           },
           stream_view_.value());
       } else {
-        cub::DeviceTransform::Transform(
+        cuopt::device_transform(
           cuda::std::make_tuple(data.d_diag_.data(), data.d_is_direct_free_linear_.data()),
           data.d_diag_.data(),
           linear_size,
@@ -2851,7 +2852,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
 
     // inv_diag and h = A*inv_diag*... are only used for the ADAT solve path.
     if (!use_augmented) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         data.d_diag_.data(),
         data.d_inv_diag.data(),
         data.d_diag_.size(),
@@ -2919,7 +2920,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
     RAFT_CUDA_TRY(
       cudaMemsetAsync(data.d_tmp3_.data(), 0, sizeof(f_t) * data.d_tmp3_.size(), stream_view_));
     if (data.n_upper_bounds > 0) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(data.d_bound_rhs_.data(),
                               data.d_v_.data(),
                               data.d_complementarity_wv_rhs_.data(),
@@ -2932,7 +2933,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         stream_view_.value());
       RAFT_CHECK_CUDA(stream_view_);
     }
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(data.d_tmp3_.data(),
                             data.d_complementarity_target_.data(),
                             data.d_dual_rhs_.data(),
@@ -2951,7 +2952,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
 
   if (!use_augmented) {
     raft::common::nvtx::range fun_scope("Barrier: GPU compute H");
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(data.d_inv_diag.data(), data.d_tmp3_.data()),
       data.d_tmp4_.data(),
       lp.num_cols,
@@ -3090,7 +3091,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       // r1 <- A'*dy - r1
       data.cusparse_view_.transpose_spmv(1.0, data.cusparse_dy_, -1.0, data.cusparse_r1_);
 
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(data.d_inv_diag.data(), data.d_r1_.data(), data.d_diag_.data()),
         thrust::make_zip_iterator(data.d_dx_.data(), data.d_dx_residual_.data()),
         data.d_inv_diag.size(),
@@ -3103,7 +3104,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       raft::copy(dx.data(), data.d_dx_.data(), data.d_dx_.size(), stream_view_);
 
       data.cusparse_view_.transpose_spmv(-1.0, data.cusparse_dy_, 1.0, data.cusparse_dx_residual_);
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(data.d_dx_residual_.data(), data.d_r1_prime_.data()),
         data.d_dx_residual_.data(),
         data.d_dx_residual_.size(),
@@ -3149,7 +3150,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       rmm::device_uvector<f_t> d_dx_residual_5(lp.num_cols, stream_view_);
       rmm::device_uvector<f_t> d_dx_residual_6(lp.num_rows, stream_view_);
 
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(data.d_inv_diag.data(), data.d_r1_.data()),
         d_dx_residual_5.data(),
         d_dx_residual_5.size(),
@@ -3180,7 +3181,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       rmm::device_uvector<f_t> d_dx_residual_3(lp.num_cols, stream_view_);
       rmm::device_uvector<f_t> d_dx_residual_4(lp.num_rows, stream_view_);
 
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(data.d_inv_diag.data(), data.d_r1_prime_.data()),
         d_dx_residual_3.data(),
         d_dx_residual_3.size(),
@@ -3300,7 +3301,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
                                           raft::device_span<const f_t> dx_span,
                                           raft::device_span<const f_t> x) {
       if (out.empty()) return;
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(rhs.data(), z.data(), dz_span.data(), dx_span.data(), x.data()),
         out.data(),
         out.size(),
@@ -3327,7 +3328,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
   {
     raft::common::nvtx::range fun_scope("Barrier: dv formation GPU");
     // dv <- (v .* E' * dx + complementarity_wv_rhs - v .* bound_rhs) ./ w
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         data.d_v_.data(),
         thrust::make_permutation_iterator(data.d_dx_.data(), data.d_upper_bounds_.data()),
@@ -3350,7 +3351,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
     // TMP data should already be on the GPU (not fixed for now since debug only)
     rmm::device_uvector<f_t> d_dv_residual(data.n_upper_bounds, stream_view_);
     // dv_residual <- -v .* E' * dx + w .* dv - complementarity_wv_rhs + v .* bound_rhs
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         data.d_v_.data(),
         thrust::make_permutation_iterator(data.d_dx_.data(), data.d_upper_bounds_.data()),
@@ -3394,7 +3395,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
     data.cusparse_view_.transpose_spmv(1.0, data.cusparse_dy_, -1.0, data.cusparse_dual_residual_);
 
     // dual_residual <- A' * dy - E * dv + dz - dual_rhs
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         data.d_dual_residual_.data(), data.d_dz_.data(), data.d_dual_rhs_.data()),
       data.d_dual_residual_.data(),
@@ -3414,7 +3415,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
     raft::common::nvtx::range fun_scope("Barrier: dw formation GPU");
 
     // dw = bound_rhs - E'*dx
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         data.d_dw_.data(),
         thrust::make_permutation_iterator(data.d_dx_.data(), data.d_upper_bounds_.data())),
@@ -3428,7 +3429,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
     if (debug) {
       // dw_residual <- dw + E'*dx - bound_rhs
 
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(
           data.d_dw_.data(),
           thrust::make_permutation_iterator(data.d_dx_.data(), data.d_upper_bounds_.data()),
@@ -3451,7 +3452,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
     raft::common::nvtx::range fun_scope("Barrier: wv_residual GPU");
 
     // wv_residual <- v .* dw + w .* dv - complementarity_wv_rhs
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(data.d_complementarity_wv_rhs_.data(),
                             data.d_w_.data(),
                             data.d_v_.data(),
@@ -3545,7 +3546,7 @@ void fill_linear_complementarity_target(iteration_data_t<i_t, f_t>& data,
                                         rmm::cuda_stream_view stream)
 {
   if (target.empty()) return;
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(xz_rhs.data(), x.data(), data.d_is_direct_free_linear_.data()),
     target.data(),
     target.size(),
@@ -3597,7 +3598,7 @@ void fill_affine_cone_complementarity_target(iteration_data_t<i_t, f_t>& data,
   cones.z     = raft::device_span<f_t>(data.d_z_.data() + cone_var_start, m_c);
   auto cone_target =
     raft::device_span<f_t>(data.d_complementarity_target_.data() + cone_var_start, m_c);
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cones.z.data(), cone_target.data(), m_c, [] HD(f_t z_val) { return -z_val; }, stream.value());
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CHECK_CUDA(stream);
@@ -3789,7 +3790,7 @@ void barrier_solver_t<i_t, f_t>::compute_cc_rhs(iteration_data_t<i_t, f_t>& data
       data, cone_var_start, m_c, new_mu, stream_view_);
   }
 
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(data.d_dw_aff_.data(), data.d_dv_aff_.data()),
     data.d_complementarity_wv_rhs_.data(),
     data.d_complementarity_wv_rhs_.size(),
@@ -3835,7 +3836,7 @@ void barrier_solver_t<i_t, f_t>::compute_final_direction(iteration_data_t<i_t, f
   assert(data.d_dx_aff_.size() == data.d_dz_aff_.size());
   assert(data.d_dy_aff_.size() == data.d_dy_.size());
 
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(
       data.d_dw_aff_.data(), data.d_dv_aff_.data(), data.d_dw_.data(), data.d_dv_.data()),
     thrust::make_zip_iterator(data.d_dw_.data(), data.d_dv_.data()),
@@ -3845,7 +3846,7 @@ void barrier_solver_t<i_t, f_t>::compute_final_direction(iteration_data_t<i_t, f
     },
     stream_view_.value());
   RAFT_CHECK_CUDA(stream_view_);
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(
       data.d_dx_aff_.data(), data.d_dz_aff_.data(), data.d_dx_.data(), data.d_dz_.data()),
     thrust::make_zip_iterator(data.d_dx_.data(), data.d_dz_.data()),
@@ -3855,7 +3856,7 @@ void barrier_solver_t<i_t, f_t>::compute_final_direction(iteration_data_t<i_t, f
     },
     stream_view_.value());
   RAFT_CHECK_CUDA(stream_view_);
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(data.d_dy_aff_.data(), data.d_dy_.data()),
     data.d_dy_.data(),
     data.d_dy_.size(),
@@ -3907,7 +3908,7 @@ void barrier_solver_t<i_t, f_t>::compute_next_iterate(iteration_data_t<i_t, f_t>
 {
   raft::common::nvtx::range fun_scope("Barrier: compute_next_iterate");
 
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(data.d_w_.data(), data.d_v_.data(), data.d_dw_.data(), data.d_dv_.data()),
     thrust::make_zip_iterator(data.d_w_.data(), data.d_v_.data()),
     data.d_dw_.size(),
@@ -3916,7 +3917,7 @@ void barrier_solver_t<i_t, f_t>::compute_next_iterate(iteration_data_t<i_t, f_t>
     },
     stream_view_.value());
   RAFT_CHECK_CUDA(stream_view_);
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(data.d_x_.data(), data.d_z_.data(), data.d_dx_.data(), data.d_dz_.data()),
     thrust::make_zip_iterator(data.d_x_.data(), data.d_z_.data()),
     data.d_dx_.size(),
@@ -3925,7 +3926,7 @@ void barrier_solver_t<i_t, f_t>::compute_next_iterate(iteration_data_t<i_t, f_t>
     },
     stream_view_.value());
   RAFT_CHECK_CUDA(stream_view_);
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(data.d_y_.data(), data.d_dy_.data()),
     data.d_y_.data(),
     data.d_y_.size(),

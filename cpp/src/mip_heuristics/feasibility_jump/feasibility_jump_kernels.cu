@@ -296,8 +296,12 @@ DI std::pair<f_t, typename fj_t<i_t, f_t>::move_score_info_t> compute_best_mtm(
     f_t c_lb = fj.pb.constraint_lower_bounds[cstr_idx];
     f_t c_ub = fj.pb.constraint_upper_bounds[cstr_idx];
     f_t new_val;
-    auto [delta_ij, sign, slack, cstr_tolerance] =
-      get_mtm_for_constraint<i_t, f_t, move_type>(fj, var_idx, cstr_idx, cstr_coeff, c_lb, c_ub);
+    auto mtm_info = get_mtm_for_constraint<i_t, f_t, move_type>(
+      fj, var_idx, cstr_idx, cstr_coeff, c_lb, c_ub);
+    f_t delta_ij        = thrust::get<0>(mtm_info);
+    f_t sign            = thrust::get<1>(mtm_info);
+    f_t slack           = thrust::get<2>(mtm_info);
+    f_t cstr_tolerance  = thrust::get<3>(mtm_info);
     if (fj.pb.is_integer_var(var_idx)) {
       new_val = cstr_coeff * sign > 0
                   ? floor(old_val + delta_ij + fj.pb.tolerances.integrality_tolerance)
@@ -734,8 +738,10 @@ DI void update_lift_moves(typename fj_t<i_t, f_t>::climber_data_t::view_t fj)
       // Process each bound separately, as both are satified and may both be finite
       // otherwise range constraints aren't correctly handled
       for (auto [bound, sign] : {std::make_tuple(c_lb, -1), std::make_tuple(c_ub, 1)}) {
-        auto [delta, slack] =
-          get_mtm_for_bound<i_t, f_t>(fj, var_idx, cstr_idx, cstr_coeff, bound, sign);
+        auto mtm_bound = get_mtm_for_bound<i_t, f_t>(
+          fj, var_idx, cstr_idx, cstr_coeff, bound, sign);
+        f_t delta = thrust::get<0>(mtm_bound);
+        f_t slack = thrust::get<1>(mtm_bound);
 
         if (cstr_coeff * sign < 0) {
           if (fj.pb.is_integer_var(var_idx)) delta = ceil(delta);
@@ -1386,8 +1392,11 @@ __global__ void handle_local_minimum_kernel(typename fj_t<i_t, f_t>::climber_dat
       *fj.incumbent_objective > *fj.best_objective) {
     __syncwarp();
     cg::this_grid().sync();
-    auto [bm_best_var, bm_best_delta, bm_best_score] =
+    auto breakthrough_move =
       best_breakthrough_move_at_local_min<i_t, f_t, TPB_localmin>(fj);
+    i_t bm_best_var       = thrust::get<0>(breakthrough_move);
+    f_t bm_best_delta     = thrust::get<1>(breakthrough_move);
+    auto bm_best_score    = thrust::get<2>(breakthrough_move);
     if (bm_best_score > best_score) {
       best_score    = bm_best_score;
       best_var      = bm_best_var;
@@ -1406,8 +1415,11 @@ __global__ void handle_local_minimum_kernel(typename fj_t<i_t, f_t>::climber_dat
   // Attempt to find a valid move by going over MTM moves in valid constraints
   if (*fj.selected_var == std::numeric_limits<i_t>::max() &&
       *fj.incumbent_objective < std::numeric_limits<f_t>::infinity()) {
-    auto [sat_best_var, sat_best_delta, sat_best_score] =
+    auto sat_move =
       best_sat_cstr_mtm_move<i_t, f_t, TPB_localmin>(fj);
+    i_t sat_best_var    = thrust::get<0>(sat_move);
+    f_t sat_best_delta  = thrust::get<1>(sat_move);
+    auto sat_best_score = thrust::get<2>(sat_move);
 
     if (FIRST_THREAD && sat_best_score.valid())
       cuopt_assert(fj.pb.check_variable_within_bounds(

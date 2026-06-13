@@ -66,7 +66,8 @@ cusparse_sp_mat_descr_wrapper_t<i_t, f_t>::operator cusparseSpMatDescr_t() const
 
 // cusparse_dn_vec_descr_wrapper_t implementation
 template <typename f_t>
-cusparse_dn_vec_descr_wrapper_t<f_t>::cusparse_dn_vec_descr_wrapper_t() : need_destruction_(false)
+cusparse_dn_vec_descr_wrapper_t<f_t>::cusparse_dn_vec_descr_wrapper_t()
+  : need_destruction_(false), zero_size_values_(nullptr)
 {
 }
 
@@ -74,12 +75,13 @@ template <typename f_t>
 cusparse_dn_vec_descr_wrapper_t<f_t>::~cusparse_dn_vec_descr_wrapper_t()
 {
   if (need_destruction_) { RAFT_CUSPARSE_TRY_NO_THROW(cusparseDestroyDnVec(descr_)); }
+  if (zero_size_values_ != nullptr) { RAFT_CUDA_TRY_NO_THROW(cudaFree(zero_size_values_)); }
 }
 
 template <typename f_t>
 cusparse_dn_vec_descr_wrapper_t<f_t>::cusparse_dn_vec_descr_wrapper_t(
   const cusparse_dn_vec_descr_wrapper_t& other)
-  : descr_(other.descr_), need_destruction_(false)
+  : descr_(other.descr_), need_destruction_(false), zero_size_values_(nullptr)
 {
 }
 
@@ -88,16 +90,36 @@ cusparse_dn_vec_descr_wrapper_t<f_t>& cusparse_dn_vec_descr_wrapper_t<f_t>::oper
   cusparse_dn_vec_descr_wrapper_t<f_t>&& other)
 {
   if (need_destruction_) { RAFT_CUSPARSE_TRY(cusparseDestroyDnVec(descr_)); }
+  if (zero_size_values_ != nullptr) { RAFT_CUDA_TRY(cudaFree(zero_size_values_)); }
   descr_                  = other.descr_;
   need_destruction_       = other.need_destruction_;
+  zero_size_values_       = other.zero_size_values_;
   other.need_destruction_ = false;
+  other.zero_size_values_ = nullptr;
   return *this;
 }
 
 template <typename f_t>
-void cusparse_dn_vec_descr_wrapper_t<f_t>::create(int64_t size, f_t* values)
+void cusparse_dn_vec_descr_wrapper_t<f_t>::create(int64_t size, f_t* values, char const* debug_name)
 {
-  RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsecreatednvec(&descr_, size, values));
+  EXE_CUOPT_EXPECTS(size == 0 || values != nullptr,
+                    "Cannot create cuSPARSE dense vector descriptor for %s: non-empty vector has "
+                    "a null data pointer",
+                    debug_name == nullptr ? "<unnamed>" : debug_name);
+  if (size == 0 && values == nullptr) {
+    if (zero_size_values_ == nullptr) { RAFT_CUDA_TRY(cudaMalloc(&zero_size_values_, sizeof(f_t))); }
+    values = zero_size_values_;
+  }
+  auto const status = raft::sparse::detail::cusparsecreatednvec(&descr_, size, values);
+  if (status != CUSPARSE_STATUS_SUCCESS) {
+    EXE_CUOPT_FAIL("Cannot create cuSPARSE dense vector descriptor for %s: size=%lld values=%p "
+                   "status=%d:%s",
+                   debug_name == nullptr ? "<unnamed>" : debug_name,
+                   static_cast<long long>(size),
+                   static_cast<void*>(values),
+                   static_cast<int>(status),
+                   raft::sparse::detail::cusparse_error_to_string(status));
+  }
   need_destruction_ = true;
 }
 
@@ -511,12 +533,15 @@ cusparse_view_t<i_t, f_t>::cusparse_view_t(
              const_cast<f_t*>(A_T_.data()));
 
   c.create(op_problem_scaled.n_variables,
-           const_cast<f_t*>(op_problem_scaled.objective_coefficients.data()));
+           const_cast<f_t*>(op_problem_scaled.objective_coefficients.data()),
+           "objective_coefficients");
 
   primal_solution.create(op_problem_scaled.n_variables,
-                         current_saddle_point_state.get_primal_solution().data());
+                         current_saddle_point_state.get_primal_solution().data(),
+                         "primal_solution");
   dual_solution.create(op_problem_scaled.n_constraints,
-                       current_saddle_point_state.get_dual_solution().data());
+                       current_saddle_point_state.get_dual_solution().data(),
+                       "dual_solution");
 
   // TODO batch mdoe: convert those to RAII views
   if (batch_mode_) {
@@ -579,23 +604,30 @@ cusparse_view_t<i_t, f_t>::cusparse_view_t(
 
   primal_gradient.create(
     current_saddle_point_state.get_primal_gradient().size(),  // It is 0 in cupdlpx
-    current_saddle_point_state.get_primal_gradient().data());
+    current_saddle_point_state.get_primal_gradient().data(),
+    "primal_gradient");
   dual_gradient.create(op_problem_scaled.n_constraints,
-                       current_saddle_point_state.get_dual_gradient().data());
+                       current_saddle_point_state.get_dual_gradient().data(),
+                       "dual_gradient");
 
   current_AtY.create(op_problem_scaled.n_variables,
-                     current_saddle_point_state.get_current_AtY().data());
-  next_AtY.create(op_problem_scaled.n_variables, current_saddle_point_state.get_next_AtY().data());
+                     current_saddle_point_state.get_current_AtY().data(),
+                     "current_AtY");
+  next_AtY.create(op_problem_scaled.n_variables,
+                  current_saddle_point_state.get_next_AtY().data(),
+                  "next_AtY");
 
   potential_next_dual_solution.create(op_problem_scaled.n_constraints,
-                                      _potential_next_dual_solution.data());
+                                      _potential_next_dual_solution.data(),
+                                      "potential_next_dual_solution");
 
-  tmp_primal.create(op_problem_scaled.n_variables, _tmp_primal.data());
-  tmp_dual.create(op_problem_scaled.n_constraints, _tmp_dual.data());
+  tmp_primal.create(op_problem_scaled.n_variables, _tmp_primal.data(), "tmp_primal");
+  tmp_dual.create(op_problem_scaled.n_constraints, _tmp_dual.data(), "tmp_dual");
   if (hyper_params.use_reflected_primal_dual) {
     cuopt_assert(_reflected_primal_solution.size() > 0, "Reflected primal solution empty");
     reflected_primal_solution.create(op_problem_scaled.n_variables,
-                                     _reflected_primal_solution.data());
+                                     _reflected_primal_solution.data(),
+                                     "reflected_primal_solution");
   }
 
   const rmm::device_scalar<f_t> alpha{1, handle_ptr->get_stream()};
@@ -774,17 +806,21 @@ cusparse_view_t<i_t, f_t>::cusparse_view_t(
       A_float_.resize(op_problem_scaled.nnz, handle_ptr->get_stream());
       A_T_float_.resize(op_problem_scaled.nnz, handle_ptr->get_stream());
 
-      RAFT_CUDA_TRY(cub::DeviceTransform::Transform(op_problem_scaled.coefficients.data(),
-                                                    A_float_.data(),
-                                                    op_problem_scaled.nnz,
-                                                    double_to_float_functor{},
-                                                    handle_ptr->get_stream().value()));
+      auto const a_float_transform_status =
+        cuopt::device_transform(op_problem_scaled.coefficients.data(),
+                                A_float_.data(),
+                                op_problem_scaled.nnz,
+                                double_to_float_functor{},
+                                handle_ptr->get_stream().value());
+      RAFT_CUDA_TRY(a_float_transform_status);
 
-      RAFT_CUDA_TRY(cub::DeviceTransform::Transform(A_T_.data(),
-                                                    A_T_float_.data(),
-                                                    op_problem_scaled.nnz,
-                                                    double_to_float_functor{},
-                                                    handle_ptr->get_stream().value()));
+      auto const a_t_float_transform_status =
+        cuopt::device_transform(A_T_.data(),
+                                A_T_float_.data(),
+                                op_problem_scaled.nnz,
+                                double_to_float_functor{},
+                                handle_ptr->get_stream().value());
+      RAFT_CUDA_TRY(a_t_float_transform_status);
 
       A_mixed_.create(op_problem_scaled.n_constraints,
                       op_problem_scaled.n_variables,
@@ -926,18 +962,22 @@ cusparse_view_t<i_t, f_t>::cusparse_view_t(
              const_cast<i_t*>(A_T_indices_.data()),
              const_cast<f_t*>(A_T_.data()));
 
-  c.create(op_problem.n_variables, const_cast<f_t*>(op_problem.objective_coefficients.data()));
+  c.create(op_problem.n_variables,
+           const_cast<f_t*>(op_problem.objective_coefficients.data()),
+           "objective_coefficients");
 
   if (!hyper_params.use_adaptive_step_size_strategy) {
-    primal_solution.create(op_problem.n_variables, _potential_next_primal.data());
-    dual_solution.create(op_problem.n_constraints, _potential_next_dual.data());
+    primal_solution.create(
+      op_problem.n_variables, _potential_next_primal.data(), "potential_next_primal");
+    dual_solution.create(
+      op_problem.n_constraints, _potential_next_dual.data(), "potential_next_dual");
   } else {
-    primal_solution.create(op_problem.n_variables, _primal_solution.data());
-    dual_solution.create(op_problem.n_constraints, _dual_solution.data());
+    primal_solution.create(op_problem.n_variables, _primal_solution.data(), "primal_solution");
+    dual_solution.create(op_problem.n_constraints, _dual_solution.data(), "dual_solution");
   }
 
-  tmp_primal.create(op_problem.n_variables, _tmp_primal.data());
-  tmp_dual.create(op_problem.n_constraints, _tmp_dual.data());
+  tmp_primal.create(op_problem.n_variables, _tmp_primal.data(), "tmp_primal");
+  tmp_dual.create(op_problem.n_constraints, _tmp_dual.data(), "tmp_dual");
 
   if (batch_mode_) {
     [[maybe_unused]] const bool is_cupdlpx = is_cupdlpx_restart<i_t, f_t>(hyper_params);
@@ -1143,11 +1183,11 @@ cusparse_view_t<i_t, f_t>::cusparse_view_t(
              const_cast<i_t*>(existing_cusparse_view.A_T_indices_.data()),
              const_cast<f_t*>(existing_cusparse_view.A_T_.data()));
 
-  primal_solution.create(op_problem.n_variables, _primal_solution);
-  dual_solution.create(op_problem.n_constraints, _dual_solution);
+  primal_solution.create(op_problem.n_variables, _primal_solution, "primal_solution");
+  dual_solution.create(op_problem.n_constraints, _dual_solution, "dual_solution");
 
-  primal_gradient.create(op_problem.n_variables, _primal_gradient);
-  dual_gradient.create(op_problem.n_constraints, _dual_gradient);
+  primal_gradient.create(op_problem.n_variables, _primal_gradient, "primal_gradient");
+  dual_gradient.create(op_problem.n_constraints, _dual_gradient, "dual_gradient");
 
   const rmm::device_scalar<f_t> alpha{1, handle_ptr->get_stream()};
   const rmm::device_scalar<f_t> beta{1, handle_ptr->get_stream()};
@@ -1243,17 +1283,20 @@ void cusparse_view_t<i_t, f_t>::update_mixed_precision_matrices()
   if constexpr (std::is_same_v<f_t, double>) {
     if (!mixed_precision_enabled_) { return; }
 
-    RAFT_CUDA_TRY(cub::DeviceTransform::Transform(A_.data(),
-                                                  A_float_.data(),
-                                                  A_.size(),
-                                                  double_to_float_functor{},
-                                                  handle_ptr_->get_stream().value()));
+    auto const a_float_transform_status = cuopt::device_transform(A_.data(),
+                                                                  A_float_.data(),
+                                                                  A_.size(),
+                                                                  double_to_float_functor{},
+                                                                  handle_ptr_->get_stream().value());
+    RAFT_CUDA_TRY(a_float_transform_status);
 
-    RAFT_CUDA_TRY(cub::DeviceTransform::Transform(A_T_.data(),
-                                                  A_T_float_.data(),
-                                                  A_T_.size(),
-                                                  double_to_float_functor{},
-                                                  handle_ptr_->get_stream().value()));
+    auto const a_t_float_transform_status =
+      cuopt::device_transform(A_T_.data(),
+                              A_T_float_.data(),
+                              A_T_.size(),
+                              double_to_float_functor{},
+                              handle_ptr_->get_stream().value());
+    RAFT_CUDA_TRY(a_t_float_transform_status);
 
     handle_ptr_->get_stream().synchronize();
   }

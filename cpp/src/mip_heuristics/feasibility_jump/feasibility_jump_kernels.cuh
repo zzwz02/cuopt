@@ -14,6 +14,12 @@
 
 #include <cub/cub.cuh>
 
+#ifdef CUOPT_USE_MACA_CCCL
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+#endif
+
 namespace cuopt::linear_programming::detail {
 
 enum class weight_strategy_t { Increment, Multiply };

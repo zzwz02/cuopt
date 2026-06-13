@@ -21,6 +21,12 @@
       "description": "Modify, build, test, debug, and contribute to NVIDIA cuOpt (C++/CUDA, Python, server, CI). Use for solver internals, PRs, DCO, and code conventions."
     },
     {
+      "name": "cuopt-maca-porting",
+      "source": "./skills/cuopt-maca-porting",
+      "skills": "./",
+      "description": "Port and debug NVIDIA cuOpt on MetaX C500 with MACA/cu-bridge: build model, MACA CCCL compatibility, warp64, RAPIDS-free shims, and C++/C API/CLI validation."
+    },
+    {
       "name": "cuopt-install",
       "source": "./skills/cuopt-install",
       "skills": "./",

@@ -87,7 +87,7 @@ struct elem_multi_t {
   {
   }
 
-  __device__ f_t operator()(i_t i) const
+  __host__ __device__ f_t operator()(i_t i) const
   {
     auto var    = variables[i];
     auto bounds = variable_bounds[var];

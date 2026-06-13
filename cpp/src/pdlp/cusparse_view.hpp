@@ -53,13 +53,14 @@ class cusparse_dn_vec_descr_wrapper_t {
   cusparse_dn_vec_descr_wrapper_t& operator=(cusparse_dn_vec_descr_wrapper_t&& other);
   cusparse_dn_vec_descr_wrapper_t& operator=(const cusparse_dn_vec_descr_wrapper_t& other) = delete;
 
-  void create(int64_t size, f_t* values);
+  void create(int64_t size, f_t* values, char const* debug_name = nullptr);
 
   operator cusparseDnVecDescr_t() const;
 
  private:
   cusparseDnVecDescr_t descr_;
   bool need_destruction_;
+  f_t* zero_size_values_;
 };
 
 template <typename f_t>

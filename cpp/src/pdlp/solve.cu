@@ -336,7 +336,7 @@ void adjust_dual_solution_and_reduced_cost(rmm::device_uvector<f_t>& dual_soluti
                                            rmm::cuda_stream_view stream_view)
 {
   // y <- -y
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     dual_solution.data(),
     dual_solution.data(),
     dual_solution.size(),
@@ -344,7 +344,7 @@ void adjust_dual_solution_and_reduced_cost(rmm::device_uvector<f_t>& dual_soluti
     stream_view);
 
   // z <- -z
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     reduced_cost.data(),
     reduced_cost.data(),
     reduced_cost.size(),

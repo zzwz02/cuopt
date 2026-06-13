@@ -8,6 +8,7 @@
 #include <cuopt/error.hpp>
 
 #include <cuopt/linear_programming/pdlp/pdlp_hyper_params.cuh>
+#include <cuopt/linear_programming/utilities/segmented_sum_handler.cuh>
 #include <pdlp/pdlp_constants.hpp>
 #include <pdlp/restart_strategy/pdlp_restart_strategy.cuh>
 #include <pdlp/swap_and_resize_helper.cuh>
@@ -62,6 +63,31 @@ __global__ void solve_bound_constrained_trust_region_kernel(
   f_t* low_radius_squared,
   f_t* high_radius_squared,
   const f_t* target_radius);
+
+template <typename i_t, typename f_t, int BLOCK_SIZE>
+__global__ void weighted_l2_if_infinite_reduce_kernel(
+  typename pdlp_restart_strategy_t<i_t, f_t>::view_t restart_strategy_view, i_t n, f_t* out)
+{
+  __shared__ f_t shared[BLOCK_SIZE];
+
+  f_t thread_sum = f_t(0);
+  for (i_t idx = static_cast<i_t>(threadIdx.x); idx < n; idx += BLOCK_SIZE) {
+    if (isinf(restart_strategy_view.threshold[idx])) {
+      auto const direction = restart_strategy_view.direction_full[idx];
+      thread_sum += direction * direction * restart_strategy_view.weights[idx];
+    }
+  }
+
+  shared[threadIdx.x] = thread_sum;
+  __syncthreads();
+
+  for (int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) { shared[threadIdx.x] += shared[threadIdx.x + offset]; }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) { *out = shared[0]; }
+}
 
 template <typename i_t, typename f_t>
 pdlp_restart_strategy_t<i_t, f_t>::pdlp_restart_strategy_t(
@@ -273,6 +299,9 @@ pdlp_restart_strategy_t<i_t, f_t>::pdlp_restart_strategy_t(
             std::numeric_limits<f_t>::infinity());
 
   if (batch_mode_) {
+#if defined(CUOPT_USE_MACA_CCCL)
+    dot_product_bytes = 0;
+#else
     // Pass down any input pointer of the right type, actual pointer does not matter
     size_t byte_needed = 0;
 
@@ -295,6 +324,7 @@ pdlp_restart_strategy_t<i_t, f_t>::pdlp_restart_strategy_t(
       dual_size_h_,
       stream_view_);
     dot_product_bytes = std::max(dot_product_bytes, byte_needed);
+#endif
 
     dot_product_storage.resize(dot_product_bytes, stream_view_);
   }
@@ -1254,6 +1284,14 @@ void pdlp_restart_strategy_t<i_t, f_t>::distance_squared_moved_from_last_restart
                                                     distance_moved.data(),
                                                     stream_view_));
   } else {
+#if defined(CUOPT_USE_MACA_CCCL)
+    fixed_size_segmented_sum<i_t, f_t>(
+      thrust::make_transform_iterator(tmp.data(), power_two_func_t<f_t>{}),
+      distance_moved.data(),
+      climber_strategies_.size(),
+      size_of_solutions_h,
+      stream_view_);
+#else
     cub::DeviceSegmentedReduce::Sum(
       dot_product_storage.data(),
       dot_product_bytes,
@@ -1262,6 +1300,7 @@ void pdlp_restart_strategy_t<i_t, f_t>::distance_squared_moved_from_last_restart
       climber_strategies_.size(),
       size_of_solutions_h,
       stream_view_);
+#endif
   }
 }
 
@@ -1925,7 +1964,7 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
 
     // Copying primal / dual bound before sorting them according to threshold
     using f_t2 = typename type_2<f_t>::type;
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       problem_ptr->variable_bounds.data(),
       thrust::make_zip_iterator(thrust::make_tuple(lower_bound_.data(), upper_bound_.data())),
       primal_size_h_,
@@ -1956,6 +1995,12 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
     // Compute the L2 norm on only infinite value before sorting to reduce effect of adding small /
     // big floating point values
 
+#if defined(CUOPT_USE_MACA_CCCL)
+    constexpr int block_size = 256;
+    weighted_l2_if_infinite_reduce_kernel<i_t, f_t, block_size>
+      <<<1, block_size, 0, stream_view_.value()>>>(
+        this->view(), primal_size_h_ + dual_size_h_, high_radius_squared_.data());
+#else
     // Define the transformation functor
     weighted_l2_if_infinite<i_t, f_t> transform_func(this->view());
 
@@ -1973,6 +2018,7 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
                                   transformed_end,
                                   f_t(0.0),
                                   thrust::plus<f_t>());
+#endif
 
     // Save direction_full_ before sorting it
     raft::copy(unsorted_direction_full_.data(),
@@ -2109,7 +2155,7 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
                            stream_view_);
     // project by max(min(x[i], upperbound[i]),lowerbound[i]) for primal part
     using f_t2 = typename type_2<f_t>::type;
-    cub::DeviceTransform::Transform(cuda::std::make_tuple(duality_gap.primal_solution_tr_.data(),
+    cuopt::device_transform(cuda::std::make_tuple(duality_gap.primal_solution_tr_.data(),
                                                           problem_ptr->variable_bounds.data()),
                                     duality_gap.primal_solution_tr_.data(),
                                     primal_size_h_,

@@ -23,8 +23,8 @@ struct norm_inf_max {
   template <typename f_t>
   __device__ __forceinline__ f_t operator()(const f_t& a, const f_t& b) const
   {
-    f_t x = cuda::std::abs(a);
-    f_t y = cuda::std::abs(b);
+    f_t x = a < f_t{0} ? -a : a;
+    f_t y = b < f_t{0} ? -b : b;
     return x > y ? x : y;
   }
 };

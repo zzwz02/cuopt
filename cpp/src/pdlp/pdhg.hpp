@@ -20,6 +20,8 @@
 #include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/functional>
+
 #include <tuple>
 #include <vector>
 

@@ -41,7 +41,7 @@ namespace cuopt::linear_programming::detail {
 
 template <typename i_t, typename f_t>
 struct detect_infeas_redun_t {
-  __device__ __forceinline__ thrust::tuple<i_t, i_t> operator()(
+  __host__ __device__ __forceinline__ thrust::tuple<i_t, i_t> operator()(
     thrust::tuple<f_t, f_t, f_t, f_t> t) const
   {
     auto min_act = thrust::get<0>(t);

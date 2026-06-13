@@ -926,15 +926,18 @@ static thrust::tuple<fj_move_t, fj_staged_score_t> find_mtm_move(
 
         f_t c_lb = fj_cpu.h_cstr_lb[cstr_idx];
         f_t c_ub = fj_cpu.h_cstr_ub[cstr_idx];
-        auto [delta, sign, slack, cstr_tolerance] =
-          get_mtm_for_constraint<i_t, f_t, move_type>(fj_cpu.view,
-                                                      var_idx,
-                                                      cstr_idx,
-                                                      cstr_coeff,
-                                                      c_lb,
-                                                      c_ub,
-                                                      fj_cpu.h_assignment,
-                                                      fj_cpu.h_lhs);
+        auto mtm_info = get_mtm_for_constraint<i_t, f_t, move_type>(fj_cpu.view,
+                                                                    var_idx,
+                                                                    cstr_idx,
+                                                                    cstr_coeff,
+                                                                    c_lb,
+                                                                    c_ub,
+                                                                    fj_cpu.h_assignment,
+                                                                    fj_cpu.h_lhs);
+        f_t delta          = thrust::get<0>(mtm_info);
+        f_t sign           = thrust::get<1>(mtm_info);
+        f_t slack          = thrust::get<2>(mtm_info);
+        f_t cstr_tolerance = thrust::get<3>(mtm_info);
         if (is_integer_var<i_t, f_t>(fj_cpu, var_idx)) {
           new_val = cstr_coeff * sign > 0
                       ? floor(val + delta + fj_cpu.view.pb.tolerances.integrality_tolerance)
@@ -1135,14 +1138,16 @@ static thrust::tuple<fj_move_t, fj_staged_score_t> find_lift_move(
         // Process each bound separately, as both are satified and may both be finite
         // otherwise range constraints aren't correctly handled
         for (auto [bound, sign] : {std::make_tuple(c_lb, -1), std::make_tuple(c_ub, 1)}) {
-          auto [delta, slack] = get_mtm_for_bound<i_t, f_t>(fj_cpu.view,
-                                                            var_idx,
-                                                            cstr_idx,
-                                                            cstr_coeff,
-                                                            bound,
-                                                            sign,
-                                                            fj_cpu.h_assignment,
-                                                            fj_cpu.h_lhs);
+          auto mtm_bound = get_mtm_for_bound<i_t, f_t>(fj_cpu.view,
+                                                       var_idx,
+                                                       cstr_idx,
+                                                       cstr_coeff,
+                                                       bound,
+                                                       sign,
+                                                       fj_cpu.h_assignment,
+                                                       fj_cpu.h_lhs);
+          f_t delta = thrust::get<0>(mtm_bound);
+          f_t slack = thrust::get<1>(mtm_bound);
 
           if (cstr_coeff * sign < 0) {
             if (is_integer_var<i_t, f_t>(fj_cpu, var_idx)) delta = ceil(delta);

@@ -95,7 +95,11 @@ class manual_cuda_graph_t {
     // Destroy the source graph regardless of whether instantiation succeeded:
     // on failure cudaGraphInstantiate leaves instance_ at nullptr per the API
     // contract, and the source graph is unconditionally not needed any more.
+#if defined(CUOPT_USE_MACA_CCCL)
+    cudaError_t inst_err = cudaGraphInstantiate(&instance_, captured, nullptr, nullptr, 0);
+#else
     cudaError_t inst_err = cudaGraphInstantiate(&instance_, captured);
+#endif
     RAFT_CUDA_TRY_NO_THROW(cudaGraphDestroy(captured));
     RAFT_CUDA_TRY(inst_err);
 

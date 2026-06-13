@@ -17,8 +17,9 @@ namespace raft {
 
 #if defined(__AMDGCN_WAVEFRONT_SIZE__)
 static constexpr int WarpSize = __AMDGCN_WAVEFRONT_SIZE__;
-#elif defined(__HIP_PLATFORM_AMD__)
-static constexpr int WarpSize = 64;  // CDNA is wave64-only
+#elif defined(__HIP_PLATFORM_AMD__) || defined(__MACA__) || defined(__MACACC__) || \
+  defined(__MACA_ARCH__) || defined(__XCORE_WN__)
+static constexpr int WarpSize = 64;  // MACA C500/CDNA-style targets are wave64.
 #else
 static constexpr int WarpSize = 32;
 #endif

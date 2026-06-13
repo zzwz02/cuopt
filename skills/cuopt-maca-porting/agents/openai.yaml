@@ -1,0 +1,4 @@
+interface:
+  display_name: "cuOpt MACA Porting"
+  short_description: "Port cuOpt to MACA/cu-bridge targets"
+  default_prompt: "Use $cuopt-maca-porting to continue the cuOpt MACA/cu-bridge C500 port."

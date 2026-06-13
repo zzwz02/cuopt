@@ -249,7 +249,7 @@ void infeasibility_information_t<i_t, f_t>::compute_infeasibility_information(
     print("delta_dual_solution after scale before mod", dual_ray);
 #endif
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(primal_ray.data(),
                             problem_wrap_container(op_problem_scaled_.variable_bounds)),
       primal_ray.data(),
@@ -272,7 +272,7 @@ void infeasibility_information_t<i_t, f_t>::compute_infeasibility_information(
                                                    max_abs_t<f_t>{},
                                                    f_t(0.0));
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(dual_ray.data(),
                             problem_wrap_container(op_problem_scaled_.constraint_lower_bounds),
                             problem_wrap_container(op_problem_scaled_.constraint_upper_bounds)),
@@ -364,7 +364,7 @@ void infeasibility_information_t<i_t, f_t>::compute_infeasibility_information(
            primal_ray_linear_objective_.element(0, stream_view_));
 #endif
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(dual_ray.data(),
                             problem_wrap_container(op_problem_scaled_.constraint_lower_bounds),
                             problem_wrap_container(op_problem_scaled_.constraint_upper_bounds)),
@@ -381,7 +381,7 @@ void infeasibility_information_t<i_t, f_t>::compute_infeasibility_information(
 #endif
 
     using f_t2 = typename type_2<f_t>::type;
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(current_pdhg_solver.get_primal_tmp_resource().data(),
                             problem_wrap_container(op_problem_scaled_.variable_bounds)),
       dual_slack_.data(),
@@ -409,7 +409,7 @@ void infeasibility_information_t<i_t, f_t>::compute_infeasibility_information(
     printf("sum_dual_slack=%lf\n", sum_dual_slack_.element(0, stream_view_));
 #endif
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         current_pdhg_solver.get_dual_tmp_resource().data(),
         problem_wrap_container(op_problem_scaled_.constraint_lower_bounds),
@@ -431,7 +431,7 @@ void infeasibility_information_t<i_t, f_t>::compute_infeasibility_information(
     print("primal_slack", primal_slack_);
 #endif
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         current_pdhg_solver.get_primal_tmp_resource().data(),
         problem_wrap_container(op_problem_scaled_.variable_bounds),
@@ -471,7 +471,7 @@ void infeasibility_information_t<i_t, f_t>::compute_infeasibility_information(
            max_dual_ray_infeasibility_.element(0, stream_view_));
 #endif
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(max_dual_ray_infeasibility_.data(),
                             dual_ray_inf_norm_.data(),
                             sum_primal_slack_.data(),
@@ -684,7 +684,7 @@ void infeasibility_information_t<i_t, f_t>::compute_reduced_cost_from_primal_gra
   rmm::device_uvector<f_t>& primal_gradient, rmm::device_uvector<f_t>& primal_ray)
 {
   using f_t2 = typename type_2<f_t>::type;
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(primal_gradient.data(), problem_ptr->variable_bounds.data()),
     bound_value_.data(),
     primal_size_h_,
@@ -716,7 +716,7 @@ void infeasibility_information_t<i_t, f_t>::compute_reduced_costs_dual_objective
   // Check if these bounds are the same as computed above
   // if reduced cost is positive -> lower bound, negative -> upper bounds, 0 -> 0
   // if bound_val is not finite let element be -inf, otherwise bound_value*reduced_cost
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(reduced_cost_.data(), problem_ptr->variable_bounds.data()),
     bound_value_.data(),
     primal_size_h_,

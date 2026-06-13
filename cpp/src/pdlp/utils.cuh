@@ -10,6 +10,7 @@
 #include <optional>
 #include <pdlp/pdlp_constants.hpp>
 #include <pdlp/restart_strategy/pdlp_restart_strategy.cuh>
+#include <utilities/device_transform.cuh>
 #include <utilities/macros.cuh>
 
 #include <raft/core/device_span.hpp>
@@ -273,7 +274,7 @@ void inline combine_constraint_bounds(const problem_t<i_t, f_t>& op_problem,
     "constraint_lower_bounds and constraint_upper_bounds must have the same size");
   combined_bounds.resize(op_problem.constraint_lower_bounds.size(),
                          op_problem.handle_ptr->get_stream());
-  cub::DeviceTransform::Transform(cuda::std::make_tuple(op_problem.constraint_lower_bounds.data(),
+  cuopt::device_transform(cuda::std::make_tuple(op_problem.constraint_lower_bounds.data(),
                                                         op_problem.constraint_upper_bounds.data()),
                                   combined_bounds.data(),
                                   combined_bounds.size(),
@@ -289,29 +290,29 @@ void inline compute_sum_bounds(const rmm::device_uvector<f_t>& constraint_lower_
 {
   rmm::device_buffer d_temp_storage;
   size_t bytes = 0;
-  cub::DeviceReduce::TransformReduce(
-    nullptr,
-    bytes,
+  auto input = thrust::make_transform_iterator(
     thrust::make_zip_iterator(constraint_lower_bounds.data(), constraint_upper_bounds.data()),
-    thrust::make_transform_output_iterator(out, sqrt_func_t<f_t>{}),
-    constraint_lower_bounds.size(),
-    cuda::std::plus<>{},
-    rhs_sum_of_squares_t<f_t>{},
-    f_t(0),
-    stream_view);
+    rhs_sum_of_squares_t<f_t>{});
+  auto output = thrust::make_transform_output_iterator(out, sqrt_func_t<f_t>{});
+  cub::DeviceReduce::Reduce(nullptr,
+                            bytes,
+                            input,
+                            output,
+                            constraint_lower_bounds.size(),
+                            cuda::std::plus<>{},
+                            f_t(0),
+                            stream_view);
 
   d_temp_storage.resize(bytes, stream_view);
 
-  cub::DeviceReduce::TransformReduce(
-    d_temp_storage.data(),
-    bytes,
-    thrust::make_zip_iterator(constraint_lower_bounds.data(), constraint_upper_bounds.data()),
-    thrust::make_transform_output_iterator(out, sqrt_func_t<f_t>{}),
-    constraint_lower_bounds.size(),
-    cuda::std::plus<>{},
-    rhs_sum_of_squares_t<f_t>{},
-    f_t(0),
-    stream_view);
+  cub::DeviceReduce::Reduce(d_temp_storage.data(),
+                            bytes,
+                            input,
+                            output,
+                            constraint_lower_bounds.size(),
+                            cuda::std::plus<>{},
+                            f_t(0),
+                            stream_view);
   RAFT_CUDA_TRY(cudaStreamSynchronize(stream_view));
 }
 
@@ -615,7 +616,8 @@ struct is_nan_or_inf {
 // Used to compute the linf of (residual_i - rel * b/c_i)
 template <typename i_t, typename f_t>
 struct relative_residual_t {
-  __device__ f_t operator()(const thrust::tuple<f_t, f_t>& t) const
+  template <typename tuple_t>
+  HDI f_t operator()(tuple_t const& t) const
   {
     const f_t residual = raft::abs(thrust::get<0>(t));
     // Rhs for either primal (b) and dual (c)
@@ -635,7 +637,7 @@ struct relative_residual_t {
 
 template <typename f_t>
 struct abs_t {
-  __device__ f_t operator()(const f_t in) const { return raft::abs(in); }
+  HDI f_t operator()(const f_t in) const { return raft::abs(in); }
 };
 
 template <typename f_t>

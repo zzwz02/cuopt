@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include <raft/core/detail/macros.hpp>
+
 #include <cuda/std/cstddef>
 #include <cuda/std/span>
 
@@ -36,21 +38,21 @@ class span {
 
   static constexpr bool is_device_span = is_device;
 
-  __host__ __device__ constexpr span() noexcept = default;
+  _RAFT_HOST_DEVICE constexpr span() noexcept = default;
 
-  __host__ __device__ constexpr span(pointer ptr, size_type count) noexcept : base_{ptr, count} {}
+  _RAFT_HOST_DEVICE constexpr span(pointer ptr, size_type count) noexcept : base_{ptr, count} {}
 
-  __host__ __device__ constexpr span(pointer first, pointer last) noexcept
+  _RAFT_HOST_DEVICE constexpr span(pointer first, pointer last) noexcept
     : base_{first, static_cast<size_type>(last - first)}
   {
   }
 
   template <std::size_t N>
-  __host__ __device__ constexpr span(element_type (&arr)[N]) noexcept : base_{arr, N}
+  _RAFT_HOST_DEVICE constexpr span(element_type (&arr)[N]) noexcept : base_{arr, N}
   {
   }
 
-  __host__ __device__ constexpr span(base_type other) noexcept : base_{other} {}
+  _RAFT_HOST_DEVICE constexpr span(base_type other) noexcept : base_{other} {}
 
   // Qualification-converting constructor: span<U> -> span<T> when U* converts to
   // T* (e.g. span<int> -> span<const int>), matching raft::span semantics.
@@ -58,32 +60,32 @@ class span {
             std::size_t OtherExtent,
             typename = std::enable_if_t<std::is_convertible_v<U (*)[], T (*)[]> &&
                                         (Extent == dynamic_extent || Extent == OtherExtent)>>
-  __host__ __device__ constexpr span(span<U, is_device, OtherExtent> const& other) noexcept
+  _RAFT_HOST_DEVICE constexpr span(span<U, is_device, OtherExtent> const& other) noexcept
     : base_{other.data(), other.size()}
   {
   }
 
-  __host__ __device__ constexpr span(span const&) noexcept            = default;
-  __host__ __device__ constexpr span& operator=(span const&) noexcept = default;
+  _RAFT_HOST_DEVICE constexpr span(span const&) noexcept            = default;
+  _RAFT_HOST_DEVICE constexpr span& operator=(span const&) noexcept = default;
 
-  __host__ __device__ constexpr pointer data() const noexcept { return base_.data(); }
-  __host__ __device__ constexpr size_type size() const noexcept { return base_.size(); }
-  __host__ __device__ constexpr size_type size_bytes() const noexcept
+  _RAFT_HOST_DEVICE constexpr pointer data() const noexcept { return base_.data(); }
+  _RAFT_HOST_DEVICE constexpr size_type size() const noexcept { return base_.size(); }
+  _RAFT_HOST_DEVICE constexpr size_type size_bytes() const noexcept
   {
     return base_.size() * sizeof(T);
   }
-  __host__ __device__ constexpr bool empty() const noexcept { return base_.empty(); }
+  _RAFT_HOST_DEVICE constexpr bool empty() const noexcept { return base_.empty(); }
 
-  __host__ __device__ constexpr reference operator[](size_type i) const noexcept { return base_[i]; }
-  __host__ __device__ constexpr reference front() const noexcept { return base_.front(); }
-  __host__ __device__ constexpr reference back() const noexcept { return base_.back(); }
+  _RAFT_HOST_DEVICE constexpr reference operator[](size_type i) const noexcept { return base_[i]; }
+  _RAFT_HOST_DEVICE constexpr reference front() const noexcept { return base_.front(); }
+  _RAFT_HOST_DEVICE constexpr reference back() const noexcept { return base_.back(); }
 
-  __host__ __device__ constexpr iterator begin() const noexcept { return data(); }
-  __host__ __device__ constexpr iterator end() const noexcept { return data() + size(); }
-  __host__ __device__ constexpr iterator cbegin() const noexcept { return data(); }
-  __host__ __device__ constexpr iterator cend() const noexcept { return data() + size(); }
+  _RAFT_HOST_DEVICE constexpr iterator begin() const noexcept { return data(); }
+  _RAFT_HOST_DEVICE constexpr iterator end() const noexcept { return data() + size(); }
+  _RAFT_HOST_DEVICE constexpr iterator cbegin() const noexcept { return data(); }
+  _RAFT_HOST_DEVICE constexpr iterator cend() const noexcept { return data() + size(); }
 
-  __host__ __device__ constexpr span<T, is_device, dynamic_extent> subspan(
+  _RAFT_HOST_DEVICE constexpr span<T, is_device, dynamic_extent> subspan(
     size_type offset, size_type count = dynamic_extent) const noexcept
   {
     return span<T, is_device, dynamic_extent>{
@@ -96,7 +98,7 @@ class span {
 
 // Element-wise comparison, matching raft::span semantics.
 template <typename T, std::size_t X, typename U, std::size_t Y, bool is_device>
-__host__ __device__ constexpr bool operator==(span<T, is_device, X> l, span<U, is_device, Y> r)
+_RAFT_HOST_DEVICE constexpr bool operator==(span<T, is_device, X> l, span<U, is_device, Y> r)
 {
   if (l.size() != r.size()) { return false; }
   auto l_beg = l.cbegin();
@@ -108,7 +110,7 @@ __host__ __device__ constexpr bool operator==(span<T, is_device, X> l, span<U, i
 }
 
 template <typename T, std::size_t X, typename U, std::size_t Y, bool is_device>
-__host__ __device__ constexpr bool operator!=(span<T, is_device, X> l, span<U, is_device, Y> r)
+_RAFT_HOST_DEVICE constexpr bool operator!=(span<T, is_device, X> l, span<U, is_device, Y> r)
 {
   return !(l == r);
 }

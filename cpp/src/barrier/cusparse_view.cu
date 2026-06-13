@@ -188,12 +188,12 @@ cusparse_view_t<i_t, f_t>::cusparse_view_t(raft::handle_t const* handle_ptr,
                     CUDA_R_64F);
 
   // Tmp just to init the buffer size and preprocess
-  cusparseDnVecDescr_t x;
-  cusparseDnVecDescr_t y;
   rmm::device_uvector<f_t> d_x(cols, handle_ptr_->get_stream());
   rmm::device_uvector<f_t> d_y(rows, handle_ptr_->get_stream());
-  RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsecreatednvec(&x, d_x.size(), d_x.data()));
-  RAFT_CUSPARSE_TRY(raft::sparse::detail::cusparsecreatednvec(&y, d_y.size(), d_y.data()));
+  detail::cusparse_dn_vec_descr_wrapper_t<f_t> x;
+  detail::cusparse_dn_vec_descr_wrapper_t<f_t> y;
+  x.create(d_x.size(), d_x.data(), "barrier_spmv_x");
+  y.create(d_y.size(), d_y.data(), "barrier_spmv_y");
 
   size_t buffer_size_spmv = 0;
   RAFT_CUSPARSE_TRY(
@@ -247,8 +247,6 @@ cusparse_view_t<i_t, f_t>::cusparse_view_t(raft::handle_t const* handle_ptr,
                              spmv_buffer_transpose_.data(),
                              handle_ptr->get_stream());
 #endif
-  RAFT_CUSPARSE_TRY(cusparseDestroyDnVec(x));
-  RAFT_CUSPARSE_TRY(cusparseDestroyDnVec(y));
 }
 
 template <typename i_t, typename f_t>

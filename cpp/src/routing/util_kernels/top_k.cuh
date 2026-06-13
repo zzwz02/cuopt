@@ -38,6 +38,103 @@ constexpr auto get_default()
   }
 }
 
+DI double top_k_sort_key(double value) { return value; }
+
+template <typename output_t>
+DI double top_k_sort_key(output_t const& value)
+{
+  return value.selection_delta;
+}
+
+template <typename i_t,
+          typename output_t,
+          int k,
+          int TPB,
+          bool write_diagonal,
+          int items_per_thread = 16>
+DI int top_k_indices_per_row_linear(i_t row_id,
+                                    raft::device_span<const output_t> row_costs,
+                                    raft::device_span<output_t> out_costs,
+                                    raft::device_span<i_t> out_indices)
+{
+  static_assert(TPB * items_per_thread == k * 2, "Invalid launch configration");
+  cuopt_assert(out_costs.size() == k, "Unexpected row size");
+  cuopt_assert(out_indices.size() == k, "Unexpected row size");
+
+  __shared__ output_t block_best_costs[TPB];
+  __shared__ i_t block_best_indices[TPB];
+  __shared__ i_t selected_indices[k];
+  __shared__ int valid_cost_count;
+
+  if (threadIdx.x < k) {
+    out_costs[threadIdx.x]       = get_default<output_t>();
+    out_indices[threadIdx.x]     = -1;
+    selected_indices[threadIdx.x] = -1;
+  }
+  if (threadIdx.x == 0) { valid_cost_count = 0; }
+  __syncthreads();
+
+  i_t num_cols = row_costs.size();
+  for (int rank = 0; rank < k; ++rank) {
+    output_t thread_best = get_default<output_t>();
+    i_t thread_best_idx  = -1;
+
+    for (i_t col = threadIdx.x; col < num_cols; col += TPB) {
+      if constexpr (write_diagonal) {
+        if (col == row_id) { continue; }
+      }
+
+      bool already_selected = false;
+      for (int prev = 0; prev < rank; ++prev) {
+        if (selected_indices[prev] == col) {
+          already_selected = true;
+          break;
+        }
+      }
+      if (already_selected) { continue; }
+
+      auto candidate = row_costs[col];
+      auto cand_key  = top_k_sort_key(candidate);
+      auto best_key  = top_k_sort_key(thread_best);
+      if (cand_key < best_key || (cand_key == best_key && thread_best_idx >= 0 &&
+                                    col < thread_best_idx)) {
+        thread_best     = candidate;
+        thread_best_idx = col;
+      }
+    }
+
+    block_best_costs[threadIdx.x]   = thread_best;
+    block_best_indices[threadIdx.x] = thread_best_idx;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      output_t best = get_default<output_t>();
+      i_t best_idx  = -1;
+      for (int t = 0; t < TPB; ++t) {
+        if (block_best_indices[t] < 0) { continue; }
+        auto cand_key = top_k_sort_key(block_best_costs[t]);
+        auto best_key = top_k_sort_key(best);
+        if (cand_key < best_key || (cand_key == best_key && (best_idx < 0 || block_best_indices[t] < best_idx))) {
+          best     = block_best_costs[t];
+          best_idx = block_best_indices[t];
+        }
+      }
+
+      if (best_idx >= 0) {
+        out_costs[rank]        = best;
+        out_indices[rank]      = best_idx;
+        selected_indices[rank] = best_idx;
+        valid_cost_count       = rank + 1;
+      }
+    }
+    __syncthreads();
+
+    if (selected_indices[rank] < 0) { break; }
+  }
+
+  return valid_cost_count;
+}
+
 template <typename i_t,
           typename output_t,
           int k,
@@ -49,6 +146,17 @@ DI int top_k_indices_per_row(i_t row_id,
                              raft::device_span<output_t> out_costs,
                              raft::device_span<i_t> out_indices)
 {
+#ifdef CUOPT_USE_MACA_CCCL
+  if constexpr (!::cuda::std::is_same_v<output_t, double>) {
+    return top_k_indices_per_row_linear<i_t,
+                                        output_t,
+                                        k,
+                                        TPB,
+                                        write_diagonal,
+                                        items_per_thread>(row_id, row_costs, out_costs, out_indices);
+  } else
+#endif
+  {
   static_assert(TPB * items_per_thread == k * 2, "Invalid launch configration");
   cuopt_assert(out_costs.size() == k, "Unexpected row size");
   cuopt_assert(out_indices.size() == k, "Unexpected row size");
@@ -202,6 +310,7 @@ DI int top_k_indices_per_row(i_t row_id,
   // we can store a maximum of k elements in the graph.
   return min(block_reduce(temp_storage.reduce).Sum(valid_cost_count),
              static_cast<int>(out_costs.size()));
+  }
 }
 
 }  // namespace detail

@@ -80,6 +80,7 @@ option(SKIP_ROUTING_BUILD "Skip building routing components" OFF)
 option(SKIP_GRPC_BUILD "Skip building gRPC and protobuf components" OFF)
 option(WRITE_FATBIN "Enable fatbin writing" ON)
 option(HOST_LINEINFO "Build with debug line information for host code" OFF)
+option(CUOPT_USE_MACA_CCCL "Use MACA/cu-bridge provided CCCL headers instead of fetching NVIDIA CCCL" OFF)
 
 message(VERBOSE "cuOpt: Enable nvcc -lineinfo: ${CMAKE_CUDA_LINEINFO}")
 message(VERBOSE "cuOpt: Build cuOpt unit-tests: ${BUILD_TESTS}")
@@ -90,6 +91,7 @@ message(VERBOSE "cuOpt: Skip C/Python adapters: ${SKIP_C_PYTHON_ADAPTERS}")
 message(VERBOSE "cuOpt: Skip routing build: ${SKIP_ROUTING_BUILD}")
 message(VERBOSE "cuOpt: Build with debug line information for host code: ${HOST_LINEINFO}")
 message(VERBOSE "cuOpt: fatbin: ${WRITE_FATBIN}")
+message(VERBOSE "cuOpt: Use MACA CCCL: ${CUOPT_USE_MACA_CCCL}")
 
 # ##################################################################################################
 # - compiler options ------------------------------------------------------------------------------
@@ -99,12 +101,35 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 find_package(CUDAToolkit REQUIRED)
 
+if (CUOPT_USE_MACA_CCCL)
+    if (DEFINED ENV{MACA_PATH} AND NOT "$ENV{MACA_PATH}" STREQUAL "")
+        set(CUOPT_MACA_PATH "$ENV{MACA_PATH}")
+    else ()
+        set(CUOPT_MACA_PATH "/opt/maca")
+    endif ()
+
+    find_library(CUOPT_MACA_MCBLAS_LIBRARY NAMES mcblas
+            PATHS "${CUOPT_MACA_PATH}/lib" REQUIRED NO_DEFAULT_PATH)
+    find_library(CUOPT_MACA_MCBLASLT_LIBRARY NAMES mcblasLt
+            PATHS "${CUOPT_MACA_PATH}/lib" REQUIRED NO_DEFAULT_PATH)
+    find_library(CUOPT_MACA_MCSPARSE_LIBRARY NAMES mcsparse
+            PATHS "${CUOPT_MACA_PATH}/lib" REQUIRED NO_DEFAULT_PATH)
+    find_library(CUOPT_MACA_MCSOLVER_LIBRARY NAMES mcsolver
+            PATHS "${CUOPT_MACA_PATH}/lib" REQUIRED NO_DEFAULT_PATH)
+    find_library(CUOPT_MACA_MCRAND_LIBRARY NAMES mcrand
+            PATHS "${CUOPT_MACA_PATH}/lib" REQUIRED NO_DEFAULT_PATH)
+
+    message(STATUS "Using MACA libraries from ${CUOPT_MACA_PATH}/lib")
+endif ()
+
 set(CUOPT_CXX_FLAGS "")
 set(CUOPT_CUDA_FLAGS "")
 
-if (CMAKE_COMPILER_IS_GNUCXX)
+if (CMAKE_COMPILER_IS_GNUCXX AND NOT CUOPT_USE_MACA_CCCL)
     list(APPEND CUOPT_CXX_FLAGS -Werror -Wno-error=deprecated-declarations)
-endif (CMAKE_COMPILER_IS_GNUCXX)
+elseif (CUOPT_USE_MACA_CCCL)
+    list(APPEND CUOPT_CXX_FLAGS -Wno-error=deprecated-declarations)
+endif ()
 
 # Papilo pulls in Boost.Multiprecision float128 support, which expects quadmath.h from the GCC
 # toolchain internals. Conda clang ships libquadmath, but does not surface the matching GCC
@@ -199,17 +224,32 @@ message("-- Host target architecture = '${CMAKE_SYSTEM_PROCESSOR}'")
 
 # make the flags global in order to propagate flags to test cmake files
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --expt-extended-lambda")
-if (${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
+if (NOT CUOPT_USE_MACA_CCCL AND ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -static-global-template-stub=false")
 endif ()
-list(APPEND CUOPT_CUDA_FLAGS -Werror=cross-execution-space-call -Wno-deprecated-declarations -Xcompiler=-Werror --default-stream=per-thread)
+if (CUOPT_USE_MACA_CCCL)
+    list(APPEND CUOPT_CUDA_FLAGS
+            -Wno-deprecated-declarations
+            -Wno-error=deprecated-declarations
+            -Wno-error=unused-variable
+            -Wno-error=reorder-ctor
+            -Wno-error=mismatched-tags
+            -Wno-error=pass-failed
+            --default-stream=per-thread)
+else ()
+    list(APPEND CUOPT_CUDA_FLAGS -Werror=cross-execution-space-call -Wno-deprecated-declarations -Xcompiler=-Werror --default-stream=per-thread)
+endif ()
 if ("${CMAKE_CUDA_HOST_COMPILER}" MATCHES "clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+    list(APPEND CUOPT_CUDA_FLAGS -Xcompiler=-Wall)
+elseif (CUOPT_USE_MACA_CCCL)
     list(APPEND CUOPT_CUDA_FLAGS -Xcompiler=-Wall)
 else ()
     list(APPEND CUOPT_CUDA_FLAGS -Xcompiler=-Wall -Wno-error=non-template-friend)
 endif ()
-list(APPEND CUOPT_CUDA_FLAGS -Xfatbin=-compress-all)
-if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+if (NOT CUOPT_USE_MACA_CCCL)
+    list(APPEND CUOPT_CUDA_FLAGS -Xfatbin=-compress-all)
+endif ()
+if (NOT CUOPT_USE_MACA_CCCL AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
     list(APPEND CUOPT_CUDA_FLAGS -Xfatbin=--compress-level=3)
 endif ()
 list(APPEND CUOPT_CUDA_FLAGS -fopenmp)
@@ -264,13 +304,15 @@ set(lib_dir "${CMAKE_INSTALL_LIBDIR}")
 
 # rmm / raft / rapids_logger are no longer fetched or linked: cuOpt's own
 # cuda::mr-free same-name shim headers under cpp/vendor/include provide the
-# used API subset (see docs/dev/rapids_removal_plan.md). Only CCCL is still
-# fetched (it is an NVIDIA/cccl product that ships with the CUDA toolkit, not
-# part of RAPIDS).
-# Fetched via FetchContent; use -DFETCHCONTENT_SOURCE_DIR_CCCL=<dir> to reuse
-# a local checkout (offline builds), or pre-provide a CCCL::CCCL target.
+# used API subset (see docs/dev/rapids_removal_plan.md).  Normal NVIDIA builds
+# still fetch pinned CCCL; MACA builds use the CCCL surface shipped with
+# cu-bridge/MACA and must not fetch NVIDIA CCCL.
 if (NOT TARGET CCCL::CCCL)
-    include(cmake/thirdparty/get_cccl.cmake)
+    if (CUOPT_USE_MACA_CCCL)
+        include(cmake/thirdparty/get_maca_cccl.cmake)
+    else ()
+        include(cmake/thirdparty/get_cccl.cmake)
+    endif ()
 endif ()
 
 # Vendored rmm/raft/rapids_logger shim include directory. The rmm/raft/
@@ -565,6 +607,18 @@ target_include_directories(cuopt
         "$<INSTALL_INTERFACE:include>"
 )
 
+set(CUOPT_BOOST_INCLUDE_DIRS ${Boost_INCLUDE_DIRS})
+if (NOT CUOPT_BOOST_INCLUDE_DIRS AND Boost_DIR)
+    get_filename_component(CUOPT_BOOST_ROOT "${Boost_DIR}/../../.." ABSOLUTE)
+    if (EXISTS "${CUOPT_BOOST_ROOT}/include/boost/serialization/split_free.hpp")
+        list(APPEND CUOPT_BOOST_INCLUDE_DIRS "${CUOPT_BOOST_ROOT}/include")
+    endif ()
+endif ()
+
+if (CUOPT_BOOST_INCLUDE_DIRS)
+    target_include_directories(cuopt SYSTEM PRIVATE ${CUOPT_BOOST_INCLUDE_DIRS})
+endif ()
+
 # Link PSLP by file to avoid export dependency tracking
 target_link_libraries(cuopt PRIVATE $<TARGET_FILE:PSLP>)
 add_dependencies(cuopt PSLP)
@@ -572,13 +626,33 @@ add_dependencies(cuopt PSLP)
 # ##################################################################################################
 # - link libraries --------------------------------------------------------------------------------
 
+set(CUOPT_PUBLIC_CUDA_LIBS
+        CUDA::cudart_static
+        CUDA::cublas
+        CUDA::cusparse
+        CCCL::CCCL)
+
 set(CUOPT_PRIVATE_CUDA_LIBS
+        CUDA::cublasLt
         CUDA::curand
         CUDA::cusolver
         TBB::tbb
         OpenMP::OpenMP_CXX)
 
-list(PREPEND CUOPT_PRIVATE_CUDA_LIBS CUDA::cublasLt)
+if (CUOPT_USE_MACA_CCCL)
+    set(CUOPT_PUBLIC_CUDA_LIBS
+            CUDA::cudart_static
+            "${CUOPT_MACA_MCBLAS_LIBRARY}"
+            "${CUOPT_MACA_MCSPARSE_LIBRARY}"
+            CCCL::CCCL)
+
+    set(CUOPT_PRIVATE_CUDA_LIBS
+            "${CUOPT_MACA_MCBLASLT_LIBRARY}"
+            "${CUOPT_MACA_MCRAND_LIBRARY}"
+            "${CUOPT_MACA_MCSOLVER_LIBRARY}"
+            TBB::tbb
+            OpenMP::OpenMP_CXX)
+endif ()
 
 execute_process(
         COMMAND git rev-parse --short HEAD
@@ -602,7 +676,8 @@ target_include_directories(cuopt PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/include)
 list(JOIN CMAKE_CUDA_ARCHITECTURES "," JOINED_CUDA_ARCHITECTURES)
 target_compile_definitions(cuopt PUBLIC
         CUOPT_CUDA_ARCHITECTURES="${JOINED_CUDA_ARCHITECTURES}"
-        CUOPT_CPU_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}")
+        CUOPT_CPU_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}"
+        $<$<BOOL:${CUOPT_USE_MACA_CCCL}>:CUOPT_USE_MACA_CCCL>)
 
 # Vendored rmm/raft/rapids_logger shim headers, ahead of any other include
 # dirs so <rmm/...>, <raft/...> and <rapids_logger/...> resolve to the shim.
@@ -610,12 +685,16 @@ target_include_directories(cuopt PUBLIC
         "$<BUILD_INTERFACE:${CUOPT_VENDOR_INCLUDE_DIR}>"
         "$<INSTALL_INTERFACE:include/cuopt_vendor>")
 
+if (CUOPT_USE_MACA_CCCL)
+    target_include_directories(cuopt SYSTEM BEFORE PUBLIC
+            "$<BUILD_INTERFACE:${CUOPT_MACA_CUBRIDGE_CCCL_INCLUDE_DIR}>"
+            "$<BUILD_INTERFACE:${CUOPT_MACA_CUBRIDGE_INCLUDE_DIR}>"
+            "$<BUILD_INTERFACE:${CUOPT_MACA_INCLUDE_DIR}>")
+endif ()
+
 target_link_libraries(cuopt
         PUBLIC
-        CUDA::cudart_static  # was pulled in transitively via rmm::rmm before the cutover
-        CUDA::cublas
-        CUDA::cusparse
-        CCCL::CCCL
+        ${CUOPT_PUBLIC_CUDA_LIBS}
         PRIVATE
         SuiteSparse::AMD
         ${CUOPT_PRIVATE_CUDA_LIBS}
@@ -680,10 +759,29 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/cuopt/version_config.hpp
 # - install export -------------------------------------------------------------------------------
 # Hand-written package config (was rapids_export). Consumers get the
 # cuopt::cuopt target plus its PUBLIC dependencies: CUDAToolkit and
-# CCCL::CCCL (fetched on demand if absent, overridable for offline use via
-# -DFETCHCONTENT_SOURCE_DIR_CCCL).
+# CCCL::CCCL.  NVIDIA build-tree consumers fetch pinned CCCL on demand;
+# MACA build-tree consumers recreate the local interface target from MACA_PATH.
 include(CMakePackageConfigHelpers)
 
+if (CUOPT_USE_MACA_CCCL)
+set(_cuopt_config_body
+"include(CMakeFindDependencyMacro)
+find_dependency(CUDAToolkit)
+if(NOT TARGET CCCL::CCCL)
+  if(NOT DEFINED MACA_PATH)
+    set(MACA_PATH \"$ENV{MACA_PATH}\")
+  endif()
+  if(NOT MACA_PATH)
+    set(MACA_PATH \"/opt/maca\")
+  endif()
+  add_library(CCCL::CCCL INTERFACE IMPORTED)
+  set_target_properties(CCCL::CCCL PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES
+      \"${MACA_PATH}/tools/cu-bridge/include/cccl;${MACA_PATH}/tools/cu-bridge/include;${MACA_PATH}/include\")
+endif()
+include(\"\${CMAKE_CURRENT_LIST_DIR}/cuopt-targets.cmake\")
+")
+else ()
 set(_cuopt_config_body
 "include(CMakeFindDependencyMacro)
 find_dependency(CUDAToolkit)
@@ -699,6 +797,7 @@ if(NOT TARGET CCCL::CCCL)
 endif()
 include(\"\${CMAKE_CURRENT_LIST_DIR}/cuopt-targets.cmake\")
 ")
+endif ()
 
 # Install tree -----------------------------------------------------------------
 install(EXPORT cuopt-exports

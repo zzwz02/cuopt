@@ -6,6 +6,7 @@
 /* clang-format on */
 
 #include <cuopt/linear_programming/pdlp/pdlp_hyper_params.cuh>
+#include <cuopt/linear_programming/utilities/segmented_sum_handler.cuh>
 
 #include <pdlp/pdlp_climber_strategy.hpp>
 #include <pdlp/pdlp_constants.hpp>
@@ -66,6 +67,9 @@ adaptive_step_size_strategy_t<i_t, f_t>::adaptive_step_size_strategy_t(
   valid_step_size_[0] = 0;
 
   if (batch_mode_) {
+#if defined(CUOPT_USE_MACA_CCCL)
+    dot_product_bytes = 0;
+#else
     // Pass down any input pointer of the right type, actual pointer does not matter
     size_t byte_needed = 0;
     RAFT_CUDA_TRY(cub::DeviceSegmentedReduce::Sum(
@@ -99,6 +103,7 @@ adaptive_step_size_strategy_t<i_t, f_t>::adaptive_step_size_strategy_t(
       dual_size_,
       stream_view_.value()));
     dot_product_bytes = std::max(dot_product_bytes, byte_needed);
+#endif
 
     dot_product_storage.resize(dot_product_bytes, stream_view_.value());
   }
@@ -414,7 +419,7 @@ void adaptive_step_size_strategy_t<i_t, f_t>::compute_interaction_and_movement(
 
   // Compute Ay' - Ay = next_Aty - current_Aty
   // TODO later batch mode: remove this once you want to do per climber restart
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(current_saddle_point_state.get_next_AtY().data(),
                           current_saddle_point_state.get_current_AtY().data()),
     tmp_primal.data(),
@@ -463,6 +468,33 @@ void adaptive_step_size_strategy_t<i_t, f_t>::compute_interaction_and_movement(
                                       stream_view_.value()));
   } else {
     // TODO later batch mode: remove this once you want to do per climber restart
+#if defined(CUOPT_USE_MACA_CCCL)
+    fixed_size_segmented_sum<i_t, f_t>(
+      thrust::make_transform_iterator(
+        thrust::make_zip_iterator(tmp_primal.data(),
+                                  current_saddle_point_state.get_delta_primal().data()),
+        tuple_multiplies<f_t>{}),
+      interaction_.data(),
+      climber_strategies_.size(),
+      primal_size_,
+      stream_view_);
+
+    fixed_size_segmented_sum<i_t, f_t>(
+      thrust::make_transform_iterator(current_saddle_point_state.get_delta_primal().data(),
+                                      power_two_func_t<f_t>{}),
+      norm_squared_delta_primal_.data(),
+      climber_strategies_.size(),
+      primal_size_,
+      stream_view_);
+
+    fixed_size_segmented_sum<i_t, f_t>(
+      thrust::make_transform_iterator(current_saddle_point_state.get_delta_dual().data(),
+                                      power_two_func_t<f_t>{}),
+      norm_squared_delta_dual_.data(),
+      climber_strategies_.size(),
+      dual_size_,
+      stream_view_);
+#else
     cub::DeviceSegmentedReduce::Sum(
       dot_product_storage.data(),
       dot_product_bytes,
@@ -494,6 +526,7 @@ void adaptive_step_size_strategy_t<i_t, f_t>::compute_interaction_and_movement(
       climber_strategies_.size(),
       dual_size_,
       stream_view_.value());
+#endif
   }
 }
 

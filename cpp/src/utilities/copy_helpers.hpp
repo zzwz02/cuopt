@@ -140,14 +140,10 @@ auto host_copy(T const* device_ptr, size_t size, rmm::cuda_stream_view stream_vi
 inline auto host_copy(bool const* device_ptr, size_t size, rmm::cuda_stream_view stream_view)
 {
   if (!device_ptr) { return std::vector<bool>(0); }
-  rmm::device_uvector<int> d_int_vec(size, stream_view);
-  d_int_vec.resize(size, stream_view);
-  cuda::std::identity id;
-  thrust::transform(
-    rmm::exec_policy(stream_view), device_ptr, device_ptr + size, d_int_vec.begin(), id);
-  auto h_int_vec = host_copy(d_int_vec.data(), d_int_vec.size(), stream_view);
-  std::vector<bool> h_bool_vec(h_int_vec.size());
-  for (size_t i = 0; i < h_int_vec.size(); ++i) {
+  std::vector<uint8_t> h_int_vec(size);
+  raft::copy(h_int_vec.data(), reinterpret_cast<uint8_t const*>(device_ptr), size, stream_view);
+  std::vector<bool> h_bool_vec(size);
+  for (size_t i = 0; i < size; ++i) {
     h_bool_vec[i] = static_cast<bool>(h_int_vec[i]);
   }
   stream_view.synchronize();
@@ -263,15 +259,11 @@ inline auto device_copy(std::vector<bool> const& host_vec, rmm::cuda_stream_view
   for (size_t i = 0; i < host_vec.size(); ++i) {
     host_vec_int[i] = host_vec[i];
   }
-  auto device_vec_int = device_copy(host_vec_int, stream_view);
-
   rmm::device_uvector<bool> device_vec(host_vec.size(), stream_view);
-
-  thrust::transform(rmm::exec_policy(stream_view),
-                    device_vec_int.begin(),
-                    device_vec_int.end(),
-                    device_vec.begin(),
-                    cuda::std::identity());
+  raft::copy(reinterpret_cast<uint8_t*>(device_vec.data()),
+             host_vec_int.data(),
+             host_vec.size(),
+             stream_view);
 
   return device_vec;
 }

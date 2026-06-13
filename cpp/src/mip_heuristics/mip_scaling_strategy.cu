@@ -69,12 +69,12 @@ constexpr double big_m_ratio_threshold = 1.0e4;
 
 template <typename f_t>
 struct abs_value_transform_t {
-  __device__ f_t operator()(f_t value) const { return raft::abs(value); }
+  __host__ __device__ f_t operator()(f_t value) const { return raft::abs(value); }
 };
 
 template <typename f_t>
 struct nonzero_abs_or_inf_transform_t {
-  __device__ f_t operator()(f_t value) const
+  __host__ __device__ f_t operator()(f_t value) const
   {
     const f_t abs_value = raft::abs(value);
     return abs_value > f_t(0) ? abs_value : std::numeric_limits<f_t>::infinity();
@@ -83,7 +83,10 @@ struct nonzero_abs_or_inf_transform_t {
 
 template <typename i_t, typename f_t>
 struct nonzero_count_transform_t {
-  __device__ i_t operator()(f_t value) const { return raft::abs(value) > f_t(0) ? i_t(1) : i_t(0); }
+  __host__ __device__ i_t operator()(f_t value) const
+  {
+    return raft::abs(value) > f_t(0) ? i_t(1) : i_t(0);
+  }
 };
 
 template <typename item_t>
@@ -120,7 +123,7 @@ struct gcd_op_t {
 
 template <typename f_t>
 struct integer_coeff_for_integer_var_transform_t {
-  __device__ std::int64_t operator()(thrust::tuple<f_t, var_t> coeff_with_type) const
+  __host__ __device__ std::int64_t operator()(thrust::tuple<f_t, var_t> coeff_with_type) const
   {
     const f_t coefficient = thrust::get<0>(coeff_with_type);
     const var_t var_type  = thrust::get<1>(coeff_with_type);

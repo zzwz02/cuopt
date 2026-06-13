@@ -134,13 +134,13 @@ __global__ void calc_activity_kernel(typename problem_t<i_t, f_t>::view_t pb,
 // Update bounds
 
 template <typename i_t, typename f_t>
-inline __device__ bool check_infeasibility(f_t min_a, f_t max_a, f_t cnst_lb, f_t cnst_ub, f_t eps)
+HDI bool check_infeasibility(f_t min_a, f_t max_a, f_t cnst_lb, f_t cnst_ub, f_t eps)
 {
   return (min_a > cnst_ub + eps) || (max_a < cnst_lb - eps);
 }
 
 template <typename i_t, typename f_t>
-inline __device__ bool check_infeasibility(
+HDI bool check_infeasibility(
   f_t min_a, f_t max_a, f_t cnst_lb, f_t cnst_ub, f_t abs_tol, f_t rel_tol)
 {
   auto eps = get_cstr_tolerance<i_t, f_t>(cnst_lb, cnst_ub, abs_tol, rel_tol);
@@ -148,7 +148,7 @@ inline __device__ bool check_infeasibility(
 }
 
 template <typename i_t, typename f_t>
-inline __device__ bool check_redundancy(
+HDI bool check_redundancy(
   f_t min_a, f_t max_a, f_t cnst_lb, f_t cnst_ub, f_t abs_tol, f_t rel_tol)
 {
   auto eps = get_cstr_tolerance<i_t, f_t>(cnst_lb, cnst_ub, abs_tol, rel_tol);

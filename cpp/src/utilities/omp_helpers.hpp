@@ -278,6 +278,121 @@ inline double fetch_max(omp_atomic_t<double>& atomic_var, double other)
 }
 #endif
 
-#endif
+}  // namespace cuopt
+
+#else
+
+#include <atomic>
+#include <memory>
+#include <mutex>
+
+namespace cuopt {
+
+class omp_mutex_t {
+ public:
+  omp_mutex_t() : mutex(new std::mutex) {}
+  omp_mutex_t(omp_mutex_t&& other) { *this = std::move(other); }
+
+  omp_mutex_t(const omp_mutex_t&)            = delete;
+  omp_mutex_t& operator=(const omp_mutex_t&) = delete;
+
+  omp_mutex_t& operator=(omp_mutex_t&& other)
+  {
+    if (&other != this) { mutex = std::move(other.mutex); }
+    return *this;
+  }
+
+  void lock() { mutex->lock(); }
+  void unlock() { mutex->unlock(); }
+  bool try_lock() { return mutex->try_lock(); }
+
+ private:
+  std::unique_ptr<std::mutex> mutex;
+};
+
+class fake_omp_mutex_t {
+ public:
+  static void lock() {}
+  static void unlock() {}
+  static bool try_lock() { return true; }
+};
+
+template <typename T>
+class omp_atomic_t {
+ public:
+  omp_atomic_t() = default;
+  omp_atomic_t(T val) : val(val) {}
+
+  T operator=(T new_val)
+  {
+    store(new_val);
+    return new_val;
+  }
+
+  operator T() const { return load(); }
+  T operator+=(T inc) { return fetch_add(inc) + inc; }
+  T operator-=(T inc) { return fetch_sub(inc) - inc; }
+  T operator++() { return fetch_add(T(1)) + 1; }
+  T operator++(int) { return fetch_add(T(1)); }
+  T operator--() { return fetch_sub(T(1)) - 1; }
+  T operator--(int) { return fetch_sub(T(1)); }
+
+  T load(std::memory_order memory_order = std::memory_order::seq_cst) const
+  {
+    return val.load(memory_order);
+  }
+
+  void store(T new_val, std::memory_order memory_order = std::memory_order::seq_cst)
+  {
+    val.store(new_val, memory_order);
+  }
+
+  T exchange(T other, std::memory_order memory_order = std::memory_order::seq_cst)
+  {
+    return val.exchange(other, memory_order);
+  }
+
+  T fetch_add(T inc, std::memory_order memory_order = std::memory_order::seq_cst)
+  {
+    return val.fetch_add(inc, memory_order);
+  }
+
+  T fetch_sub(T inc, std::memory_order memory_order = std::memory_order::seq_cst)
+  {
+    return val.fetch_sub(inc, memory_order);
+  }
+
+  T& underlying() { return shadow; }
+  T underlying() const { return load(); }
+
+ private:
+  std::atomic<T> val{};
+  T shadow{};
+
+  friend double fetch_min(omp_atomic_t<double>& atomic_var, double other);
+  friend double fetch_max(omp_atomic_t<double>& atomic_var, double other);
+};
+
+inline double fetch_min(omp_atomic_t<double>& atomic_var, double other)
+{
+  double old = atomic_var.val.load(std::memory_order::seq_cst);
+  while (other < old &&
+         !atomic_var.val.compare_exchange_weak(
+           old, other, std::memory_order::seq_cst, std::memory_order::seq_cst)) {
+  }
+  return old;
+}
+
+inline double fetch_max(omp_atomic_t<double>& atomic_var, double other)
+{
+  double old = atomic_var.val.load(std::memory_order::seq_cst);
+  while (other > old &&
+         !atomic_var.val.compare_exchange_weak(
+           old, other, std::memory_order::seq_cst, std::memory_order::seq_cst)) {
+  }
+  return old;
+}
 
 }  // namespace cuopt
+
+#endif

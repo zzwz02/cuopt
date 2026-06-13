@@ -537,7 +537,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_problem()
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   // Scale c
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(op_problem_scaled_.objective_coefficients.data(),
                           problem_wrap_container(cummulative_variable_scaling_)),
     op_problem_scaled_.objective_coefficients.data(),
@@ -546,7 +546,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_problem()
     stream_view_);
 
   using f_t2 = typename type_2<f_t>::type;
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(op_problem_scaled_.variable_bounds.data(),
                           problem_wrap_container(cummulative_variable_scaling_)),
     op_problem_scaled_.variable_bounds.data(),
@@ -555,7 +555,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_problem()
     stream_view_.value());
 
   if (pdhg_solver_ptr_ && pdhg_solver_ptr_->get_new_bounds_idx().size() != 0) {
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         pdhg_solver_ptr_->get_new_bounds_lower().data(),
         pdhg_solver_ptr_->get_new_bounds_upper().data(),
@@ -571,14 +571,14 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_problem()
       stream_view_);
   }
 
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(op_problem_scaled_.constraint_lower_bounds.data(),
                           problem_wrap_container(cummulative_constraint_matrix_scaling_)),
     op_problem_scaled_.constraint_lower_bounds.data(),
     op_problem_scaled_.constraint_lower_bounds.size(),
     cuda::std::multiplies<f_t>{},
     stream_view_);
-  cub::DeviceTransform::Transform(
+  cuopt::device_transform(
     cuda::std::make_tuple(op_problem_scaled_.constraint_upper_bounds.data(),
                           problem_wrap_container(cummulative_constraint_matrix_scaling_)),
     op_problem_scaled_.constraint_upper_bounds.data(),
@@ -595,7 +595,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_problem()
     print("objective_rescaling", objective_rescaling_);
 #endif
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(op_problem_scaled_.constraint_lower_bounds.data(),
                             op_problem_scaled_.constraint_upper_bounds.data(),
                             batch_wrapped_container(bound_rescaling_, dual_size_h_)),
@@ -617,7 +617,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_problem()
     // we pass the scaling factor to PDHG later. In PDHG we act the (almost fully) scaled variable
     // bounds and add this missing scaling factor.
     if (original_batch_size_ == 1) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         op_problem_scaled_.variable_bounds.data(),
         op_problem_scaled_.variable_bounds.data(),
         op_problem_scaled_.variable_bounds.size(),
@@ -627,7 +627,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_problem()
         stream_view_);
     }
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(op_problem_scaled_.objective_coefficients.data(),
                             batch_wrapped_container(objective_rescaling_, primal_size_h_)),
       op_problem_scaled_.objective_coefficients.data(),
@@ -672,7 +672,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_solutions(
                   error_type_t::RuntimeError,
                   "Scale primal didn't get a vector of size primal");
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         primal_solution.data(),
         thrust::make_transform_iterator(
@@ -684,7 +684,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_solutions(
       stream_view_);
 
     if (hyper_params_.bound_objective_rescaling && !running_mip_) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(primal_solution.data(),
                               batch_wrapped_container(bound_rescaling_, primal_size_h_)),
         primal_solution.data(),
@@ -699,7 +699,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_solutions(
                   error_type_t::RuntimeError,
                   "Unscale dual didn't get a vector of size dual");
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(dual_solution.data(),
                             thrust::make_transform_iterator(
                               thrust::make_counting_iterator(0),
@@ -711,7 +711,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_solutions(
       stream_view_);
 
     if (hyper_params_.bound_objective_rescaling && !running_mip_) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(dual_solution.data(),
                               batch_wrapped_container(objective_rescaling_, dual_size_h_)),
         dual_solution.data(),
@@ -726,7 +726,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_solutions(
                   error_type_t::RuntimeError,
                   "Unscale dual didn't get a vector of size dual");
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         dual_slack.data(),
         thrust::make_transform_iterator(
@@ -738,7 +738,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::scale_solutions(
       stream_view_);
 
     if (hyper_params_.bound_objective_rescaling && !running_mip_) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(dual_slack.data(),
                               batch_wrapped_container(objective_rescaling_, primal_size_h_)),
         dual_slack.data(),
@@ -794,7 +794,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::unscale_solutions(
                   "Unscale primal didn't get a vector of size primal");
     cuopt_assert(cummulative_variable_scaling_.size() == static_cast<size_t>(primal_size_h_), "");
 
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         primal_solution.data(),
         thrust::make_transform_iterator(
@@ -806,7 +806,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::unscale_solutions(
       stream_view_);
 
     if (hyper_params_.bound_objective_rescaling && !running_mip_) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(
           primal_solution.data(),
           thrust::make_transform_iterator(batch_wrapped_container(bound_rescaling_, primal_size_h_),
@@ -824,7 +824,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::unscale_solutions(
                   "Unscale dual didn't get a vector of size dual");
     cuopt_assert(cummulative_constraint_matrix_scaling_.size() == static_cast<size_t>(dual_size_h_),
                  "");
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(dual_solution.data(),
                             thrust::make_transform_iterator(
                               thrust::make_counting_iterator(0),
@@ -835,7 +835,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::unscale_solutions(
       cuda::std::multiplies<>{},
       stream_view_);
     if (hyper_params_.bound_objective_rescaling && !running_mip_) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(dual_solution.data(),
                               thrust::make_transform_iterator(
                                 batch_wrapped_container(objective_rescaling_, dual_size_h_),
@@ -851,7 +851,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::unscale_solutions(
     cuopt_expects(dual_slack.size() % static_cast<size_t>(primal_size_h_) == 0,
                   error_type_t::RuntimeError,
                   "Unscale dual didn't get a vector of size dual");
-    cub::DeviceTransform::Transform(
+    cuopt::device_transform(
       cuda::std::make_tuple(
         dual_slack.data(),
         thrust::make_transform_iterator(
@@ -862,7 +862,7 @@ void pdlp_initial_scaling_strategy_t<i_t, f_t>::unscale_solutions(
       batch_safe_div<f_t>(),
       stream_view_);
     if (hyper_params_.bound_objective_rescaling && !running_mip_) {
-      cub::DeviceTransform::Transform(
+      cuopt::device_transform(
         cuda::std::make_tuple(dual_slack.data(),
                               thrust::make_transform_iterator(
                                 batch_wrapped_container(objective_rescaling_, primal_size_h_),

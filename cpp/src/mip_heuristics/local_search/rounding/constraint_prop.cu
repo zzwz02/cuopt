@@ -675,13 +675,10 @@ constraint_prop_t<i_t, f_t>::generate_bulk_rounding_vector(
     auto unset_var_idx = host_vars_to_set[i];
     f_t first_probe, second_probe;
     // if it is a bulk rounding do
-    if (host_vars_to_set.size() > 1) {
-      cuda::std::tie(first_probe, second_probe) =
-        generate_double_probing_pair(sol, orig_sol, unset_var_idx, probing_config, true);
-    } else {
-      cuda::std::tie(first_probe, second_probe) =
-        generate_double_probing_pair(sol, orig_sol, unset_var_idx, probing_config, false);
-    }
+    auto probe_pair = generate_double_probing_pair(
+      sol, orig_sol, unset_var_idx, probing_config, host_vars_to_set.size() > 1);
+    first_probe  = probe_pair.first;
+    second_probe = probe_pair.second;
     cuopt_assert(
       test_var_out_of_bounds(orig_sol, unset_var_idx, first_probe, int_tol, sol.handle_ptr),
       "Variable out of original bounds!");

@@ -78,7 +78,7 @@ struct segmented_sum_t {
   void prepare_workspace_for_type(rmm::cuda_stream_view stream)
   {
     auto input  = thrust::make_constant_iterator(value_t{});
-    auto output = thrust::make_discard_iterator();
+    auto output = static_cast<value_t*>(nullptr);
 
     if (!medium_cone_ids.is_empty()) {
       const auto medium_begin_offsets =
@@ -103,7 +103,7 @@ struct segmented_sum_t {
       RAFT_CUDA_TRY(cub::DeviceReduce::Sum(nullptr,
                                            temp_storage_bytes,
                                            input + large_cone_offsets[i],
-                                           output + large_cone_ids[i],
+                                           output,
                                            large_cone_dimensions[i],
                                            stream.value()));
       cub_workspace_bytes = std::max(cub_workspace_bytes, temp_storage_bytes);

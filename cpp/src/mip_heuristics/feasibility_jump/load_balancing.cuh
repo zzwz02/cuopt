@@ -274,9 +274,9 @@ static DI void warp_update_move_score(const typename fj_t<i_t, f_t>::climber_dat
   f_t bonus = bonus_robust;
 
   if (subworkid == 0) {
-    auto [base_obj, bonus_breakthrough] = move_objective_score<i_t, f_t>(fj, var_idx, delta);
-    base += base_obj;
-    bonus += bonus_breakthrough;
+    auto objective_score = move_objective_score<i_t, f_t>(fj, var_idx, delta);
+    base += objective_score.first;
+    bonus += objective_score.second;
   }
 
   if (single_warp) {
@@ -297,8 +297,14 @@ __global__ void load_balancing_compute_scores_binary(
 
   i_t lane_id = threadIdx.x % raft::WarpSize;
 
-  for (auto [var_idx, subworkid, offset_begin, offset_end, csr_offset, skip] :
+  for (auto work :
        csr_load_balancer<i_t, f_t>{fj, fj.row_size_bin_prefix_sum, fj.work_id_to_bin_var_idx}) {
+    i_t var_idx       = thrust::get<0>(work);
+    i_t subworkid     = thrust::get<1>(work);
+    i_t offset_begin  = thrust::get<2>(work);
+    i_t offset_end    = thrust::get<3>(work);
+    i_t csr_offset    = thrust::get<4>(work);
+    bool skip         = thrust::get<5>(work);
     cuopt_assert(fj.pb.is_binary_variable[var_idx], "variable is not binary");
 
     if (skip) continue;
@@ -372,9 +378,13 @@ __global__ void load_balancing_mtm_compute_candidates(
 
   i_t lane_id = threadIdx.x % raft::WarpSize;
 
-  const i_t stride = get_warp_id_stride();
-  for (auto [var_idx, subworkid, offset_begin, offset_end, _, skip] : csr_load_balancer<i_t, f_t>{
+  for (auto work : csr_load_balancer<i_t, f_t>{
          fj, fj.row_size_nonbin_prefix_sum, fj.work_id_to_nonbin_var_idx}) {
+    i_t var_idx      = thrust::get<0>(work);
+    i_t subworkid    = thrust::get<1>(work);
+    i_t offset_begin = thrust::get<2>(work);
+    i_t offset_end   = thrust::get<3>(work);
+    bool skip        = thrust::get<5>(work);
     cuopt_assert(!fj.pb.is_binary_variable[var_idx], "variable is binary");
 
     if (skip) continue;
@@ -443,11 +453,13 @@ __global__ void load_balancing_mtm_compute_candidates(
 
     bool is_duplicate = false;
     // check across the warp to opportunistically eliminate duplicate candidate moves
+#ifndef CUOPT_USE_MACA_CCCL
     raft::lane_mask_t mask = __match_any_sync(raft::activemask(), delta);
     if (raft::lane_popc(mask) > 1) {
       auto mask_ffs = raft::lane_ffs(mask) - 1;
       is_duplicate  = lane_id != mask_ffs;
     }
+#endif
 
     // only store actual candidates (delta non-zero)
     if (!fj.pb.integer_equal(delta, (f_t)0) && !is_duplicate) {
@@ -475,9 +487,13 @@ __launch_bounds__(TPB_loadbalance, 16) __global__
 
   i_t lane_id = threadIdx.x % raft::WarpSize;
 
-  const i_t stride = get_warp_id_stride();
-  for (auto [var_idx, subworkid, offset_begin, offset_end, _, skip] : csr_load_balancer<i_t, f_t>{
+  for (auto work : csr_load_balancer<i_t, f_t>{
          fj, fj.row_size_nonbin_prefix_sum, fj.work_id_to_nonbin_var_idx}) {
+    i_t var_idx      = thrust::get<0>(work);
+    i_t subworkid    = thrust::get<1>(work);
+    i_t offset_begin = thrust::get<2>(work);
+    i_t offset_end   = thrust::get<3>(work);
+    bool skip        = thrust::get<5>(work);
     cuopt_assert(!fj.pb.is_binary_variable[var_idx], "variable is binary");
 
     if (skip) continue;

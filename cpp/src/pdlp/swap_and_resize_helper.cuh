@@ -47,6 +47,23 @@ struct matrix_swap_index_functor {
 };
 
 template <typename i_t, typename f_t>
+__global__ void matrix_swap_kernel(f_t* matrix,
+                                   const swap_pair_t<i_t>* pairs,
+                                   i_t vector_size,
+                                   size_t total_items)
+{
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total_items) { return; }
+  const i_t swap_idx = static_cast<i_t>(idx / static_cast<size_t>(vector_size));
+  const i_t offset   = static_cast<i_t>(idx - static_cast<size_t>(swap_idx) * vector_size);
+  const size_t left  = static_cast<size_t>(pairs[swap_idx].left) * vector_size + offset;
+  const size_t right = static_cast<size_t>(pairs[swap_idx].right) * vector_size + offset;
+  f_t tmp            = matrix[left];
+  matrix[left]       = matrix[right];
+  matrix[right]      = tmp;
+}
+
+template <typename i_t, typename f_t>
 void matrix_swap(rmm::device_uvector<f_t>& matrix,
                  i_t vector_size,
                  const thrust::universal_host_pinned_vector<swap_pair_t<i_t>>& swap_pairs)
@@ -62,28 +79,11 @@ void matrix_swap(rmm::device_uvector<f_t>& matrix,
   const size_t swap_count  = swap_pairs.size();
   const size_t total_items = swap_count * static_cast<size_t>(vector_size);
 
-  auto counting   = thrust::make_counting_iterator<size_t>(0);
-  auto left_index = thrust::make_transform_iterator(
-    counting,
-    matrix_swap_index_functor<i_t>{thrust::raw_pointer_cast(swap_pairs.data()), vector_size, true});
-  auto right_index = thrust::make_transform_iterator(
-    counting,
-    matrix_swap_index_functor<i_t>{
-      thrust::raw_pointer_cast(swap_pairs.data()), vector_size, false});
-
-  auto left_perm  = thrust::make_permutation_iterator(matrix.data(), left_index);
-  auto right_perm = thrust::make_permutation_iterator(matrix.data(), right_index);
-  auto in_zip     = thrust::make_zip_iterator(left_perm, right_perm);
-  auto out_zip    = thrust::make_zip_iterator(left_perm, right_perm);
-
-  cub::DeviceTransform::Transform(
-    in_zip,
-    out_zip,
-    total_items,
-    [] HD(thrust::tuple<f_t, f_t> values) -> thrust::tuple<f_t, f_t> {
-      return thrust::make_tuple(thrust::get<1>(values), thrust::get<0>(values));
-    },
-    matrix.stream().value());
+  constexpr int block_size = 256;
+  auto const grid_size =
+    static_cast<unsigned int>((total_items + block_size - 1) / block_size);
+  matrix_swap_kernel<i_t, f_t><<<grid_size, block_size, 0, matrix.stream().value()>>>(
+    matrix.data(), thrust::raw_pointer_cast(swap_pairs.data()), vector_size, total_items);
 }
 
 template <typename host_vector_t>
