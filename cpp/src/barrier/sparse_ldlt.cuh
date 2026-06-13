@@ -1450,6 +1450,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   ~sparse_cholesky_ldlt_t() override
   {
     if (solve_graph_valid_) { cudaGraphExecDestroy(solve_graph_); }
+    if (factor_graph_valid_) { cudaGraphExecDestroy(factor_graph_); }
     if (std::getenv("CUOPT_LDLT_STATS") != nullptr) {
       settings_.log.printf(
         "LDLT stats: factorize calls=%d total=%.2fs | solve calls=%d total=%.2fs\n",
@@ -2411,6 +2412,12 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       }
       solve_graph_valid_ = false;
       solve_graph_warm_  = false;
+      if (factor_graph_valid_) {
+        RAFT_CUDA_TRY(cudaGraphExecDestroy(factor_graph_));
+        factor_graph_ = nullptr;
+      }
+      factor_graph_valid_ = false;
+      factor_graph_warm_  = false;
       raft::copy(d_Lp_.data(), Lp_.data(), Lp_.size(), stream);
       raft::copy(d_Li_.data(), Li_.data(), Li_.size(), stream);
       raft::copy(d_rp_ptr_.data(), rp_ptr_.data(), rp_ptr_.size(), stream);
@@ -2561,12 +2568,15 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   // Numeric factorization on the device with level-scheduled kernels.
   // a_values is a device pointer holding the nnz_A_ values of the analyzed
   // matrix in its original entry order.
-  i_t factorize_values_device(const f_t* a_values)
+  // Issues the full numeric-factorization kernel sequence (no host reads):
+  // used both eagerly and under CUDA-graph capture. static_pivot_tol must be
+  // supplied (the Jacobi-scaled path has max|diag| == 1 by construction).
+  // halt checks only run when allow_halt (capture must not early-return).
+  i_t factor_kernels_device(const f_t* a_values,
+                            f_t static_pivot_tol_in,
+                            bool allow_halt,
+                            rmm::cuda_stream_view stream)
   {
-    f_t start_numeric = tic();
-    factorized_       = false;
-    auto stream       = handle_ptr_->get_stream();
-
     RAFT_CUDA_TRY(cudaMemsetAsync(d_Lx_.data(), 0, sizeof(f_t) * nnz_L_, stream));
     RAFT_CUDA_TRY(cudaMemsetAsync(d_D_.data(), 0, sizeof(f_t) * n_, stream));
     if (tail_dim_ > 0) {
@@ -2599,7 +2609,6 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     // Symmetric Jacobi scaling of the quasi-definite KKT system (M' = S M S):
     // bounds the diagonal to +-1, taming element growth of the pivot-free
     // factorization on badly ranged systems; the solve untransforms.
-    scaling_active_ = pivot_n_neg_ > 0;
     if (scaling_active_) {
       const int grid_n0 = (n_ + block_dim - 1) / block_dim;
       ldlt_detail::ldlt_compute_scale_kernel<i_t, f_t>
@@ -2617,15 +2626,18 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       }
     }
 
-    // Static pivoting threshold relative to the largest diagonal magnitude of
-    // the (permuted) input.
-    const f_t max_abs_diag = thrust::transform_reduce(rmm::exec_policy(stream),
-                                                      d_D_.data(),
-                                                      d_D_.data() + n_,
-                                                      ldlt_detail::abs_op<f_t>{},
-                                                      f_t(0),
-                                                      thrust::maximum<f_t>{});
-    const f_t static_pivot_tol = compute_static_pivot_tol(max_abs_diag);
+    // Static pivoting threshold: supplied by the caller (graph capture; the
+    // scaled system has max|diag| == 1), or computed from the assembled
+    // diagonal (host read - eager paths only).
+    const f_t static_pivot_tol =
+      static_pivot_tol_in > f_t(0)
+        ? static_pivot_tol_in
+        : compute_static_pivot_tol(thrust::transform_reduce(rmm::exec_policy(stream),
+                                                            d_D_.data(),
+                                                            d_D_.data() + n_,
+                                                            ldlt_detail::abs_op<f_t>{},
+                                                            f_t(0),
+                                                            thrust::maximum<f_t>{}));
 
     // The two-phase atomic path parallelizes the updates of long columns over
     // the whole device; it is not bitwise deterministic, so the deterministic
@@ -2662,7 +2674,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                             scaling_active_ ? d_scale_.data() : nullptr,
                                             d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
-        if ((seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
+        if (allow_halt && (seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
         continue;
       }
       if (seg.bundled == 1) {
@@ -2690,7 +2702,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                             scaling_active_ ? d_scale_.data() : nullptr,
                                             d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
-        if ((seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
+        if (allow_halt && (seg_idx & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
         continue;
       }
       for (i_t l = seg.lo; l < seg.hi; l++) {
@@ -2756,14 +2768,72 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                                  d_sign_corrections_.data());
         RAFT_CHECK_CUDA(stream);
       }
-      if ((l & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
+      if (allow_halt && (l & 63) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
       }
     }
 
     if (tail_dim_ > 0) {
-      i_t status = factor_dense_tail(stream, static_pivot_tol);
+      i_t status = factor_dense_tail(stream, static_pivot_tol, allow_halt);
       if (status != 0) { return status; }
     }
+    return 0;
+  }
+
+  i_t factorize_values_device(const f_t* a_values)
+  {
+    f_t start_numeric = tic();
+    factorized_       = false;
+    auto stream       = handle_ptr_->get_stream();
+    // Scale the quasi-definite and legacy (initial-point augmented) systems;
+    // the SPD/ADAT path keeps its exact historical arithmetic.
+    scaling_active_ = pivot_n_neg_ != 0;
+
+    // The Jacobi-scaled path has max|diag| == 1 by construction, making the
+    // static tolerance (and thus the whole kernel sequence) constant: capture
+    // it into a CUDA graph keyed on the pivot floors and the value pointer.
+    i_t status;
+    if (scaling_active_ && !use_host_numeric_) {
+      const f_t static_pivot_tol = compute_static_pivot_tol(f_t(1));
+      const bool key_match = factor_graph_valid_ && factor_graph_values_ == a_values &&
+                             factor_graph_neg_floor_ == pivot_neg_floor_ &&
+                             factor_graph_pos_floor_ == pivot_pos_floor_ &&
+                             factor_graph_n_neg_ == pivot_n_neg_;
+      if (factor_graph_valid_ && !key_match) {
+        RAFT_CUDA_TRY(cudaGraphExecDestroy(factor_graph_));
+        factor_graph_       = nullptr;
+        factor_graph_valid_ = false;
+        // keep factor_graph_warm_: library workspaces stay warm
+      }
+      if (!factor_graph_valid_) {
+        if (!factor_graph_warm_) {
+          status             = factor_kernels_device(a_values, static_pivot_tol, true, stream);
+          factor_graph_warm_ = true;
+        } else {
+          RAFT_CUDA_TRY(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+          status            = factor_kernels_device(a_values, static_pivot_tol, false, stream);
+          cudaGraph_t graph = nullptr;
+          RAFT_CUDA_TRY(cudaStreamEndCapture(stream, &graph));
+          if (status == 0) {
+            RAFT_CUDA_TRY(cudaGraphInstantiate(&factor_graph_, graph, nullptr, nullptr, 0));
+            factor_graph_valid_     = true;
+            factor_graph_values_    = a_values;
+            factor_graph_neg_floor_ = pivot_neg_floor_;
+            factor_graph_pos_floor_ = pivot_pos_floor_;
+            factor_graph_n_neg_     = pivot_n_neg_;
+            RAFT_CUDA_TRY(cudaGraphLaunch(factor_graph_, stream));
+          }
+          RAFT_CUDA_TRY(cudaGraphDestroy(graph));
+        }
+      } else {
+        RAFT_CUDA_TRY(cudaGraphLaunch(factor_graph_, stream));
+        status = 0;
+      }
+    } else {
+      // Unscaled paths: the tolerance depends on the assembled diagonal and
+      // is computed inside (negative sentinel).
+      status = factor_kernels_device(a_values, f_t(-1), true, stream);
+    }
+    if (status != 0) { return status; }
 
     i_t fail = d_fail_.value(stream);
     if (halted()) { return CONCURRENT_HALT_RETURN; }
@@ -2775,19 +2845,18 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     last_sign_corrections_ = d_sign_corrections_.value(stream);
     if (std::getenv("CUOPT_LDLT_PIVDBG") != nullptr) {
       fprintf(stderr,
-              "[ldlt] n_neg=%d static=%d signfix=%d tol=%.2e negf=%.2e posf=%.2e\n",
+              "[ldlt] n_neg=%d static=%d signfix=%d scaled=%d negf=%.2e posf=%.2e\n",
               pivot_n_neg_,
               static_pivots,
               last_sign_corrections_,
-              static_pivot_tol,
+              scaling_active_ ? 1 : 0,
               pivot_neg_floor_,
               pivot_pos_floor_);
     }
     if (static_pivots > 0) {
-      settings_.log.debug("Static pivoting perturbed %d pivots (%d sign corrections, tol %.2e)\n",
+      settings_.log.debug("Static pivoting perturbed %d pivots (%d sign corrections)\n",
                           static_pivots,
-                          last_sign_corrections_,
-                          static_pivot_tol);
+                          last_sign_corrections_);
     }
     factor_time_ += toc(start_numeric);
     n_factor_calls_++;
@@ -2806,7 +2875,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   // panels and applied as DGEMMs. The block itself is then factored with a
   // right-looking panel loop (custom diagonal/panel kernels + DGEMM trailing
   // updates).
-  i_t factor_dense_tail(rmm::cuda_stream_view stream, f_t static_pivot_tol)
+  i_t factor_dense_tail(rmm::cuda_stream_view stream, f_t static_pivot_tol, bool allow_halt)
   {
     constexpr int block_dim = ldlt_detail::factor_block_dim;
     const i_t d             = tail_dim_;
@@ -2865,7 +2934,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
                                   &one,
                                   d_dense_.data(),
                                   d));
-      if (halted()) {
+      if (allow_halt && halted()) {
         RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas, prev_mode));
         return CONCURRENT_HALT_RETURN;
       }
@@ -2932,7 +3001,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
             d_dense_.data(), d, tail_start_, p0, nb_eff, d_D_.data());
         RAFT_CHECK_CUDA(stream);
       }
-      if ((p0 / nb) % 16 == 0 && halted()) {
+      if (allow_halt && (p0 / nb) % 16 == 0 && halted()) {
         RAFT_CUBLAS_TRY(cublasSetPointerMode(cublas, prev_mode));
         return CONCURRENT_HALT_RETURN;
       }
@@ -3028,10 +3097,9 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
       if ((j & 1023) == 0 && halted()) { return CONCURRENT_HALT_RETURN; }
     }
     if (static_pivots > 0) {
-      settings_.log.debug("Static pivoting perturbed %d pivots (%d sign corrections, tol %.2e)\n",
+      settings_.log.debug("Static pivoting perturbed %d pivots (%d sign corrections)\n",
                           static_pivots,
-                          last_sign_corrections_,
-                          static_pivot_tol);
+                          last_sign_corrections_);
     }
 
     if (first_factor_) {
@@ -3323,6 +3391,15 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
   bool solve_graph_valid_{false};
   bool solve_graph_warm_{false};
   bool solve_graph_scaling_{false};
+
+  // Captured factorization sequence (see factorize_values_device).
+  cudaGraphExec_t factor_graph_{nullptr};
+  bool factor_graph_valid_{false};
+  bool factor_graph_warm_{false};
+  const f_t* factor_graph_values_{nullptr};
+  f_t factor_graph_neg_floor_{0};
+  f_t factor_graph_pos_floor_{0};
+  i_t factor_graph_n_neg_{0};
 
   // Permutation: perm_[k] = original index of the k-th pivot.
   std::vector<i_t> perm_;
