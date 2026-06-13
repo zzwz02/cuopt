@@ -12,14 +12,18 @@
 #include <dual_simplex/types.hpp>
 #include <dual_simplex/vector_math.hpp>
 
+#include <cub/cub.cuh>
 #include <thrust/execution_policy.h>
 #include <thrust/extrema.h>
 #include <thrust/fill.h>
 #include <thrust/inner_product.h>
+#include <thrust/iterator/transform_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/transform.h>
 #include <thrust/transform_reduce.h>
 
+#include <rmm/device_buffer.hpp>
+#include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <algorithm>
@@ -43,6 +47,16 @@ struct multiply_op {
 };
 
 template <typename T>
+struct abs_op {
+  __host__ __device__ T operator()(T val) const { return val < T{0} ? -val : val; }
+};
+
+template <typename T>
+struct square_op {
+  __host__ __device__ T operator()(T val) const { return val * val; }
+};
+
+template <typename T>
 struct axpy_op {
   T alpha;
   __host__ __device__ T operator()(T x, T y) const { return x + alpha * y; }
@@ -57,32 +71,59 @@ struct subtract_scaled_op {
 template <typename f_t>
 f_t vector_norm_inf(const rmm::device_uvector<f_t>& x)
 {
-  auto begin   = x.data();
-  auto end     = x.data() + x.size();
-  auto max_abs = thrust::transform_reduce(
-    rmm::exec_policy(x.stream()),
-    begin,
-    end,
-    [] __host__ __device__(f_t val) { return abs(val); },
-    static_cast<f_t>(0),
-    thrust::maximum<f_t>{});
-  RAFT_CHECK_CUDA(x.stream());
-  return max_abs;
+  if (x.size() == 0) { return f_t{0}; }
+
+  auto transformed_input = thrust::make_transform_iterator(x.data(), abs_op<f_t>{});
+  auto out               = rmm::device_scalar<f_t>(x.stream());
+  auto storage           = rmm::device_buffer(0, x.stream());
+  size_t storage_bytes   = 0;
+  RAFT_CUDA_TRY(cub::DeviceReduce::Reduce(nullptr,
+                                          storage_bytes,
+                                          transformed_input,
+                                          out.data(),
+                                          x.size(),
+                                          thrust::maximum<f_t>{},
+                                          f_t{0},
+                                          x.stream()));
+  storage.resize(storage_bytes, x.stream());
+  RAFT_CUDA_TRY(cub::DeviceReduce::Reduce(storage.data(),
+                                          storage_bytes,
+                                          transformed_input,
+                                          out.data(),
+                                          x.size(),
+                                          thrust::maximum<f_t>{},
+                                          f_t{0},
+                                          x.stream()));
+  return out.value(x.stream());
 }
 
 template <typename f_t>
 f_t vector_norm2(const rmm::device_uvector<f_t>& x)
 {
-  auto begin          = x.data();
-  auto end            = x.data() + x.size();
-  auto sum_of_squares = thrust::transform_reduce(
-    rmm::exec_policy(x.stream()),
-    begin,
-    end,
-    [] __host__ __device__(f_t val) { return val * val; },
-    f_t(0),
-    thrust::plus<f_t>{});
-  RAFT_CHECK_CUDA(x.stream());
+  if (x.size() == 0) { return f_t{0}; }
+
+  auto transformed_input = thrust::make_transform_iterator(x.data(), square_op<f_t>{});
+  auto out               = rmm::device_scalar<f_t>(x.stream());
+  auto storage           = rmm::device_buffer(0, x.stream());
+  size_t storage_bytes   = 0;
+  RAFT_CUDA_TRY(cub::DeviceReduce::Reduce(nullptr,
+                                          storage_bytes,
+                                          transformed_input,
+                                          out.data(),
+                                          x.size(),
+                                          thrust::plus<f_t>{},
+                                          f_t{0},
+                                          x.stream()));
+  storage.resize(storage_bytes, x.stream());
+  RAFT_CUDA_TRY(cub::DeviceReduce::Reduce(storage.data(),
+                                          storage_bytes,
+                                          transformed_input,
+                                          out.data(),
+                                          x.size(),
+                                          thrust::plus<f_t>{},
+                                          f_t{0},
+                                          x.stream()));
+  auto sum_of_squares = out.value(x.stream());
   return std::sqrt(sum_of_squares);
 }
 

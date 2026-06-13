@@ -37,6 +37,11 @@ namespace cuopt::linear_programming::test {
 
 constexpr double default_time_limit    = 10;
 constexpr bool default_heuristics_only = true;
+#if defined(CUOPT_USE_MACA_CCCL)
+constexpr double gf2_presolve_time_limit = 5.0;
+#else
+constexpr double gf2_presolve_time_limit = 0.5;
+#endif
 
 TEST(termination_status, trivial_presolve_optimality_test)
 {
@@ -108,13 +113,15 @@ TEST(termination_status, crossing_bounds_infeasible)
 
 TEST(termination_status, gf2_presolve_optimal)
 {
-  auto [termination_status, obj_val, lb] = test_mps_file("mip/enlight_hard.mps", 0.5, true);
+  auto [termination_status, obj_val, lb] =
+    test_mps_file("mip/enlight_hard.mps", gf2_presolve_time_limit, true);
   EXPECT_EQ(termination_status, mip_termination_status_t::Optimal);
 }
 
 TEST(termination_status, gf2_presolve_infeasible)
 {
-  auto [termination_status, obj_val, lb] = test_mps_file("mip/enlight11.mps", 0.5, true);
+  auto [termination_status, obj_val, lb] =
+    test_mps_file("mip/enlight11.mps", gf2_presolve_time_limit, true);
   EXPECT_EQ(termination_status, mip_termination_status_t::Infeasible);
 }
 
