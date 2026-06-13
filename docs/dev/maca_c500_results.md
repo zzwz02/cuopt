@@ -11,7 +11,8 @@
 > `skills/cuopt-maca-porting/SKILL.md`。
 >
 > 运行约定:所有构建/测试均 `source maca_env.sh`(含 `MACA_DIRECT_DISPATCH=1`),
-> 构建目录 `cpp/build_maca`。
+> 构建目录 `cpp/build_maca`。A100 对照 build 目录:`cpp/build_a100_cuda_cached_20260613_1617`。该目录为 CUDA/A100
+> 路径,链接本地 CUDA 而非 MACA/cu-bridge,可复用作后续 C500 vs A100 行为对照。
 
 ## 1. 功能范围矩阵(对标 cuDSS-free 基线 §3)
 
@@ -24,7 +25,7 @@
 | QP / SOCP(barrier,自研 LDLᵀ) | ✅ | ✅ | QP_UNIT 7/7、SOCP 28/28 |
 | C API(cuopt_c.h) | ✅ | ✅ | C_API_TEST 61 run / 0 fail |
 | cuopt_cli | ✅ | ✅ | LP/QP 烟测目标值精确;CLI_TEST 7/7(需 `cuopt_cli` 在 PATH:`export PATH=$PWD/cpp/build_maca:$PATH`)|
-| routing C++(VRP/PDP/breaks/异构) | ✅ | ⚠ ROUTING_UNIT 13/14 套件绿;`span<bool>` + warp 自旋锁两大根因已修;余 1 例 OOB(`test_heterogeneous_breaks`)| §4:span 花括号→圆括号(§4.0)+ warp 协作自旋锁串行化(§4.0b);余 `insert_graph_nodes_kernel` OOB(§4.0c) |
+| routing C++(VRP/PDP/breaks/异构) | ✅ | ✅ 已修复 `span<bool>`、warp 自旋锁、`test_heterogeneous_breaks` OOB | §4:span 花括号→圆括号(§4.0)+ warp 协作自旋锁串行化(§4.0b)+ cycle-finder 重构竞态(§4.0c) |
 | 距离引擎(C++ waypoint) | ✅ | ✅ | WAYPOINT_MATRIXTEST 6/6 |
 | examples(cvrp/pdptw/service) | ✅ | ⏳ 待建/待测 | — |
 | Python LP/MILP/QP/SOCP(numpy) | ✅ | ⏳ 待建/待测 | Cython 扩展未构建 |
@@ -52,9 +53,12 @@
   改动 6 文件:`cuda_helpers.cuh`(新增 `with_lock`/`with_lock_block`)、
   `vrp_move_candidates.cuh`、`move_candidates.cuh`、`prize_collection.cu`、
   `perform_moves.cu`(in-branch 释放);`device_map.cuh`(warp 内 lane 串行化)。
-- 验证:`ROUTING_UNIT_TEST` **13/14 套件绿**(§4 结果表);整个 `vehicle_breaks`
-  套件 6/6 通过(含 `uniform_breaks`)。余 1 例 `test_heterogeneous_breaks` 为独立
-  OOB(§4.0c,待办)。
+- **修复 3**:`heterogenous_breaks.test_heterogeneous_breaks` 的
+  `insert_graph_nodes_kernel` OOB = cycle-finder 重构 predecessor 链时同一 kernel
+  内多线程读写同一个 `d_best.key_ptr[0]`,偶发拼出不存在的图边;已改为对目标 key 做
+  本地快照后再写回(§4.0c)。
+- 验证:`vehicle_breaks` 6/6 通过(含 `uniform_breaks`);`heterogenous_breaks`
+  2/2 通过;`test_heterogeneous_breaks --gtest_repeat=10` 通过。
 
 ## 4. routing C++ 调查
 
@@ -136,20 +140,43 @@ kernel 内每个 while 自旋加「越界即 printf 并 break」的计数器,触
 (对照:此前 span 修复前为 5 passed / 105 failed 的级联崩溃;自旋锁修复前 `vehicle_breaks`
 等多套件挂死。)
 
-### 4.0c 遗留:`heterogenous_breaks.test_heterogeneous_breaks` 在 `insert_graph_nodes_kernel` OOB
+### 4.0c 已修复:`heterogenous_breaks.test_heterogeneous_breaks` 在 `insert_graph_nodes_kernel` OOB
 
-自旋锁修复后该用例不再挂死,但**暴露出一个此前被死锁掩盖的独立越界**(非回归——
-我的改动只动锁,且其余 13 套件全绿;此 OOB 一直存在,只是之前 cycle-finder 死锁使其
-不可达)。
-- 性质:`Memory Violation(0x4)` 陷阱(非死锁),`~/mxlog/umd/trapInfo.*` 给出元凶内核
-  `cuopt::routing::detail::insert_graph_nodes_kernel<int,float,request_t(1)>`
-  ——cycle-finder 找到负环后据 move-path 落子的内核。
-- 线索:`move_candidates.cuh::reset()` 注释已提示该内核的已知风险——「弹出 depot 的
-  环 → `insert_graph_nodes_kernel` 解引用 NULL `n_nodes`」。疑为异构(non-uniform
-  break)下 cycle-finder 产出的环含非法节点 → 落子时越界。属与 span/AtY 同类的
-  「NVIDIA 良性、C500 触发 ATU」数据类问题。
-- 下一步:trap-log 已定位内核;用 printf 注入 + `-DASSERT_MODE` 收窄 OOB 的具体索引;
-  与 A100 对拍 cycle-finder 在该用例的环输出。
+自旋锁修复后该用例不再挂死,但暴露出一个此前被死锁掩盖的独立越界。元凶内核为
+`cuopt::routing::detail::insert_graph_nodes_kernel<int,float,request_t(1)>`;触发条件是
+cycle-finder 偶发重构出一条包含**不存在图边**的坏环,随后 `populate_move_path` 如实把坏边
+转成 move-path,最终在插入阶段越界。
+
+**命中的具体坏环/越界下标**(一次 C500 suspect dump):
+- `cycle id=0 size=5 nodes 102(r2) 97(r5) 96(r5) 0(r9) 120(r20)`。
+- 其中 `96(r5)->97(r5)` 在 graph 中不存在:
+  `graph_cost=1.79769e+308`,candidate 也是 max,
+  `cand_ins=(8,8,32767,32767)`。
+- 该边生成 `path block=6 request=96 ejected=97 target_route=5 target_n_after_eject=7 insert=8 PRE_BAD`。
+  `insert_graph_nodes_kernel` 弹出 97 后 route 5 只有 7 个节点,却试图以 `insert=8`
+  插入 96;若不拦截,VRP `insert_node` 的右移循环从 `i=7` 继续向下找 `insertion_idx=8`,
+  会读写越界。
+
+**根因**:cycle-finder 的 `extend_cycle` 并行扫描 `d_valid_paths` 时,每个线程都直接用
+同一个可变的 `d_best.key_ptr[0]` 做匹配并在命中后立即改写它。同一 kernel 内其他线程
+可能看到已经被改过的 key,在同一个 level 继续匹配另一条 entry,把 predecessor 链串错,
+从而重构出 graph 中不存在的边(例如同一路线 `96(r5)->97(r5)`)。
+
+**修复**:`extend_cycle` 先把本轮要查找的 key 读到线程本地 `target_key`;所有线程只和
+这个稳定快照比较。命中后基于快照构造 `next_key` 并写回 `d_best.key_ptr[0]`,避免同一轮
+扫描 cascading match 到下一段 predecessor。
+
+**验证**:
+- C500:`ROUTING_UNIT_TEST --gtest_filter=heterogenous_breaks.test_heterogeneous_breaks --gtest_repeat=10`
+  10/10 通过,无 `Memory Violation`。
+- C500:`ROUTING_UNIT_TEST --gtest_filter=heterogenous_breaks.*` 2/2 通过。
+- A100 CUDA build:`compute-sanitizer --tool memcheck` 连跑 3 轮
+  `heterogenous_breaks.test_heterogeneous_breaks`,均 `ERROR SUMMARY: 0 errors`。
+- A100 对照 build 目录:`cpp/build_a100_cuda_cached_20260613_1617`。该目录为 CUDA/A100
+  路径,链接本地 CUDA 而非 MACA/cu-bridge,可复用作后续 C500 vs A100 sanitizer/行为对照。
+- A100 原始 `extend_cycle` 对照:临时恢复旧实现并在同一对照目录重编,memcheck 连跑 5 轮
+  未报错(`ERROR SUMMARY: 0 errors`)。这说明该坏环在 A100 调度下未复现;sanitizer 只能
+  捕获实际发生的内存越界,不会报告未触发的 cycle 重构逻辑竞态。
 
 ### 4.1 调查过程记录
 

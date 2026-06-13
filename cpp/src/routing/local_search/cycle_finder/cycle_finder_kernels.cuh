@@ -95,17 +95,20 @@ __global__ void extend_cycle(
   int curr_cycle_size)
 {
   ret.curr_cycle_size = curr_cycle_size;
+  const auto target_key = d_best.key_ptr[0];
   for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < d_valid_paths.max_available;
        i += blockDim.x * gridDim.x) {
-    if (d_valid_paths.keys[i] == d_best.key_ptr[0]) {
+    if (d_valid_paths.keys[i] == target_key) {
       // acquire
-      auto route_id = graph.route_ids[d_best.key_ptr[0].head];
+      auto route_id = graph.route_ids[target_key.head];
       // Set las bit to false "cutting the head"
-      d_best.key_ptr[0].label.set(route_id, false);
+      auto next_key = target_key;
+      next_key.label.set(route_id, false);
       // Set new head
       auto pred              = d_valid_paths.predecessors[i];
-      d_best.key_ptr[0].head = pred;
-      ret.push_back(d_best.key_ptr[0].head);
+      next_key.head          = pred;
+      d_best.key_ptr[0]      = next_key;
+      ret.push_back(pred);
     }
   }
 }

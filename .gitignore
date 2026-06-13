@@ -82,3 +82,4 @@ cpp/build2/
 cpp/build3/
 cpp/build_maca/
 .maca_cu_bridge/
+cpp/build_a100_*
