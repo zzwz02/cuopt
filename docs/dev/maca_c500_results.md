@@ -24,7 +24,7 @@
 | QP / SOCP(barrier,自研 LDLᵀ) | ✅ | ✅ | QP_UNIT 7/7、SOCP 28/28 |
 | C API(cuopt_c.h) | ✅ | ✅ | C_API_TEST 61 run / 0 fail |
 | cuopt_cli | ✅ | ✅ | LP/QP 烟测目标值精确;CLI_TEST 7/7(需 `cuopt_cli` 在 PATH:`export PATH=$PWD/cpp/build_maca:$PATH`)|
-| routing C++(VRP/PDP/breaks/异构) | ✅ | ⚠ 部分(GES 路径阻塞) | ROUTING_UNIT 5/110:`find_all_squeeze_pos` 内核 warp64 全局越界(Xnack/ATU),拖垮 GES 相关用例(详见 §4) |
+| routing C++(VRP/PDP/breaks/异构) | ✅ | ⚠ ATU 根因已修(`span<bool const>` 花括号),uniform_breaks 仍挂起 | §4:`span.hpp` 花括号→圆括号修复 order_match 野指针;含最小复现 |
 | 距离引擎(C++ waypoint) | ✅ | ✅ | WAYPOINT_MATRIXTEST 6/6 |
 | examples(cvrp/pdptw/service) | ✅ | ⏳ 待建/待测 | — |
 | Python LP/MILP/QP/SOCP(numpy) | ✅ | ⏳ 待建/待测 | Cython 扩展未构建 |
@@ -46,7 +46,35 @@
   DUAL_SIMPLEX(30)· SOCP(28)。
 - 关键运行依赖:`MACA_DIRECT_DISPATCH=1`(已写入 maca_env.sh)。
 
-## 4. routing C++ 调查(进行中)
+## 4. routing C++ 调查
+
+### 4.0 根因已定位并修复:`span<bool const>` 花括号初始化在 MACA CCCL 上构造出垃圾 span
+
+**根因**:vendored `raft::span`(`cpp/vendor/include/raft/core/span.hpp`)用花括号
+初始化其 `cuda::std::span<T> base_`:`base_{ptr, count}`。对 `T = bool const`
+这是**收窄列表初始化**(`bool const*` → `bool`)。新 CCCL/CUDA 在编译期直接报错;
+**老 MACA CCCL 编译通过但构造出垃圾 span(指针/长度错乱)**。cuOpt 的每车
+`order_match` 恰为 `raft::span<bool const>`,故 C500 上其 `.data()` 变成野指针
+(实测 `0x7ffc…`,size=2),被 MISMATCH 维度 `order_match[l1.node()]` 在 device
+解引用 → Xnack/ATU 陷阱 → `find_all_squeeze_pos` 触发、级联拖垮整个 ROUTING_UNIT。
+
+**与 warp64 无关**(之前的猜测错误);本质同 AtY 类——NVIDIA 老 CUDA 12.1 恰好
+编译为正确构造,12.9 编译期报错,MACA CCCL 静默编错。
+
+**最小复现**(`docs/dev/maca_span_bool_repro.cu`,A100 与 C500 对拍):
+
+| | C500(MACA CCCL) | A100(CUDA 12.9) |
+|---|---|---|
+| `span<bool const>{ptr,count}`(花括号) | **编译过、运行垃圾**:`data=0x2000000000004, size=2` | **编译报错** `narrowing const __nv_bool*→__nv_bool` |
+| `span<bool const>(ptr,count)`(圆括号,本修复) | ✅ 正确 | ✅ 正确 |
+| `span<int const>` / `span<bool>` | ✅(仅 `bool const` 出错) | ✅ |
+
+**修复**:`span.hpp` 中把 `base_{...}` 改为圆括号 `base_(...)`(direct-init,强制
+走 `(ptr,count)` 构造),对所有 span 正确。修复后 `vehicle_time_windows` 等通过、
+ATU 陷阱消失。**遗留**:`vehicle_breaks.uniform_breaks` 仍挂起(GPU 46%、无陷阱),
+为独立问题,待后续。
+
+### 4.1 调查过程记录
 
 - **距离引擎 WAYPOINT_MATRIXTEST:6/6 通过。**
 - **ROUTING_UNIT_TEST:5 passed / 105 failed**,但绝大多数为**级联**:一旦
@@ -64,9 +92,22 @@
   上 WarpSize=64 → TPB 总为 64/128(NVIDIA 为 32 的倍数)。但单纯的
   `global[threadIdx.x]` 越界在 NVIDIA(TPB≥32)亦会触发,而 NVIDIA routing
   43/43 全过,故应为 warp64 特有(每-warp 结构 / 共享尺寸 / 约简)路径。
-- **工具**:`mcSanitizer` 在本容器不可用(`inotify_add_watch` on
-  `/root/mcRpcPort.ini` 失败后挂起);已对 `squeeze.cu` 加 `--generate-line-info`
-  重编以备 PC→行号映射。根因定位与修复进行中(并行代码分析 + 复现)。
+- **崩溃点精定位**(printf 注入 + `~/mxlog/umd` trap 日志逐步收窄):陷阱发生在
+  `node_t::total_excess_of_combine`(`cpp/src/routing/node/node.cuh:154` 的
+  `get_transit_time` 或 `:164` 的 `get_arc_of_dimension`)——即 squeeze 插入
+  评估中 `combine(node, current, vehicle_info,…)` 读取全局 transit/arc 矩阵。
+  现场:`num_nodes=1, blockDim=64, max_nodes_per_route=64, vehicle_id=12,
+  num_breaks=1`(带 break 维度)。`current=get_node(node_insertion_idx+1)` 读到
+  +1(回程 depot)槽;`copy_from` 确实复制了 `[0,n_nodes+1)`(含 +1 槽),故非
+  「共享未初始化」。**已排除**:MISMATCH 维度 `order_match[l1.node()]` 越界(注入
+  打印 `l1.node=0,size=2`,在界内);共享 route 尺寸 +1 失配(调用方以
+  `max_route_size+added_size` 预留,已补偿)。**仍待定**:`combine` 读全局矩阵
+  所用某节点索引在 C500 为野值(疑与 AtY 同类——NVIDIA 良性、C500 触发 ATU)。
+- **工具**:`mcSanitizer` 本容器不可用(`inotify_add_watch` on
+  `/root/mcRpcPort.ini` 失败后挂起,无源码行);`-DASSERT_MODE` 重编亦未命中
+  (越界访问无前置 `cuopt_assert`)。**有效手段**:`~/mxlog/umd/trapInfo.*.log`
+  直接给出陷阱 kernel 名(demangle → `find_all_squeeze_pos`);printf 注入逐步
+  收窄到 combine。最终定位与修复留待后续专项(需可用的逐行 sanitizer)。
 
 ## 5. 性能基准(C500 vs A100 基线)
 

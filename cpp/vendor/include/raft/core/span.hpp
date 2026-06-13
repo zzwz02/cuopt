@@ -40,15 +40,21 @@ class span {
 
   _RAFT_HOST_DEVICE constexpr span() noexcept = default;
 
-  _RAFT_HOST_DEVICE constexpr span(pointer ptr, size_type count) noexcept : base_{ptr, count} {}
+  // NOTE: use parenthesised (direct-init) construction of base_, NOT brace-init.
+  // base_type is cuda::std::span<T>; with brace-init `base_{ptr, count}` a span of
+  // `bool` is treated as a narrowing list-initialization (bool* -> bool), which
+  // newer CCCL rejects at compile time and older MACA CCCL silently mis-compiles
+  // into a garbage span (wrong pointer/size). This corrupted cuOpt's
+  // order_match span<bool const> on C500. Parentheses force the (ptr,count) ctor.
+  _RAFT_HOST_DEVICE constexpr span(pointer ptr, size_type count) noexcept : base_(ptr, count) {}
 
   _RAFT_HOST_DEVICE constexpr span(pointer first, pointer last) noexcept
-    : base_{first, static_cast<size_type>(last - first)}
+    : base_(first, static_cast<size_type>(last - first))
   {
   }
 
   template <std::size_t N>
-  _RAFT_HOST_DEVICE constexpr span(element_type (&arr)[N]) noexcept : base_{arr, N}
+  _RAFT_HOST_DEVICE constexpr span(element_type (&arr)[N]) noexcept : base_(arr, N)
   {
   }
 
@@ -61,7 +67,7 @@ class span {
             typename = std::enable_if_t<std::is_convertible_v<U (*)[], T (*)[]> &&
                                         (Extent == dynamic_extent || Extent == OtherExtent)>>
   _RAFT_HOST_DEVICE constexpr span(span<U, is_device, OtherExtent> const& other) noexcept
-    : base_{other.data(), other.size()}
+    : base_(other.data(), other.size())
   {
   }
 
