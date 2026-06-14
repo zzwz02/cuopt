@@ -16,6 +16,7 @@
 #include <utilities/copy_helpers.hpp>
 
 #include <cuda_runtime_api.h>
+#include <cub/cub.cuh>
 #include <thrust/count.h>
 #include <thrust/functional.h>
 #include <thrust/gather.h>
@@ -363,40 +364,47 @@ static void csrsort_cusparse(rmm::device_uvector<f_t>& values,
   if (values.size() == 0) { return; }
 
   auto stream = offsets.stream();
-  cusparseHandle_t handle;
-  cusparseCreate(&handle);
-  cusparseSetStream(handle, stream);
+  i_t nnz     = values.size();
 
-  i_t nnz = values.size();
-  i_t m   = rows;
-  i_t n   = cols;
-
-  cusparseMatDescr_t matA;
-  cusparseCreateMatDescr(&matA);
-  cusparseSetMatIndexBase(matA, CUSPARSE_INDEX_BASE_ZERO);
-  cusparseSetMatType(matA, CUSPARSE_MATRIX_TYPE_GENERAL);
-
-  size_t pBufferSizeInBytes = 0;
-  check_cusparse_status(cusparseXcsrsort_bufferSizeExt(
-    handle, m, n, nnz, offsets.data(), indices.data(), &pBufferSizeInBytes));
-  rmm::device_uvector<uint8_t> pBuffer(pBufferSizeInBytes, stream);
-  cuopt_assert(((intptr_t)pBuffer.data() % 128) == 0,
-               "CUSPARSE buffer size is not aligned to 128 bytes");
-  rmm::device_uvector<i_t> P(nnz, stream);
-  thrust::sequence(handle_ptr->get_thrust_policy(), P.begin(), P.end());
-
-  check_cusparse_status(cusparseXcsrsort(
-    handle, m, n, nnz, matA, offsets.data(), indices.data(), P.data(), pBuffer.data()));
-
-  // apply the permutation to the values
+  // C500: the previous implementation used cusparseXcsrsort (mcsparse). Its *internal*
+  // onesweep radix sort / permutation-gather kernels race on C500 under async execution --
+  // a standalone replay of the exact dumped inputs is fault-free and MACA_LAUNCH_BLOCKING=3
+  // makes the whole solver pass, but in a normal async repeated in-process solve the
+  // mcsparse-internal kernels intermittently trap (Xnack/ATU). Sort the column indices
+  // within each row with CUB segmented sort instead -- the same primitive that
+  // csr_to_csc_transpose already uses successfully on C500 -- reordering the matrix values,
+  // then sync before the work buffers are freed.
+  rmm::device_uvector<i_t> indices_sorted(nnz, stream);
   rmm::device_uvector<f_t> values_sorted(nnz, stream);
-  thrust::gather(
-    handle_ptr->get_thrust_policy(), P.begin(), P.end(), values.begin(), values_sorted.begin());
-  thrust::copy(
-    handle_ptr->get_thrust_policy(), values_sorted.begin(), values_sorted.end(), values.begin());
 
-  cusparseDestroyMatDescr(matA);
-  cusparseDestroy(handle);
+  size_t temp_storage_bytes = 0;
+  cub::DeviceSegmentedSort::SortPairs(nullptr,
+                                      temp_storage_bytes,
+                                      indices.data(),
+                                      indices_sorted.data(),
+                                      values.data(),
+                                      values_sorted.data(),
+                                      nnz,
+                                      rows,
+                                      offsets.data(),
+                                      offsets.data() + 1,
+                                      stream);
+  rmm::device_uvector<std::byte> temp_storage(temp_storage_bytes, stream);
+  cub::DeviceSegmentedSort::SortPairs(temp_storage.data(),
+                                      temp_storage_bytes,
+                                      indices.data(),
+                                      indices_sorted.data(),
+                                      values.data(),
+                                      values_sorted.data(),
+                                      nnz,
+                                      rows,
+                                      offsets.data(),
+                                      offsets.data() + 1,
+                                      stream);
+
+  raft::copy(indices.data(), indices_sorted.data(), nnz, stream);
+  raft::copy(values.data(), values_sorted.data(), nnz, stream);
+  RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
 
   check_csr_representation(values, offsets, indices, handle_ptr, cols, rows);
 }

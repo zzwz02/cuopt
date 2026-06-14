@@ -27,7 +27,7 @@
 | routing C++(VRP/PDP/breaks/异构) | ✅ | ✅ 已修复 `span<bool>`、warp 自旋锁、`test_heterogeneous_breaks` OOB | §4:span 花括号→圆括号(§4.0)+ warp 协作自旋锁串行化(§4.0b)+ cycle-finder 重构竞态(§4.0c) |
 | 距离引擎(C++ waypoint) | ✅ | ✅ | WAYPOINT_MATRIXTEST 6/6 |
 | examples(cvrp/pdptw/service) | ✅ | ✅ service/pdptw 通过(修过时示例数据);cvrp degraded-Success | §4.2:service 唯一 break 点 + pdptw 每车型 cost matrix;cvrp 私有内存 20KB>16KB(降级) |
-| Python LP/MILP/QP/SOCP(numpy) | ✅ | ⏳ 待建/待测 | Cython 扩展未构建 |
+| Python LP/MILP/QP/SOCP(numpy) | ✅ | ⚠ 多次求解 fault 已修(csrsort→CUB);崩溃级联消除、多数用例通过;余 warm-start 路径挂起(open)| §4.3:cusparseXcsrsort 内部 mcsparse kernel C500 async 竞态 → 换 CUB DeviceSegmentedSort |
 | Python routing+distance(cudf) | ✅ | ⏸ 暂缓 | — |
 | REST server / gRPC / self-hosted | ✅ | ⏸ 暂缓 | — |
 | 性能基准(LP/QP/routing) | ✅(§5) | ✅ LP+QP(routing 暂缓) | LP §5.1(多数 1–2×,scpm1 14×);QP §5.2(目标值逐位一致) |
@@ -247,6 +247,30 @@ C500 无关的过时示例数据**(主机端校验,A100 用当前 26.06 同样�
 
 结论:examples 的 service/pdptw 失败为过时示例数据(非移植问题),已修并 commit;cvrp 记录为 C500 私有内存
 限制(待系统侧 `pri_mem_sz` 或内核侧 local 内存削减的后续专项)。
+
+### 4.3 Python LP/MILP/QP/SOCP(numpy,RAPIDS-free):已修复同进程多次求解 fault(csrsort → CUB 段排序)
+
+- **构建路径(无需改脚本)**:`LIBCUOPT_DIR=cpp/build_maca CCCL=cpp/build/_deps/cccl-src CUDA_HOME=/usr/local/cuda`
+  下 `bash python/cuopt/build_lp_modules_rapids_free.sh`(conda py3.10)即把 8 个 LP/routing/distance Cython 模块
+  链接到 MACA libcuopt。`import cuopt.linear_programming` 在 C500 通过(需 `pip install python-dateutil`)。
+- **症状(已修复)**:同一进程**重复 LP 求解**时,`compute_transpose_of_problem`→`csrsort_cusparse` 里的
+  `cusparseXcsrsort`(mcsparse)内部 kernel(onesweep 基数排序 / 置换 gather `mcspGthrKernel`)偶发 **Xnack/ATU Fault**;
+  一旦 fault MACA 运行时被禁用 → 整套 60 用例约 21 通过后级联崩溃。
+- **根因定位 = `cusparseXcsrsort` 的 mcsparse 内部 kernel 在 C500 async 下竞态**(逐步排除):
+  - `MACA_LAUNCH_BLOCKING=3`(串行化所有 kernel)→ 重复求解**全 Optimal、无 fault** ⇒ 是**竞态**,非确定性坏数据/坏 kernel。
+  - dump `csrsort_cusparse` 的真实 `m/n/offsets/indices`(合法:offsets 单调、`off[-1]==nnz`、indices 在 `[0,n)`),
+    喂独立 `cusparseXcsrsort` 连跑 5 次(`docs/dev/mccub_csrsort_repro.cu`)→ **全对** ⇒ 排除输入数据 / 重复 csrsort 本身。
+  - 关 CUDA graph(`manual_cuda_graph_t` 改 eager)fault **未消失**(只移到 `mcspGthrKernel`)⇒ 排除 CUDA graph;
+    单方法 PDLP(非 concurrent)同样 fault ⇒ 排除并发;A100 initcheck 仅报无关 `combined_bounds`(重算未消除)⇒ 排除 cuopt buffer。
+    裸 mccub `SortPairs`(`docs/dev/mccub_onesweep_repro.cu`)独立无 fault ⇒ 问题在 **mcsparse 对 mccub 的内部驱动**。
+- **修复**:`csrsort_cusparse`(`problem_helpers.cuh`)弃用 `cusparseXcsrsort`,改用 **CUB `DeviceSegmentedSort::SortPairs`**
+  按行段对列索引排序、重排 values(与 `csr_to_csc_transpose` 同一 C500-可用原语),末尾 `cudaStreamSynchronize`。
+  **验证**:`a2864.mps` 连求 3 次(concurrent 与 单方法 PDLP)**全 Optimal、无 fault**(normal async,无需 LAUNCH_BLOCKING);
+  整套 LP 用例的**崩溃级联消除**、多数原失败用例转通过。
+- **余项(独立、较小,open)**:`test_warm_start`(及另 ≥1 例)在 warm-start / 重复求解路径**原生挂起**(非崩溃,`test_lp_solver.py:635`);
+  `test_parse_var_names` 为目标值期望不符(`80.006 vs inf`)。与本 fault 无关,待后续专项。
+- **通用诊断手法**:`MACA_LAUNCH_BLOCKING=3` 精确定位 faulting kernel 并区分"竞态 vs 确定性";dump kernel 真实输入喂
+  独立程序复现以区分"输入坏 vs 上下文/竞态";二分关闭 graph / 并发缩小范围。**已写入 c500 skill。**
 
 ## 5. 性能基准(C500 vs A100 基线)
 
