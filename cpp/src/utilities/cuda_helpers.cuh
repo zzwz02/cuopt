@@ -268,6 +268,26 @@ inline bool set_shmem_of_kernel(Function* function, size_t dynamic_request_size)
     std::unique_lock<std::shared_mutex> wlock(mtx);
     size_t current_size = shmem_sizes.count(function) ? shmem_sizes[function] : 0;
     if (dynamic_request_size > current_size) {
+      // The device caps the *total* (static + dynamic) shared memory per block. cudaFuncSetAttribute
+      // only governs the dynamic part, so on hardware with a hard total cap (MetaX C500: 64KB) a
+      // dynamic request that fits on its own can still push static+dynamic over the cap, and the
+      // *launch* then fails with cudaErrorInvalidValue -- which several call sites do not check,
+      // turning into a hard crash (e.g. find_all_squeeze_pos). Account for the kernel's static
+      // shared so we report "won't fit" here (callers fall back / skip / raise OOM) instead.
+      static const int max_optin = [] {
+        int v = 0;
+        cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        return v;
+      }();
+      cudaFuncAttributes fattr{};
+      if (cudaFuncGetAttributes(&fattr, function) != cudaSuccess) {
+        cudaGetLastError();  // clear sticky error; fall through with static=0
+      }
+      if (max_optin > 0 &&
+          dynamic_request_size + static_cast<size_t>(fattr.sharedSizeBytes) >
+            static_cast<size_t>(max_optin)) {
+        return false;
+      }
       auto err = cudaFuncSetAttribute(
         function, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_request_size);
       if (err == cudaSuccess) {

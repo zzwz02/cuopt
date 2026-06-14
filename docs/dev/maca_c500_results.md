@@ -300,6 +300,12 @@ C500 无关的过时示例数据**(主机端校验,A100 用当前 26.06 同样�
   - 真因(gdb 采样命中):挂起在 `mcStreamSynchronize`←`local_search_t::populate_cross_moves`,GPU util ~3%(宿主侧等核不返回)。逐核夹逼(两核间插同步打印)定位到 **`populate_cross_list_kernel` 第 19 次(re-routing 把问题逐轮做大)在自身同步处挂死**。根因:该核 `route_pair_locks[first_route*n+second_route]` 用裸 `acquire_lock`/`release_lock`——虽**同 block 内每 lane 锁互不相同**,但 grid=`num_orders-1` 个 block 共享同一 `first_route`,**跨 block 争用同一锁**;C500 lock-step warp 下,赢得 CAS 的 lane 可能被停在 acquire 之后、而同 warp 兄弟 lane 仍在自旋别 block 持有的锁 → 赢家永不到 `release_lock` → 持锁不放 → 等该锁的 block 全死锁。问题随 block 数增长才触发(小输入正常,做大后某轮挂死)。
   - **修复**:`populate_cross_list_kernel` 的该锁改用 **`with_lock`**(临界区+释放放进中标 CAS 分支内,赢家在回边前已释放),与 12 行上方早已修好的 `with_lock_block`(line 301)同法——此处当初因"每 lane 锁不同看似安全"被漏掉。验证:`test_re_routing` 连跑 **11/11 通过**(原前挂起)、pytest **1 passed**,全 routing 套件**无回归**。
   - 旁注:64KB 共享内存上限(罕见、非致命)未单独处理;锁修好后测试稳定通过,该降级不触发挂起。
+- **64KB 共享内存硬上限加固(`set_shmem_of_kernel` 计入静态 shared,已修)**:C500 限的是**静态+动态**总量 64KB;`set_shmem_of_kernel` 原只校验动态部分,
+  故带静态 `__shared__` 的核可"动态≤64KB 通过校验"却"静态+动态>64KB 启动失败"→ 后续 `RAFT_CHECK_CUDA` 抛 `cudaErrorInvalidValue` **崩溃**。
+  实测:**单路由 ~1000+ 节点**(如大单巡回 TSP 或 1 车松约束)时 `find_all_squeeze_pos` 请求 64548B 动态+1028B 静态=65576>65536 → 崩(此即 skill 记录的 squeeze C500 故障)。
+  修复:`set_shmem_of_kernel` 查 `cudaFuncGetAttributes().sharedSizeBytes` 与 `cudaDevAttrMaxSharedMemoryPerBlockOptin`,静态+动态超限即返回 false → 调用方干净跳过/抛 OOM,不再崩。
+  **正确性**:Fix 后超限核**绝不带不足内存启动**,故**无静默错算**;结果只会是"有效(可能次优)解 + SUCCESS"或"明确标记的 ERROR/INFEASIBLE 空解"(需查 `get_status()`),不会是错而标 SUCCESS。阈值实测:单路由 min-dims ~800 通过 / 1000 起降级,rich-dims ~600 通过 / 1400 降级——**普通多车 VRP 路由短(几十站)永不触发**。
+  **决策(用户)**:停在此(防崩+优雅降级);不做全量 global-memory temp-route 回退(涉 16 文件/48 launch,仅惠 1000+ 单路由极端情形,性价比低)。提交 `6039310f`。
 
 ## 5. 性能基准(C500 vs A100 基线)
 
