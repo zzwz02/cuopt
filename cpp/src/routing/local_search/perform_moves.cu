@@ -309,10 +309,16 @@ __global__ void populate_cross_list_kernel(
   for (i_t second_route = threadIdx.x; second_route < sol.n_routes; second_route += blockDim.x) {
     const i_t route_pair_idx  = first_route * sol.n_routes + second_route;
     const auto best_per_route = best_values_per_route[second_route];
-    // acquire the critical section for this route pair
-    acquire_lock(&scross_cands.route_pair_locks[route_pair_idx]);
-    scross_cands.insert_best_scross_candidate(route_pair_idx, best_per_route);
-    release_lock(&scross_cands.route_pair_locks[route_pair_idx]);
+    // with_lock (not acquire_lock/release_lock): route_pair_idx is distinct per lane within a
+    // block, but many blocks share the same first_route, so they contend cross-block for the
+    // same route_pair locks. On lock-step SIMT without ITS (C500/warp64), the blocking
+    // acquire_lock idiom can park the lanes that won their CAS at the post-acquire point while a
+    // sibling lane spins on a contended lock, so the winners never reach release_lock -> the warp
+    // (and any block waiting on the held locks) deadlocks. with_lock does the critical section and
+    // releases inside the winning-CAS branch, so a holder never waits on a spinning same-warp lane.
+    with_lock(&scross_cands.route_pair_locks[route_pair_idx], [&] __device__() {
+      scross_cands.insert_best_scross_candidate(route_pair_idx, best_per_route);
+    });
   }
 }
 

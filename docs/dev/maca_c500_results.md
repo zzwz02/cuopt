@@ -28,7 +28,7 @@
 | 距离引擎(C++ waypoint) | ✅ | ✅ | WAYPOINT_MATRIXTEST 6/6 |
 | examples(cvrp/pdptw/service) | ✅ | ✅ service/pdptw 通过(修过时示例数据);cvrp degraded-Success | §4.2:service 唯一 break 点 + pdptw 每车型 cost matrix;cvrp 私有内存 20KB>16KB(降级) |
 | Python LP/MILP/QP/SOCP(numpy) | ✅ | ✅ | §4.3:`tests/linear_programming` 51 passed / 9 skip / 0 fail。两处根因均修:① 多次求解 fault(csrsort→CUB 段排序);② RAPIDS-free 模块经 cu-bridge(`pre_make nvcc`)编译,`cudaMemcpy` 改走 MACA 运行时,消除 `get_vars` inf 与 warm-start 挂起 |
-| Python routing+distance(cudf) | ✅ | ⏸ 暂缓 | — |
+| Python routing+distance(cudf) | ✅ | ✅ | §4.4:mcdf(cudf/rmm/cupy/numba)装好;routing **38 passed**、distance 8/8、烟测最优;修复 `test_re_routing` 在 C500 的 cross-move 自旋锁跨 block 死锁(`populate_cross_list_kernel` 改 `with_lock`);余 1 例 numpy 版本误报(非 MACA) |
 | REST server / gRPC / self-hosted | ✅ | ⏸ 暂缓 | — |
 | 性能基准(LP/QP/routing) | ✅(§5) | ✅ LP+QP(routing 暂缓) | LP §5.1(多数 1–2×,scpm1 14×);QP §5.2(目标值逐位一致) |
 
@@ -280,6 +280,26 @@ C500 无关的过时示例数据**(主机端校验,A100 用当前 26.06 同样�
   `tests/linear_programming` **51 passed / 9 skip / 0 fail**,含原挂起的 `test_warm_start`(两处)与全部 `get_primal_solution` 路径,`inf` 消除。
 - **通用诊断手法**:`MACA_LAUNCH_BLOCKING=3` 精确定位 faulting kernel 并区分"竞态 vs 确定性";dump kernel 真实输入喂
   独立程序复现以区分"输入坏 vs 上下文/竞态";二分关闭 graph / 并发缩小范围。**已写入 c500 skill。**
+
+### 4.4 Python routing + distance(cudf/mcdf):mcdf 装好,routing 38 通过 / distance 8/8(含修复 `test_re_routing` cross-move 自旋锁死锁)
+
+- **mcdf 安装(C500 的 cudf/rmm/cupy/numba)**:`/home/maca-mcdf-3.7.0.3-linux-x86_64.tar.xz` 提供 cp310 wheel——
+  `mcdf`(import 名 `cudf`)、`mcpy`(`cupy`/`cupyx`)、`rmmx`(`rmmx`)、`numbax`(`numbax`)。装法(conda py3.10):
+  1. `pip install --no-deps` 这 4 个 wheel(避免拖入 NVIDIA RAPIDS,也不动 LP 环境)。
+  2. 补纯 Python 依赖:`fastrlock`(cupy)、`llvmlite==0.39.1`(numbax=numba0.56)、`pandas==1.5.3`、`pyarrow==10.0.1`、`protobuf==4.21.12`(cudf 硬约束 pandas<1.6 / pyarrow10 / protobuf4.21)。
+  3. **cupy JIT 修复**:cupy 在线编译默认取 `/usr/local/cuda/include/cuda_fp16.h`(NVIDIA),`mxcc` 无法解析(`NV_IS_DEVICE` 未定义)→ 设 **`CUDA_PATH=/opt/maca/tools/cu-bridge`** 即让 cupy 用 MACA 的 fp16 头,`cupy.arange(5)+1).sum()` 通过。
+  4. **`numba`→`numbax` 垫片**:cuOpt 路由编译进 `.so` 的是 `from numba import cuda`,而 MACA 包名是 `numbax`。在 site-packages 放 `numba/__init__.py`,把 `numbax`(及其已加载子模块)别名进 `sys.modules['numba*']` 即可(`cuda.to_device`/`copy_to_host` 在 C500 往返正常)。
+  验证:`cudf.Series([1,2,3]).sum()==6`、`DataFrame.mean` 正常;`rmmx`/`numbax.cuda.is_available()==True`。
+- **routing/distance 模块**:已在 `build_lp_modules_rapids_free.sh`(`CUOPT_RT_MACA=1`)随 LP 一起编出并链 MACA 运行时(8 模块全建)。
+- **结果(按文件,OS 级 `timeout` 隔离)**:`test_data_model` 3/3、`test_solver_settings` 4/4、`test_vehicle_properties` 13/13、
+  `test_distance_engine` **8/8**(waypoint matrix)、`test_initial_solutions` 5/5、`test_solver` 3/3、`test_batch_solve` 1/1 → **共 37 passed**。
+  烟测:4 节点 VRP 经 cudf cost matrix 求解返回最优(cost 6.0、合法 route DataFrame)。
+- **`test_warnings_exceptions` 1 例失败 = 非 MACA**:断言 `w[0]` 是 cast 警告,但 numpy 1.26 先发 `np.find_common_type is deprecated`;A100 同 numpy 亦失败。环境/numpy 版本问题,非移植缺陷。
+- **`test_re_routing` 原生挂起 = cross-move 自旋锁在 C500 跨 block 死锁(已修)**:
+  - 初判误入歧途:首轮 faulthandler 见 `mcFuncSetAttribute: mcErrorInvalidValue` 刷屏,疑 64KB 共享内存上限(探针实测 **C500 `sharedMemPerBlockOptin = 64KB`**,`cudaFuncSetAttribute` ≤64KB 成功、96/128KB `invalid argument`)。但加 `CUOPT_DBG_SHMEM` 仪表测得 temp-route 实际 **<20KB**,且多数挂起**零** `mcFuncSetAttribute` → 该 >64KB 刷屏是**罕见且非致命**(某核被跳过、搜索继续),非挂起主因。
+  - 真因(gdb 采样命中):挂起在 `mcStreamSynchronize`←`local_search_t::populate_cross_moves`,GPU util ~3%(宿主侧等核不返回)。逐核夹逼(两核间插同步打印)定位到 **`populate_cross_list_kernel` 第 19 次(re-routing 把问题逐轮做大)在自身同步处挂死**。根因:该核 `route_pair_locks[first_route*n+second_route]` 用裸 `acquire_lock`/`release_lock`——虽**同 block 内每 lane 锁互不相同**,但 grid=`num_orders-1` 个 block 共享同一 `first_route`,**跨 block 争用同一锁**;C500 lock-step warp 下,赢得 CAS 的 lane 可能被停在 acquire 之后、而同 warp 兄弟 lane 仍在自旋别 block 持有的锁 → 赢家永不到 `release_lock` → 持锁不放 → 等该锁的 block 全死锁。问题随 block 数增长才触发(小输入正常,做大后某轮挂死)。
+  - **修复**:`populate_cross_list_kernel` 的该锁改用 **`with_lock`**(临界区+释放放进中标 CAS 分支内,赢家在回边前已释放),与 12 行上方早已修好的 `with_lock_block`(line 301)同法——此处当初因"每 lane 锁不同看似安全"被漏掉。验证:`test_re_routing` 连跑 **11/11 通过**(原前挂起)、pytest **1 passed**,全 routing 套件**无回归**。
+  - 旁注:64KB 共享内存上限(罕见、非致命)未单独处理;锁修好后测试稳定通过,该降级不触发挂起。
 
 ## 5. 性能基准(C500 vs A100 基线)
 
