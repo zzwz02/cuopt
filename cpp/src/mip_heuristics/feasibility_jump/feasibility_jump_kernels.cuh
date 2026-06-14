@@ -14,7 +14,7 @@
 
 #include <cub/cub.cuh>
 
-#ifdef CUOPT_USE_MACA_CCCL
+#ifdef CUOPT_MACA
 #ifndef __grid_constant__
 #define __grid_constant__
 #endif

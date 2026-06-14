@@ -37,7 +37,7 @@ namespace cuopt::linear_programming::test {
 
 constexpr double default_time_limit    = 10;
 constexpr bool default_heuristics_only = true;
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
 constexpr double gf2_presolve_time_limit = 5.0;
 #else
 constexpr double gf2_presolve_time_limit = 0.5;

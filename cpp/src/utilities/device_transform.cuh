@@ -61,7 +61,7 @@ __global__ void transform_kernel(input_it_t input, output_it_t output, index_t n
 
 }  // namespace detail
 
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
 
 template <typename input_tuple_t, typename output_it_t, typename index_t, typename op_t>
 std::enable_if_t<

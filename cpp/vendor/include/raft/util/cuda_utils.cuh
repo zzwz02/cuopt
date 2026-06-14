@@ -613,7 +613,7 @@ DI auto dp4a(S a, S b, T c) -> T;
 template <>
 DI auto dp4a(char4 a, char4 b, int c) -> int
 {
-#if __CUDA_ARCH__ >= 610 && !defined(CUOPT_USE_MACA_CCCL)
+#if __CUDA_ARCH__ >= 610 && !defined(CUOPT_MACA)
   return __dp4a(a, b, c);
 #else
   c += static_cast<int>(a.x) * static_cast<int>(b.x);
@@ -627,7 +627,7 @@ DI auto dp4a(char4 a, char4 b, int c) -> int
 template <>
 DI auto dp4a(uchar4 a, uchar4 b, unsigned int c) -> unsigned int
 {
-#if __CUDA_ARCH__ >= 610 && !defined(CUOPT_USE_MACA_CCCL)
+#if __CUDA_ARCH__ >= 610 && !defined(CUOPT_MACA)
   return __dp4a(a, b, c);
 #else
   c += static_cast<unsigned int>(a.x) * static_cast<unsigned int>(b.x);
@@ -641,7 +641,7 @@ DI auto dp4a(uchar4 a, uchar4 b, unsigned int c) -> unsigned int
 template <>
 DI auto dp4a(int a, int b, int c) -> int
 {
-#if __CUDA_ARCH__ >= 610 && !defined(CUOPT_USE_MACA_CCCL)
+#if __CUDA_ARCH__ >= 610 && !defined(CUOPT_MACA)
   return __dp4a(a, b, c);
 #else
   return dp4a(*reinterpret_cast<char4*>(&a), *reinterpret_cast<char4*>(&b), c);
@@ -651,7 +651,7 @@ DI auto dp4a(int a, int b, int c) -> int
 template <>
 DI auto dp4a(unsigned int a, unsigned int b, unsigned int c) -> unsigned int
 {
-#if __CUDA_ARCH__ >= 610 && !defined(CUOPT_USE_MACA_CCCL)
+#if __CUDA_ARCH__ >= 610 && !defined(CUOPT_MACA)
   return __dp4a(a, b, c);
 #else
   return dp4a(*reinterpret_cast<uchar4*>(&a), *reinterpret_cast<uchar4*>(&b), c);

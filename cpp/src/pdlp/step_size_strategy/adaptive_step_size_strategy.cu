@@ -67,7 +67,7 @@ adaptive_step_size_strategy_t<i_t, f_t>::adaptive_step_size_strategy_t(
   valid_step_size_[0] = 0;
 
   if (batch_mode_) {
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     dot_product_bytes = 0;
 #else
     // Pass down any input pointer of the right type, actual pointer does not matter
@@ -468,7 +468,7 @@ void adaptive_step_size_strategy_t<i_t, f_t>::compute_interaction_and_movement(
                                       stream_view_.value()));
   } else {
     // TODO later batch mode: remove this once you want to do per climber restart
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     fixed_size_segmented_sum<i_t, f_t>(
       thrust::make_transform_iterator(
         thrust::make_zip_iterator(tmp_primal.data(),

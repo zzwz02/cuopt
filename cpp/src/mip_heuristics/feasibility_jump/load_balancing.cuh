@@ -453,7 +453,7 @@ __global__ void load_balancing_mtm_compute_candidates(
 
     bool is_duplicate = false;
     // check across the warp to opportunistically eliminate duplicate candidate moves
-#ifndef CUOPT_USE_MACA_CCCL
+#ifndef CUOPT_MACA
     raft::lane_mask_t mask = __match_any_sync(raft::activemask(), delta);
     if (raft::lane_popc(mask) > 1) {
       auto mask_ffs = raft::lane_ffs(mask) - 1;

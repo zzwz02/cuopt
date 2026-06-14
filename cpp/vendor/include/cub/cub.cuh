@@ -8,7 +8,7 @@
 
 #include <utilities/device_transform.cuh>
 
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
 
 namespace cub {
 namespace detail {

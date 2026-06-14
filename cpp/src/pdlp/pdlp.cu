@@ -2109,7 +2109,7 @@ void pdlp_solver_t<i_t, f_t>::transpose_problem_fields(bool to_row)
   auto transpose_field = [&](rmm::device_uvector<f_t>& field, i_t rows) {
     if (field.size() <= static_cast<size_t>(rows)) return;
     rmm::device_uvector<f_t> transposed(field.size(), stream_view_);
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     rmm::device_uvector<f_t> geam_zero(field.size(), stream_view_);
     RAFT_CUDA_TRY(
       cudaMemsetAsync(geam_zero.data(), 0, sizeof(f_t) * geam_zero.size(), stream_view_));
@@ -2159,7 +2159,7 @@ void pdlp_solver_t<i_t, f_t>::transpose_primal_dual_to_row(
   rmm::device_uvector<f_t> dual_transposed(dual_size_h_ * climber_strategies_.size(), stream_view_);
   rmm::device_uvector<f_t> dual_slack_transposed(
     is_dual_slack_empty ? 0 : primal_size_h_ * climber_strategies_.size(), stream_view_);
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
   rmm::device_uvector<f_t> geam_zero(
     static_cast<size_t>(std::max(primal_size_h_, dual_size_h_)) * batch_size, stream_view_);
   RAFT_CUDA_TRY(
@@ -2248,7 +2248,7 @@ void pdlp_solver_t<i_t, f_t>::transpose_primal_dual_back_to_col(
   rmm::device_uvector<f_t> dual_transposed(dual_size_h_ * climber_strategies_.size(), stream_view_);
   rmm::device_uvector<f_t> dual_slack_transposed(
     is_dual_slack_empty ? 0 : primal_size_h_ * climber_strategies_.size(), stream_view_);
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
   rmm::device_uvector<f_t> geam_zero(
     static_cast<size_t>(std::max(primal_size_h_, dual_size_h_)) * batch_size, stream_view_);
   RAFT_CUDA_TRY(

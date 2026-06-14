@@ -103,7 +103,7 @@ struct segmented_sum_handler_t {
                             i_t batch_size,
                             i_t problem_size)
   {
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     byte_needed_ = 0;
     segmented_sum_storage_.resize(0, stream_view_);
     fixed_size_segmented_sum<i_t, f_t>(input, output, batch_size, problem_size, stream_view_);
@@ -131,7 +131,7 @@ struct segmented_sum_handler_t {
                                ReductionOpT reduction_op,
                                f_t initial_value)
   {
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     byte_needed_ = 0;
     segmented_sum_storage_.resize(0, stream_view_.value());
     fixed_size_segmented_reduce<i_t, f_t>(

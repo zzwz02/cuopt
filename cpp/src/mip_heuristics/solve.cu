@@ -525,7 +525,7 @@ mip_solution_t<i_t, f_t> solve_mip_helper(optimization_problem_t<i_t, f_t>& op_p
       early_cpufj->start();
       CUOPT_LOG_DEBUG("Started early CPUFJ on original problem");
 
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
       // MACA/cu-bridge can stall when Papilo's post-presolve device problem rebuild races with
       // early GPUFJ work on the same device. Keep the opportunistic CPU incumbent search and let
       // the main GPU solve run after presolve.

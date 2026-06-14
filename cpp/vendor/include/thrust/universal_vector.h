@@ -6,7 +6,7 @@
 
 #include_next <thrust/universal_vector.h>
 
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
 
 THRUST_NAMESPACE_BEGIN
 

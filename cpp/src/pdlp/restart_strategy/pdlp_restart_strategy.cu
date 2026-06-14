@@ -303,7 +303,7 @@ pdlp_restart_strategy_t<i_t, f_t>::pdlp_restart_strategy_t(
             std::numeric_limits<f_t>::infinity());
 
   if (batch_mode_) {
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     dot_product_bytes = 0;
 #else
     // Pass down any input pointer of the right type, actual pointer does not matter
@@ -1288,7 +1288,7 @@ void pdlp_restart_strategy_t<i_t, f_t>::distance_squared_moved_from_last_restart
                                                     distance_moved.data(),
                                                     stream_view_));
   } else {
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     fixed_size_segmented_sum<i_t, f_t>(
       thrust::make_transform_iterator(tmp.data(), power_two_func_t<f_t>{}),
       distance_moved.data(),
@@ -1795,7 +1795,7 @@ DI void update_range_low(
   cg::this_grid().sync();
 }
 
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
 // ---------------------------------------------------------------------------
 // MACA/C500 host-driven trust-region bisection.
 //
@@ -2145,7 +2145,7 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
     // Compute the L2 norm on only infinite value before sorting to reduce effect of adding small /
     // big floating point values
 
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     constexpr int block_size = 256;
     weighted_l2_if_infinite_reduce_kernel<i_t, f_t, block_size>
       <<<1, block_size, 0, stream_view_.value()>>>(
@@ -2240,7 +2240,7 @@ void pdlp_restart_strategy_t<i_t, f_t>::solve_bound_constrained_trust_region(
     f_t* low_radius_squared  = low_radius_squared_.data();
     f_t* high_radius_squared = high_radius_squared_.data();
     constexpr int numThreads = 128;
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     // Host-driven bisection (see the maca_tr_* kernels above), replacing the
     // persistent cooperative kernel that deadlocks on C500. Each iteration halves
     // the active [low, high) range using ordinary kernel launches; the kernel

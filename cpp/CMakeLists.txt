@@ -80,7 +80,7 @@ option(SKIP_ROUTING_BUILD "Skip building routing components" OFF)
 option(SKIP_GRPC_BUILD "Skip building gRPC and protobuf components" OFF)
 option(WRITE_FATBIN "Enable fatbin writing" ON)
 option(HOST_LINEINFO "Build with debug line information for host code" OFF)
-option(CUOPT_USE_MACA_CCCL "Use MACA/cu-bridge provided CCCL headers instead of fetching NVIDIA CCCL" OFF)
+option(CUOPT_MACA "Build for MetaX MACA/C500: use cu-bridge CCCL headers and MACA mc* libraries, and enable C500 runtime workarounds" OFF)
 
 message(VERBOSE "cuOpt: Enable nvcc -lineinfo: ${CMAKE_CUDA_LINEINFO}")
 message(VERBOSE "cuOpt: Build cuOpt unit-tests: ${BUILD_TESTS}")
@@ -91,7 +91,7 @@ message(VERBOSE "cuOpt: Skip C/Python adapters: ${SKIP_C_PYTHON_ADAPTERS}")
 message(VERBOSE "cuOpt: Skip routing build: ${SKIP_ROUTING_BUILD}")
 message(VERBOSE "cuOpt: Build with debug line information for host code: ${HOST_LINEINFO}")
 message(VERBOSE "cuOpt: fatbin: ${WRITE_FATBIN}")
-message(VERBOSE "cuOpt: Use MACA CCCL: ${CUOPT_USE_MACA_CCCL}")
+message(VERBOSE "cuOpt: Build for MetaX MACA/C500: ${CUOPT_MACA}")
 
 # ##################################################################################################
 # - compiler options ------------------------------------------------------------------------------
@@ -101,7 +101,7 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 find_package(CUDAToolkit REQUIRED)
 
-if (CUOPT_USE_MACA_CCCL)
+if (CUOPT_MACA)
     if (DEFINED ENV{MACA_PATH} AND NOT "$ENV{MACA_PATH}" STREQUAL "")
         set(CUOPT_MACA_PATH "$ENV{MACA_PATH}")
     else ()
@@ -125,9 +125,9 @@ endif ()
 set(CUOPT_CXX_FLAGS "")
 set(CUOPT_CUDA_FLAGS "")
 
-if (CMAKE_COMPILER_IS_GNUCXX AND NOT CUOPT_USE_MACA_CCCL)
+if (CMAKE_COMPILER_IS_GNUCXX AND NOT CUOPT_MACA)
     list(APPEND CUOPT_CXX_FLAGS -Werror -Wno-error=deprecated-declarations)
-elseif (CUOPT_USE_MACA_CCCL)
+elseif (CUOPT_MACA)
     list(APPEND CUOPT_CXX_FLAGS -Wno-error=deprecated-declarations)
 endif ()
 
@@ -224,10 +224,10 @@ message("-- Host target architecture = '${CMAKE_SYSTEM_PROCESSOR}'")
 
 # make the flags global in order to propagate flags to test cmake files
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --expt-extended-lambda")
-if (NOT CUOPT_USE_MACA_CCCL AND ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
+if (NOT CUOPT_MACA AND ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -static-global-template-stub=false")
 endif ()
-if (CUOPT_USE_MACA_CCCL)
+if (CUOPT_MACA)
     list(APPEND CUOPT_CUDA_FLAGS
             -Wno-deprecated-declarations
             -Wno-error=deprecated-declarations
@@ -241,15 +241,15 @@ else ()
 endif ()
 if ("${CMAKE_CUDA_HOST_COMPILER}" MATCHES "clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
     list(APPEND CUOPT_CUDA_FLAGS -Xcompiler=-Wall)
-elseif (CUOPT_USE_MACA_CCCL)
+elseif (CUOPT_MACA)
     list(APPEND CUOPT_CUDA_FLAGS -Xcompiler=-Wall)
 else ()
     list(APPEND CUOPT_CUDA_FLAGS -Xcompiler=-Wall -Wno-error=non-template-friend)
 endif ()
-if (NOT CUOPT_USE_MACA_CCCL)
+if (NOT CUOPT_MACA)
     list(APPEND CUOPT_CUDA_FLAGS -Xfatbin=-compress-all)
 endif ()
-if (NOT CUOPT_USE_MACA_CCCL AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+if (NOT CUOPT_MACA AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
     list(APPEND CUOPT_CUDA_FLAGS -Xfatbin=--compress-level=3)
 endif ()
 list(APPEND CUOPT_CUDA_FLAGS -fopenmp)
@@ -308,7 +308,7 @@ set(lib_dir "${CMAKE_INSTALL_LIBDIR}")
 # still fetch pinned CCCL; MACA builds use the CCCL surface shipped with
 # cu-bridge/MACA and must not fetch NVIDIA CCCL.
 if (NOT TARGET CCCL::CCCL)
-    if (CUOPT_USE_MACA_CCCL)
+    if (CUOPT_MACA)
         include(cmake/thirdparty/get_maca_cccl.cmake)
     else ()
         include(cmake/thirdparty/get_cccl.cmake)
@@ -639,7 +639,7 @@ set(CUOPT_PRIVATE_CUDA_LIBS
         TBB::tbb
         OpenMP::OpenMP_CXX)
 
-if (CUOPT_USE_MACA_CCCL)
+if (CUOPT_MACA)
     set(CUOPT_PUBLIC_CUDA_LIBS
             CUDA::cudart_static
             "${CUOPT_MACA_MCBLAS_LIBRARY}"
@@ -677,7 +677,7 @@ list(JOIN CMAKE_CUDA_ARCHITECTURES "," JOINED_CUDA_ARCHITECTURES)
 target_compile_definitions(cuopt PUBLIC
         CUOPT_CUDA_ARCHITECTURES="${JOINED_CUDA_ARCHITECTURES}"
         CUOPT_CPU_ARCHITECTURE="${CMAKE_SYSTEM_PROCESSOR}"
-        $<$<BOOL:${CUOPT_USE_MACA_CCCL}>:CUOPT_USE_MACA_CCCL>)
+        $<$<BOOL:${CUOPT_MACA}>:CUOPT_MACA>)
 
 # Vendored rmm/raft/rapids_logger shim headers, ahead of any other include
 # dirs so <rmm/...>, <raft/...> and <rapids_logger/...> resolve to the shim.
@@ -685,7 +685,7 @@ target_include_directories(cuopt PUBLIC
         "$<BUILD_INTERFACE:${CUOPT_VENDOR_INCLUDE_DIR}>"
         "$<INSTALL_INTERFACE:include/cuopt_vendor>")
 
-if (CUOPT_USE_MACA_CCCL)
+if (CUOPT_MACA)
     target_include_directories(cuopt SYSTEM BEFORE PUBLIC
             "$<BUILD_INTERFACE:${CUOPT_MACA_CUBRIDGE_CCCL_INCLUDE_DIR}>"
             "$<BUILD_INTERFACE:${CUOPT_MACA_CUBRIDGE_INCLUDE_DIR}>"
@@ -763,7 +763,7 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/cuopt/version_config.hpp
 # MACA build-tree consumers recreate the local interface target from MACA_PATH.
 include(CMakePackageConfigHelpers)
 
-if (CUOPT_USE_MACA_CCCL)
+if (CUOPT_MACA)
 set(_cuopt_config_body
 "include(CMakeFindDependencyMacro)
 find_dependency(CUDAToolkit)

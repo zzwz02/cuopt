@@ -146,7 +146,7 @@ DI int top_k_indices_per_row(i_t row_id,
                              raft::device_span<output_t> out_costs,
                              raft::device_span<i_t> out_indices)
 {
-#ifdef CUOPT_USE_MACA_CCCL
+#ifdef CUOPT_MACA
   if constexpr (!::cuda::std::is_same_v<output_t, double>) {
     return top_k_indices_per_row_linear<i_t,
                                         output_t,

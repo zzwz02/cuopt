@@ -6,7 +6,7 @@
 
 #include_next <cuda/functional>
 
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
 
 namespace cuda {
 

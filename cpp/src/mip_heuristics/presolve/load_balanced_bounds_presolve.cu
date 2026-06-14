@@ -192,14 +192,14 @@ bool build_graph(managed_stream_pool& streams,
 
   if (graph_exec != nullptr) {
     cudaGraphExecDestroy(graph_exec);
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
 #else
     cudaGraphInstantiate(&graph_exec, graph);
 #endif
     RAFT_CHECK_CUDA(handle_ptr->get_stream());
   } else {
-#if defined(CUOPT_USE_MACA_CCCL)
+#if defined(CUOPT_MACA)
     cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
 #else
     cudaGraphInstantiate(&graph_exec, graph);
