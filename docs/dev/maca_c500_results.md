@@ -29,7 +29,7 @@
 | examples(cvrp/pdptw/service) | ✅ | ✅ service/pdptw 通过(修过时示例数据);cvrp degraded-Success | §4.2:service 唯一 break 点 + pdptw 每车型 cost matrix;cvrp 私有内存 20KB>16KB(降级) |
 | Python LP/MILP/QP/SOCP(numpy) | ✅ | ✅ | §4.3:`tests/linear_programming` 51 passed / 9 skip / 0 fail。两处根因均修:① 多次求解 fault(csrsort→CUB 段排序);② RAPIDS-free 模块经 cu-bridge(`pre_make nvcc`)编译,`cudaMemcpy` 改走 MACA 运行时,消除 `get_vars` inf 与 warm-start 挂起 |
 | Python routing+distance(cudf) | ✅ | ✅ | §4.4:mcdf(cudf/rmm/cupy/numba)装好;routing **38 passed**、distance 8/8、烟测最优;修复 `test_re_routing` 在 C500 的 cross-move 自旋锁跨 block 死锁(`populate_cross_list_kernel` 改 `with_lock`);余 1 例 numpy 版本误报(非 MACA) |
-| REST server / gRPC / self-hosted | ✅ | ⏸ 暂缓 | — |
+| REST server / gRPC / self-hosted | ✅ | ✅ | §4.5:FastAPI+uvicorn 在 C500 起服务、`/cuopt/health` 200、solver 进程在 C500;LP via REST(afiro Optimal/-464.7531/X01=80)与 routing via REST(cost=3.0/304/8,`mcErrorRecompile=0`)端到端全通。一行修:solver worker 的 `SIGCHLD` 由 `SIG_IGN` 改 `SIG_DFL`——`SIG_IGN` 令 `wait()` 返 ECHILD、破坏 MACA 运行期重编译的 `mxcc` 子进程 |
 | 性能基准(LP/QP/routing) | ✅(§5) | ✅ LP+QP(routing 暂缓) | LP §5.1(多数 1–2×,scpm1 14×);QP §5.2(目标值逐位一致) |
 
 图例:✅ 已验证通过 · ⏳ 在做/待做 · ⏸ 本阶段暂缓
@@ -306,6 +306,19 @@ C500 无关的过时示例数据**(主机端校验,A100 用当前 26.06 同样�
   修复:`set_shmem_of_kernel` 查 `cudaFuncGetAttributes().sharedSizeBytes` 与 `cudaDevAttrMaxSharedMemoryPerBlockOptin`,静态+动态超限即返回 false → 调用方干净跳过/抛 OOM,不再崩。
   **正确性**:Fix 后超限核**绝不带不足内存启动**,故**无静默错算**;结果只会是"有效(可能次优)解 + SUCCESS"或"明确标记的 ERROR/INFEASIBLE 空解"(需查 `get_status()`),不会是错而标 SUCCESS。阈值实测:单路由 min-dims ~800 通过 / 1000 起降级,rich-dims ~600 通过 / 1400 降级——**普通多车 VRP 路由短(几十站)永不触发**。
   **决策(用户)**:停在此(防崩+优雅降级);不做全量 global-memory temp-route 回退(涉 16 文件/48 launch,仅惠 1000+ 单路由极端情形,性价比低)。提交 `6039310f`。
+
+### 4.5 REST server / self-hosted(FastAPI+uvicorn,C500):LP + routing 端到端全通(一行修 `SIGCHLD=SIG_DFL`)
+
+- **部署**:服务器为 `python/cuopt_server`(FastAPI+uvicorn),客户端 `python/cuopt_self_hosted`。装纯 Python 依赖即可(无 CUDA):`fastapi uvicorn==0.34.* msgpack==1.1.2 msgpack-numpy==0.4.8 pydantic psutil jsonref requests`。
+  启动:`PYTHONPATH=python/cuopt:python/cuopt_server CUDA_PATH=/opt/maca/tools/cu-bridge python3 python/cuopt_server/cuopt_server/cuopt_service.py -p 5000 -i 127.0.0.1`(conda py3.10)。
+- **两个 gotcha**:① 本机有 HTTP 代理(`http_proxy=127.0.0.1:3578`),`curl`/`requests` 打本地端口会走代理返 **502**——须 `--noproxy '*'` 或 `export no_proxy=127.0.0.1,localhost`。② 服务器用 `nvidia-smi` 枚举 GPU,本机另有一块 A100 被它显示为 GPU0(装饰性);**实际 solver 进程跑在 C500**(`mx-smi` 确认 PID 在 GPU0/C500,因 libcuopt 链 MACA 运行时)。
+- **LP via REST 端到端通过**:`/cuopt/health`→200;`get_LP_solve(afiro.mps)` 返回 **status=Optimal、primal_objective=-464.7531(afiro 已知最优)、X01=80.0**——HTTP→msgpack→fork solver(C500)→解→回传 全链路正确。
+- **routing via REST 端到端通过(已修,根因 = solver worker 的 `SIGCHLD=SIG_IGN` 破坏 MACA 运行时重编译子进程)**:
+  - **症状**:routing 请求时 fork 的 solver 子进程刷 **`mcLaunchKernel: Returned mcErrorRecompile`** → GES 构造核不执行 → `max_active_nodes=0` → `TPB=0` → `ValidationError: Number of threads should be greater than 0!`(干净 400)。LP 在同一子进程正常(其 PDLP 核不触发重编译)。
+  - **定位链(用户给的关键线索:C500 上 block size=1024 的核需运行期重编译,<1024 或加 `__launch_bounds__(1024)` 可免)**:开 `MXLOG_LEVEL=error,MCR=debug,MCC=debug` 看到 `mc_recompile.cpp:241 Because of max_block_size(512) is less than blockSize(1024), This kernel will recompile`,随后 `MCC online build program ret(-1)` → 重编译**失败**。即 C500 对「launch 的 block size 超过该核编译期 max_block_size」的核做**运行期重编译**(跑 `mxcc` 子进程),而重编译本身在 solver worker 里失败。
+  - **真根因**:`mxcc` 是 **fork+exec 的子进程**;MACA 重编译要 `wait()` 它。但 solver worker(`cuopt_server/utils/solver.py::process_async_solve`)设了 `signal.signal(signal.SIGCHLD, signal.SIG_IGN)`——Linux 上 `SIG_IGN` 会**自动回收子进程并令 `wait()` 返回 ECHILD**,于是 `mxcc` 的 wait 失败、`build program ret(-1)`、launch 返回 `mcErrorRecompile`。直连(无此 handler)重编译正常,故只在 server 复现。
+  - **修复(一行)**:`solver.py` 把该 worker 的 `SIGCHLD` 由 `SIG_IGN` 改为 **`SIG_DFL`**(仍忽略 SIGCHLD,但 `wait()` 可用)→ 重编译子进程成功。**无需改任何 kernel**。验证:`mcErrorRecompile=0`;routing via REST `status=0`(test_sync 等价载荷 cost=3.0;8-task CVRP cost=304 与直连一致;无时间窗 3-task cost=8);LP 仍 Optimal。
+  - **附带洞见(未采用,留作 perf 备选)**:C500 默认每核 `max_block_size=512`,故 1024-thread launch 总会触发运行期重编译(即便成功也有 `mxcc` 开销 ~30ms/次)。要免重编译可给 1024 核加 `__launch_bounds__`(若核能放下 1024)或把 launch 降到 ≤512;但根因是 `SIG_IGN`,改完后重编译能正常完成,故 kernel 侧改动非必需。
 
 ## 5. 性能基准(C500 vs A100 基线)
 

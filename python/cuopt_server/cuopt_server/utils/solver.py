@@ -353,7 +353,15 @@ def process_async_solve(
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
         set_solverid(gpu_id)
 
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    # SIGCHLD must be SIG_DFL, not SIG_IGN: on Linux SIG_IGN auto-reaps children and makes
+    # wait()/waitpid() fail with ECHILD, which breaks any subprocess this worker spawns. On
+    # MACA/C500 that includes the runtime's on-the-fly kernel recompile (it fork+execs mxcc and
+    # waits for it): with SIG_IGN the wait fails, mxcc "build program" returns -1, the launch
+    # returns mcErrorRecompile and the solve dies. SIG_DFL still ignores SIGCHLD but lets wait()
+    # work, so the recompile subprocess succeeds. (Routing kernels recompile on C500 whenever a
+    # launch block size exceeds the kernel's compiled max_block_size; that recompile is normal and
+    # only failed here because of the inherited SIG_IGN.)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
