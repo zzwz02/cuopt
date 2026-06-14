@@ -27,7 +27,7 @@
 | routing C++(VRP/PDP/breaks/异构) | ✅ | ✅ 已修复 `span<bool>`、warp 自旋锁、`test_heterogeneous_breaks` OOB | §4:span 花括号→圆括号(§4.0)+ warp 协作自旋锁串行化(§4.0b)+ cycle-finder 重构竞态(§4.0c) |
 | 距离引擎(C++ waypoint) | ✅ | ✅ | WAYPOINT_MATRIXTEST 6/6 |
 | examples(cvrp/pdptw/service) | ✅ | ✅ service/pdptw 通过(修过时示例数据);cvrp degraded-Success | §4.2:service 唯一 break 点 + pdptw 每车型 cost matrix;cvrp 私有内存 20KB>16KB(降级) |
-| Python LP/MILP/QP/SOCP(numpy) | ✅ | ⚠ 多次求解 fault 已修(csrsort→CUB);崩溃级联消除、多数用例通过;余 warm-start 路径挂起(open)| §4.3:cusparseXcsrsort 内部 mcsparse kernel C500 async 竞态 → 换 CUB DeviceSegmentedSort |
+| Python LP/MILP/QP/SOCP(numpy) | ✅ | ✅ | §4.3:`tests/linear_programming` 51 passed / 9 skip / 0 fail。两处根因均修:① 多次求解 fault(csrsort→CUB 段排序);② RAPIDS-free 模块经 cu-bridge(`pre_make nvcc`)编译,`cudaMemcpy` 改走 MACA 运行时,消除 `get_vars` inf 与 warm-start 挂起 |
 | Python routing+distance(cudf) | ✅ | ⏸ 暂缓 | — |
 | REST server / gRPC / self-hosted | ✅ | ⏸ 暂缓 | — |
 | 性能基准(LP/QP/routing) | ✅(§5) | ✅ LP+QP(routing 暂缓) | LP §5.1(多数 1–2×,scpm1 14×);QP §5.2(目标值逐位一致) |
@@ -248,7 +248,7 @@ C500 无关的过时示例数据**(主机端校验,A100 用当前 26.06 同样�
 结论:examples 的 service/pdptw 失败为过时示例数据(非移植问题),已修并 commit;cvrp 记录为 C500 私有内存
 限制(待系统侧 `pri_mem_sz` 或内核侧 local 内存削减的后续专项)。
 
-### 4.3 Python LP/MILP/QP/SOCP(numpy,RAPIDS-free):已修复同进程多次求解 fault(csrsort → CUB 段排序)
+### 4.3 Python LP/MILP/QP/SOCP(numpy,RAPIDS-free):全绿(`tests/linear_programming` 51 passed / 9 skip / 0 fail)
 
 - **构建路径(无需改脚本)**:`LIBCUOPT_DIR=cpp/build_maca CCCL=cpp/build/_deps/cccl-src CUDA_HOME=/usr/local/cuda`
   下 `bash python/cuopt/build_lp_modules_rapids_free.sh`(conda py3.10)即把 8 个 LP/routing/distance Cython 模块
@@ -267,8 +267,17 @@ C500 无关的过时示例数据**(主机端校验,A100 用当前 26.06 同样�
   按行段对列索引排序、重排 values(与 `csr_to_csc_transpose` 同一 C500-可用原语),末尾 `cudaStreamSynchronize`。
   **验证**:`a2864.mps` 连求 3 次(concurrent 与 单方法 PDLP)**全 Optimal、无 fault**(normal async,无需 LAUNCH_BLOCKING);
   整套 LP 用例的**崩溃级联消除**、多数原失败用例转通过。
-- **余项(独立、较小,open)**:`test_warm_start`(及另 ≥1 例)在 warm-start / 重复求解路径**原生挂起**(非崩溃,`test_lp_solver.py:635`);
-  `test_parse_var_names` 为目标值期望不符(`80.006 vs inf`)。与本 fault 无关,待后续专项。
+- **第二处根因 = RAPIDS-free Cython 模块用 NVIDIA `libcudart` 链接,`cudaMemcpy` 在 MACA 设备指针上静默失败(已修)**:
+  解出来后 `_device_buffer_to_numpy` 用 `cudaMemcpy`(D2H)把解 buffer 拷回 numpy。原构建脚本用 `g++ + -lcudart`(NVIDIA),
+  而解的设备内存属于 **MACA 运行时**:NVIDIA `cudaMemcpy` 返回 `rc=1`(`cudaErrorInvalidValue`)却不抛错,`np.empty` 留下未初始化
+  垃圾 → `get_vars()/get_primal_solution()` 全 `inf`(A100 正常,因内存属 NVIDIA)。这也连带使 warm-start 路径(回灌坏解)挂起。
+- **修复 = 让该 TU 走 cu-bridge 编译期转换**(而非手写 runtime shim):`cudaMemcpy/cudaDeviceSynchronize` 源码不变,
+  在 `build_lp_modules_rapids_free.sh` 加 `CUOPT_RT_MACA=1` 开关——编译器换 `/opt/maca/tools/cu-bridge/tools/pre_make nvcc`
+  (cu-bridge 头把 `cudaMemcpy→wcudaMemcpy`、`cudaMemcpyDeviceToHost→mcMemcpyDeviceToHost` 在编译期改写),include 用 cu-bridge CCCL
+  (`tools/cu-bridge/include/cccl`),链接 `-lruntime_cu -lmcruntime` 取代 `-lcudart`。**勿用 `cucc` 直编单文件;`cmake_maca`/`make_maca`
+  /`pre_make nvcc` 才是入口**(见 c500 skill)。
+  **验证**:`solver_wrapper.so` 的 `DT_NEEDED` 为 `libruntime_cu/libmcruntime`(无 `cudart`)、调用 `wcudaMemcpy`;
+  `tests/linear_programming` **51 passed / 9 skip / 0 fail**,含原挂起的 `test_warm_start`(两处)与全部 `get_primal_solution` 路径,`inf` 消除。
 - **通用诊断手法**:`MACA_LAUNCH_BLOCKING=3` 精确定位 faulting kernel 并区分"竞态 vs 确定性";dump kernel 真实输入喂
   独立程序复现以区分"输入坏 vs 上下文/竞态";二分关闭 graph / 并发缩小范围。**已写入 c500 skill。**
 

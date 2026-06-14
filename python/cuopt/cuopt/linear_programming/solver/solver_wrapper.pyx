@@ -24,7 +24,10 @@ from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
 # RAPIDS-free build: copy device solution buffers to host with cudaMemcpy
-# instead of wrapping them in an rmm DeviceBuffer / cudf Series.
+# instead of wrapping them in an rmm DeviceBuffer / cudf Series. On MACA/C500
+# this TU is compiled through cu-bridge (pre_make nvcc), which remaps cudaMemcpy
+# -> wcudaMemcpy / cudaDeviceSynchronize -> wcudaDeviceSynchronize at compile
+# time, so the copy goes through the MACA runtime that owns the solution memory.
 cdef extern from "cuda_runtime_api.h" nogil:
     ctypedef enum cudaMemcpyKind:
         cudaMemcpyDeviceToHost
@@ -135,6 +138,8 @@ cdef object _device_buffer_to_numpy(unique_ptr[device_buffer] buf):
     Replaces the rmm DeviceBuffer + cudf Series round-trip so the LP/MILP path
     has no RAPIDS runtime dependency. cudaDeviceSynchronize() guarantees the
     solver's per-thread-stream work has completed before the synchronous copy.
+    On MACA/C500 the TU is built through cu-bridge, so cudaMemcpy routes to the
+    MACA runtime that owns the device memory.
     """
     cdef device_buffer* b = buf.get()
     if b == NULL:
