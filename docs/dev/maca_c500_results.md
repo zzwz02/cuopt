@@ -26,7 +26,7 @@
 | cuopt_cli | ✅ | ✅ | LP/QP 烟测目标值精确;CLI_TEST 7/7(需 `cuopt_cli` 在 PATH:`export PATH=$PWD/cpp/build_maca:$PATH`)|
 | routing C++(VRP/PDP/breaks/异构) | ✅ | ✅ 已修复 `span<bool>`、warp 自旋锁、`test_heterogeneous_breaks` OOB | §4:span 花括号→圆括号(§4.0)+ warp 协作自旋锁串行化(§4.0b)+ cycle-finder 重构竞态(§4.0c) |
 | 距离引擎(C++ waypoint) | ✅ | ✅ | WAYPOINT_MATRIXTEST 6/6 |
-| examples(cvrp/pdptw/service) | ✅ | ⏳ 待建/待测 | — |
+| examples(cvrp/pdptw/service) | ✅ | ✅ service/pdptw 通过(修过时示例数据);cvrp degraded-Success | §4.2:service 唯一 break 点 + pdptw 每车型 cost matrix;cvrp 私有内存 20KB>16KB(降级) |
 | Python LP/MILP/QP/SOCP(numpy) | ✅ | ⏳ 待建/待测 | Cython 扩展未构建 |
 | Python routing+distance(cudf) | ✅ | ⏸ 暂缓 | — |
 | REST server / gRPC / self-hosted | ✅ | ⏸ 暂缓 | — |
@@ -225,6 +225,28 @@ lock-step)偶发触发。
   (越界访问无前置 `cuopt_assert`)。**有效手段**:`~/mxlog/umd/trapInfo.*.log`
   直接给出陷阱 kernel 名(demangle → `find_all_squeeze_pos`);printf 注入逐步
   收窄到 combine。最终定位与修复留待后续专项(需可用的逐行 sanitizer)。
+
+### 4.2 examples(cvrp / pdptw / service):2 个过时示例数据已修,cvrp 私有内存为唯一 C500 限制
+
+`cpp/tests/examples/routing` 三个示例在 C500 上**编译通过**;运行暴露 3 个独立问题,其中 **2 个是与
+C500 无关的过时示例数据**(主机端校验,A100 用当前 26.06 同样会 abort/失败),仅 1 个是真正的 C500 限制:
+
+- **service_team_routing**(已修,2/2 通过):`break_locations={0,0,0}` 非唯一,触发主机校验
+  `"There should be unique break locations"`(`data_model_view.cu` 对 break 点做 `thrust::unique` 后比长度)。
+  break 点是**唯一候选位置**集合,每车 break 次数由 `add_break_dimension` 的数组长度决定;改为 `{0}` 即通过。
+- **pdptw_mixed_fleet**(已修,2/2 通过,route_len 6/10):设了 `vehicle_types`(混合车队 0/1)却只调用了一次
+  `add_cost_matrix(m)`(默认 `vehicle_type=0`),触发 `"All vehicle cost matrices should be set"`(solve 返回
+  status=ERROR(4),被 `solve.cu` 的 catch 吞掉、日志默认级别下不打印,靠 `get_error_status().what()` 取出)。
+  `add_cost_matrix(m, vehicle_type)` 需**每车型各注册一次**;补 type 0/1 后通过。运行中 `mcFuncSetAttribute →
+  mcErrorInvalidValue` ×200+ 为**非致命**噪声(设核属性被拒,核仍照常运行、求解 SUCCESS)。
+- **cvrp_daily_deliveries**(degraded-Success,唯一真 C500 限制):3/3 场景 `Status: Success`,但某 local-search
+  内核请求 **20 KB/thread 私有(local)内存 > C500 上限 16 KB**(`/sys/module/metax/parameters/pri_mem_sz=16`,
+  只读)→ ~140 次 `mcErrorMemoryValueTooLarge` 启动失败、该内核被降级(求解器靠其它路径仍出解),进程因 sticky
+  错误退出码=1。彻底修复需 `insmod metax.ko pri_mem_sz≥20`(系统级、需 root、重置 GPU)或削减该内核 local
+  内存;本阶段按务实路线接受降级并如实记录。
+
+结论:examples 的 service/pdptw 失败为过时示例数据(非移植问题),已修并 commit;cvrp 记录为 C500 私有内存
+限制(待系统侧 `pri_mem_sz` 或内核侧 local 内存削减的后续专项)。
 
 ## 5. 性能基准(C500 vs A100 基线)
 

@@ -83,8 +83,9 @@ bool pdptw_mixed_fleet_basic_mixed_fleet_scenario()
   // Set vehicle types
   data_model.set_vehicle_types(v_vehicle_types.data());
 
-  // Add cost matrix
-  data_model.add_cost_matrix(v_cost_matrix.data());
+  // Add cost matrix for each vehicle type (mixed fleet: 0 = small, 1 = large)
+  data_model.add_cost_matrix(v_cost_matrix.data(), 0);
+  data_model.add_cost_matrix(v_cost_matrix.data(), 1);
 
   // Set order locations and pickup-delivery pairs
   data_model.set_order_locations(v_order_locations.data());
@@ -196,8 +197,9 @@ bool pdptw_mixed_fleet_complex_mixed_fleet_scenario()
   // Set vehicle types
   data_model.set_vehicle_types(v_vehicle_types.data());
 
-  // Add cost matrix
-  data_model.add_cost_matrix(v_cost_matrix.data());
+  // Add cost matrix for each vehicle type (mixed fleet: 0 = small, 1 = large)
+  data_model.add_cost_matrix(v_cost_matrix.data(), 0);
+  data_model.add_cost_matrix(v_cost_matrix.data(), 1);
 
   // Set order locations and pickup-delivery pairs
   data_model.set_order_locations(v_order_locations.data());

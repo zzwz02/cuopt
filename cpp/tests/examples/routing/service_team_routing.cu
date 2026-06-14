@@ -47,7 +47,7 @@ bool basic_service_team_scenario()
   std::vector<int> break_earliest  = {30, 30, 30};  // Earliest break times
   std::vector<int> break_latest    = {70, 70, 70};  // Latest break times
   std::vector<int> break_duration  = {15, 15, 15};  // Break duration in minutes
-  std::vector<int> break_locations = {0, 0, 0};     // Breaks must be taken at depot
+  std::vector<int> break_locations = {0};  // Unique candidate break locations (depot)
 
   // Vehicle start and end locations (all at depot)
   std::vector<int> vehicle_start_locations = {0, 0, 0};
@@ -140,7 +140,7 @@ bool complex_service_team_scenario()
   std::vector<int> break_earliest  = {60, 60, 60, 60};      // Earliest break times
   std::vector<int> break_latest    = {140, 140, 140, 140};  // Latest break times
   std::vector<int> break_duration  = {30, 30, 30, 30};      // Break duration in minutes
-  std::vector<int> break_locations = {0, 0, 0, 0};          // Breaks must be taken at depot
+  std::vector<int> break_locations = {0};  // Unique candidate break locations (depot)
 
   // Vehicle start and end locations (all at depot)
   std::vector<int> vehicle_start_locations = {0, 0, 0, 0};
