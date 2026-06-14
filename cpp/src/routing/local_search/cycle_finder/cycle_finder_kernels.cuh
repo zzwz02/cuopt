@@ -85,30 +85,46 @@ __global__ void close_cycle(typename ret_cycles_t<i_t, f_t>::view_t ret,
   ret.append_cycle(ret.curr_cycle_size);
 }
 
+// Cycle reconstruction walks the predecessor chain one level at a time. extend_cycle
+// must not read and write the cycle key in the same launch -- that was the C500 race:
+// an n_blocks x n_threads grid compared d_valid_paths.keys[i] against the *live* key
+// while the one matching thread mutated it. Because the grid spans hundreds of blocks
+// that are not all co-resident, a block in a later scheduling wave read the key word
+// the matcher was writing; snapshotting per-thread only shrank the window (the snapshot
+// still loads the word the matcher stores), so a torn read (new head + old label) could
+// still rebuild a predecessor chain with an edge that is not in the graph. It
+// reproduced only on C500 (lock-step / warp64); A100 never hit the window, and
+// compute-sanitizer memcheck reports OOB, not data races, so it stayed clean.
+//
+// Fix: double-buffer the key. extend_cycle reads key_in (which nothing in this launch
+// writes) and the single matching thread writes key_out (which nothing in this launch
+// reads). The reader set and the writer set are disjoint memory, so there is no
+// same-location read/write to tear -- correct by construction, independent of any
+// intra-kernel memory ordering. get_cycle swaps key_in/key_out between levels; stream
+// ordering across the separate launches feeds level i's output into level i-1's input.
+// device_map_t deduplicates keys (see add_impl), and every key on a well-formed cycle
+// was inserted into its level's map during find_cycle, so exactly one slot matches and
+// exactly one thread writes key_out.
 template <typename i_t, typename f_t, size_t max_routes>
 __global__ void extend_cycle(
   typename graph_t<i_t, f_t>::view_t const graph,
   typename device_map_t<key_t<max_routes>, double>::view_t const d_valid_paths,
-  typename path_t<i_t, f_t, max_routes>::view_t d_best,
+  key_t<max_routes> const* key_in,
+  key_t<max_routes>* key_out,
   typename ret_cycles_t<i_t, f_t>::view_t ret,
-  int level,
   int curr_cycle_size)
 {
-  ret.curr_cycle_size = curr_cycle_size;
-  const auto target_key = d_best.key_ptr[0];
+  ret.curr_cycle_size   = curr_cycle_size;
+  const auto target_key = *key_in;
   for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < d_valid_paths.max_available;
        i += blockDim.x * gridDim.x) {
     if (d_valid_paths.keys[i] == target_key) {
-      // acquire
-      auto route_id = graph.route_ids[target_key.head];
-      // Set las bit to false "cutting the head"
+      // "cut the head": drop the current head's route, then move the head to its predecessor
       auto next_key = target_key;
-      next_key.label.set(route_id, false);
-      // Set new head
-      auto pred              = d_valid_paths.predecessors[i];
-      next_key.head          = pred;
-      d_best.key_ptr[0]      = next_key;
-      ret.push_back(pred);
+      next_key.label.set(graph.route_ids[target_key.head], false);
+      next_key.head = d_valid_paths.predecessors[i];
+      *key_out      = next_key;
+      ret.push_back(next_key.head);
     }
   }
 }

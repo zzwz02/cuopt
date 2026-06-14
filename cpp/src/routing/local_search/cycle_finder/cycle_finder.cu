@@ -191,15 +191,24 @@ void ExactCycleFinder<i_t, f_t, max_routes>::get_cycle(graph_t<i_t, f_t>& graph,
     RAFT_CHECK_CUDA(handle_ptr->get_stream());
     i_t level = level_vec[cycle_id];
 
+    // Double-buffer the cycle key so the parallel extend_cycle never reads the word its
+    // matching thread writes: read from key_in, write the advanced key to key_out, then
+    // swap between levels (each its own stream-ordered launch). The tail is invariant
+    // along the walk, so close_cycle still reads it from best_cycles.
+    auto* key_in  = best_cycles.key_ptr.data() + cycle_id;
+    auto* key_out = key_scratch.data() + cycle_id;
     for (int i = level; i > 0; --i) {
       extend_cycle<i_t, f_t, max_routes>
         <<<n_blocks, n_threads, 0, handle_ptr->get_stream()>>>(graph.view(),
                                                                d_valid_paths.subspan(i),
-                                                               best_cycles.subspan(cycle_id),
+                                                               key_in,
+                                                               key_out,
                                                                d_ret.view(),
-                                                               i,
                                                                (level + 1) - i);
       RAFT_CHECK_CUDA(handle_ptr->get_stream());
+      auto* tmp = key_in;
+      key_in    = key_out;
+      key_out   = tmp;
     }
     close_cycle<i_t, f_t, max_routes><<<1, 1, 0, handle_ptr->get_stream()>>>(
       d_ret.view(), best_cycles.subspan(cycle_id), level + 1);

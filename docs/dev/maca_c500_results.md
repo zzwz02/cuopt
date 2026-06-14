@@ -2,8 +2,7 @@
 
 > 目标:在 MetaX C500 / MACA / cu-bridge 上,使 cuOpt 达到与官方 wheel
 > (cuDSS 版,即 RAPIDS-free + 自研 LDLᵀ 基线 `docs/dev/rapids_removal_mvp_results.md`)
-> **一样的功能范围**,并对性能进行基准对比。**暂不引入 cudf**(因此 Python
-> routing/distance 的 cudf 进出路径暂缓;Python LP/MILP/QP/SOCP 走 numpy)。
+> **一样的功能范围**,并对性能进行基准对比。
 > 参照基线硬件 = NVIDIA A100;本表硬件 = MetaX C500(MACA 3.0.x,cu-bridge,
 > warp64),AMD EPYC 7543。
 >
@@ -29,7 +28,7 @@
 | 距离引擎(C++ waypoint) | ✅ | ✅ | WAYPOINT_MATRIXTEST 6/6 |
 | examples(cvrp/pdptw/service) | ✅ | ⏳ 待建/待测 | — |
 | Python LP/MILP/QP/SOCP(numpy) | ✅ | ⏳ 待建/待测 | Cython 扩展未构建 |
-| Python routing+distance(cudf) | ✅ | ⏸ 暂缓(不引入 cudf) | — |
+| Python routing+distance(cudf) | ✅ | ⏸ 暂缓 | — |
 | REST server / gRPC / self-hosted | ✅ | ⏸ 暂缓 | — |
 | 性能基准(LP/QP/routing) | ✅(§5) | ✅ LP+QP(routing 暂缓) | LP §5.1(多数 1–2×,scpm1 14×);QP §5.2(目标值逐位一致) |
 
@@ -54,11 +53,13 @@
   `vrp_move_candidates.cuh`、`move_candidates.cuh`、`prize_collection.cu`、
   `perform_moves.cu`(in-branch 释放);`device_map.cuh`(warp 内 lane 串行化)。
 - **修复 3**:`heterogenous_breaks.test_heterogeneous_breaks` 的
-  `insert_graph_nodes_kernel` OOB = cycle-finder 重构 predecessor 链时同一 kernel
-  内多线程读写同一个 `d_best.key_ptr[0]`,偶发拼出不存在的图边;已改为对目标 key 做
-  本地快照后再写回(§4.0c)。
-- 验证:`vehicle_breaks` 6/6 通过(含 `uniform_breaks`);`heterogenous_breaks`
-  2/2 通过;`test_heterogeneous_breaks --gtest_repeat=10` 通过。
+  `insert_graph_nodes_kernel` OOB = cycle-finder 重构 predecessor 链时一大片 block
+  并发读写同一个 `d_best.key_ptr[0]`(读端跨-block 撕裂读),偶发拼出不存在的图边;
+  改为**双缓冲** `extend_cycle`(读 `key_in`、唯一命中线程写 `key_out`,读写集内存不相交,
+  按构造可证)(§4.0c)。
+- 验证:`heterogenous_breaks.*` `--gtest_repeat=10` 10/10(2 tests,无 Memory Violation);
+  回归 `vehicle_breaks` 6/6、`heterogenous` 6/6、`prize_collection` 3/3、
+  `objective_function` 2/2、`vehicle_order_match` 2/2。
 
 ## 4. routing C++ 调查
 
@@ -157,26 +158,38 @@ cycle-finder 偶发重构出一条包含**不存在图边**的坏环,随后 `pop
   插入 96;若不拦截,VRP `insert_node` 的右移循环从 `i=7` 继续向下找 `insertion_idx=8`,
   会读写越界。
 
-**根因**:cycle-finder 的 `extend_cycle` 并行扫描 `d_valid_paths` 时,每个线程都直接用
-同一个可变的 `d_best.key_ptr[0]` 做匹配并在命中后立即改写它。同一 kernel 内其他线程
-可能看到已经被改过的 key,在同一个 level 继续匹配另一条 entry,把 predecessor 链串错,
-从而重构出 graph 中不存在的边(例如同一路线 `96(r5)->97(r5)`)。
+**根因**:cycle-finder 的 `extend_cycle` 以 ~782 个 block × 256 线程并行扫描
+`d_valid_paths`,每个线程都直接用同一个可变的 `d_best.key_ptr[0]` 做匹配,而唯一命中
+线程又当场改写它(先写 head 的 route 位、再写 head)。grid 远超驻留上限、按 wave 调度,
+后一 wave 的 block 会在前一 wave 命中线程改写 `d_best.key_ptr[0]` 的过程中读到它,撕裂出
+`(新 head, 旧 label)` 这种中间态;若该中间态恰好等于本 level map 里另一条 entry,就被误
+匹配、续错 predecessor 链,从而重构出 graph 中不存在的边(例如同一路线 `96(r5)->97(r5)`)。
+本质同 span/AtY 一类:NVIDIA(32 宽 warp、ITS)调度恰好不踩这个窗口、良性;C500(warp64、
+lock-step)偶发触发。
 
-**修复**:`extend_cycle` 先把本轮要查找的 key 读到线程本地 `target_key`;所有线程只和
-这个稳定快照比较。命中后基于快照构造 `next_key` 并写回 `d_best.key_ptr[0]`,避免同一轮
-扫描 cascading match 到下一段 predecessor。
+**修复**(分两步,最终用双缓冲):
+- 先尝试**每线程快照** `target_key = d_best.key_ptr[0]` 再比较——能让 `repeat=10` 转绿,
+  但**不彻底**:快照那一次读仍落在命中线程要写的同一个全局字上,后一 wave 的 block 仍可能
+  在写的瞬间撕裂读到坏快照(窗口大幅缩小但未关闭)。
+- 最终改为**双缓冲**:`extend_cycle` 从 `key_in` 读、唯一命中线程把推进后的 key 写到
+  `key_out`(本 launch 内无人读 `key_out`、无人写 `key_in`),读集与写集内存不相交,**按
+  构造无同址读写**,与任何 kernel 内内存序无关;层间(各自独立、stream 串行的 launch)
+  swap `key_in`/`key_out`。`d_best` 的 tail 沿整条链不变,故 `close_cycle` 仍从
+  `best_cycles` 取 tail。改动:`cycle_finder_kernels.cuh`(`extend_cycle` 改 in/out
+  指针)、`cycle_finder.cu`(`get_cycle` ping-pong swap)、`cycle_finder.hpp`(新增
+  `key_scratch` 缓冲)。map 按 key 去重(`device_map_t::add`)且坏环每段 key 在 find 阶段
+  必已入对应 level 的 map,故每 level 恰好一个命中、恰好一个线程写 `key_out`。
 
-**验证**:
-- C500:`ROUTING_UNIT_TEST --gtest_filter=heterogenous_breaks.test_heterogeneous_breaks --gtest_repeat=10`
-  10/10 通过,无 `Memory Violation`。
-- C500:`ROUTING_UNIT_TEST --gtest_filter=heterogenous_breaks.*` 2/2 通过。
-- A100 CUDA build:`compute-sanitizer --tool memcheck` 连跑 3 轮
-  `heterogenous_breaks.test_heterogeneous_breaks`,均 `ERROR SUMMARY: 0 errors`。
-- A100 对照 build 目录:`cpp/build_a100_cuda_cached_20260613_1617`。该目录为 CUDA/A100
-  路径,链接本地 CUDA 而非 MACA/cu-bridge,可复用作后续 C500 vs A100 sanitizer/行为对照。
-- A100 原始 `extend_cycle` 对照:临时恢复旧实现并在同一对照目录重编,memcheck 连跑 5 轮
-  未报错(`ERROR SUMMARY: 0 errors`)。这说明该坏环在 A100 调度下未复现;sanitizer 只能
-  捕获实际发生的内存越界,不会报告未触发的 cycle 重构逻辑竞态。
+**验证**(C500,双缓冲版):
+- `ROUTING_UNIT_TEST --gtest_filter=heterogenous_breaks.* --gtest_repeat=10`:10/10 迭代、
+  每轮 2/2,无 `Memory Violation`。
+- 回归(各单跑全绿):`vehicle_breaks` 6/6、`heterogenous` 6/6、`prize_collection` 3/3、
+  `objective_function` 2/2、`vehicle_order_match` 2/2。
+- A100 对照(`cpp/build_a100_cuda_cached_20260613_1617`,链接本地 CUDA):旧 `extend_cycle`
+  在 `compute-sanitizer --tool memcheck` 下连跑均 `ERROR SUMMARY: 0 errors`——该坏环在 A100
+  调度下不复现;memcheck 只捕获**实际发生**的越界,不报告未触发的 cycle 重构竞态(故"A100
+  sanitizer 干净"不能证明原实现正确;数据竞争应由 racecheck 而非 memcheck 检测,且其对全局
+  内存竞争亦力有不逮)。
 
 ### 4.1 调查过程记录
 

@@ -190,6 +190,7 @@ struct ExactCycleFinder {
       copy_indices(0, handle_ptr_->get_stream()),
       copy_cost(0, handle_ptr_->get_stream()),
       d_cub_storage_bytes(0, handle_ptr_->get_stream()),
+      key_scratch(max_routes, handle_ptr_->get_stream()),
       max_threads(handle_ptr_->get_device_properties().maxThreadsPerBlock),
       max_blocks(handle_ptr_->get_device_properties().maxGridSize[0]),
       depot_included(depot_included_),
@@ -225,6 +226,10 @@ struct ExactCycleFinder {
   rmm::device_uvector<std::byte> d_cub_storage_bytes;
   rmm::device_uvector<double> copy_cost;
   rmm::device_uvector<int> copy_indices;
+  // second key buffer for double-buffered cycle reconstruction: extend_cycle reads the
+  // current key and writes the advanced key here, so the parallel readers and the single
+  // writer never touch the same location within a launch (see extend_cycle)
+  rmm::device_uvector<key_t<max_routes>> key_scratch;
   i_t max_level{};
   i_t n_occupied_heads;
   size_t max_paths{};
