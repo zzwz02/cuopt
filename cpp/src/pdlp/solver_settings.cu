@@ -16,6 +16,7 @@
 
 #include <rmm/exec_policy.hpp>
 
+#include <thrust/fill.h>
 #include <thrust/gather.h>
 #include <span>
 
