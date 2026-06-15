@@ -23,16 +23,25 @@ def test_type_casting_warnings():
 
     dm = routing.DataModel(3, 2)
     with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        # Search all recorded warnings by content rather than assuming a fixed
+        # index: the underlying dataframe stack can interleave its own warnings
+        # (e.g. a numpy `find_common_type` DeprecationWarning from MetaX mcdf's
+        # cudf on C500), so the cuOpt casting warning is not always w[0]/w[1].
         dm.add_cost_matrix(cost_matrix)
-        assert "Casting cost_matrix from int64 to float32" in str(w[0].message)
+        assert any(
+            "Casting cost_matrix from int64 to float32" in str(x.message)
+            for x in w
+        )
 
         dm.set_order_time_windows(
             constraints["earliest"], constraints["latest"]
         )
 
         dm.set_order_service_times(constraints["service"])
-        assert "Casting service_times from float64 to int32" in str(
-            w[1].message
+        assert any(
+            "Casting service_times from float64 to int32" in str(x.message)
+            for x in w
         )
 
 
