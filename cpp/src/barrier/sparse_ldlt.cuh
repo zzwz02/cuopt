@@ -1379,6 +1379,26 @@ inline std::vector<i_t> ldlt_column_counts(const std::vector<std::vector<i_t>>& 
 
 }  // namespace ldlt_detail
 
+// Opt-in determinism switch. CUOPT_LDLT_DETERMINISTIC (set to anything) forces
+// the LDLT factorization onto its fully deterministic, atomic-free path
+// (sequential-per-column head, no dense tail; "deterministic by construction").
+// OFF by default so the fast atomic / dense-tail path is used normally.
+//
+// Why it exists: on wave64 (MetaX C500) the default path's FP-atomicAdd Schur
+// accumulation sums in non-deterministic order; for fill-heavy SPD systems whose
+// near-zero "cancellation-born" pivots straddle the rank-deficiency drop
+// threshold (e.g. nug08-3rd), that flips drop/floor decisions and makes the IPM
+// iteration count non-reproducible run-to-run (correct objective, variable
+// time). wave32 (NVIDIA) absorbs the jitter and is unaffected. Set this env var
+// when bitwise-reproducible factorization is required; the deterministic path is
+// currently slower (it drops the dense-tail DGEMM) -- a faster deterministic
+// accumulation is future work. See docs/dev/maca_c500_results.md. Read once.
+inline bool ldlt_deterministic_env()
+{
+  static const bool v = std::getenv("CUOPT_LDLT_DETERMINISTIC") != nullptr;
+  return v;
+}
+
 // Sparse LDL^T factorization of a symmetric matrix A (stored with both triangles,
 // i.e. a full symmetric view) without numerical pivoting.
 //
@@ -1638,7 +1658,9 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     tail_dim_   = 0;
     tail_start_ = n_;
     if (use_host_numeric_) { return; }
-    if (settings_.cudss_deterministic) { return; }  // Schur assembly uses atomics
+    if (settings_.cudss_deterministic || ldlt_deterministic_env()) {
+      return;  // Schur assembly uses atomics (non-deterministic) -- skip the dense tail
+    }
     const char* env = std::getenv("CUOPT_LDLT_TAIL");
     i_t forced      = env != nullptr ? std::atoi(env) : -1;
     if (env != nullptr && forced <= 0) { return; }
@@ -2682,7 +2704,7 @@ class sparse_cholesky_ldlt_t : public sparse_cholesky_base_t<i_t, f_t> {
     // the whole device; it is not bitwise deterministic, so the deterministic
     // mode keeps the sequential-per-column kernel. Light consecutive levels
     // are fused into single-launch bundles (deterministic by construction).
-    const bool atomic_head = !settings_.cudss_deterministic;
+    const bool atomic_head = !(settings_.cudss_deterministic || ldlt_deterministic_env());
     for (size_t seg_idx = 0; seg_idx < factor_segs_.size(); seg_idx++) {
       const level_seg_t& seg = factor_segs_[seg_idx];
       if (seg.bundled == 2) {
