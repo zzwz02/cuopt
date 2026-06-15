@@ -2241,15 +2241,21 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
   // Mask used by the two ADAT/augmented branches below to enforce z > 0.
   std::vector<i_t> nonnegative_z(lp.num_cols, 1);
 
-  // Perform a numerical factorization
+  // Perform a numerical factorization. The initial-point augmented system is
+  // built around D = -(I + E*E^T) (least-norm start), so its (1,1) block is
+  // not negative definite and the quasi-definite sign pattern of the
+  // iteration systems does not apply: keep the unsigned legacy pivot rule
+  // here. The ADAT system is SPD at the initial point as well.
   i_t status;
   if (use_augmented) {
+    data.chol->set_pivot_structure(-2, 0, 0);
     status = data.chol->factorize(data.device_augmented);
 
 #ifdef CHOLESKY_DEBUG_CHECK
     cholesky_debug_check(data, lp, use_augmented);
 #endif
   } else {
+    data.chol->set_pivot_structure(0, 0, 0);
     status = data.chol->factorize(data.device_ADAT);
   }
   if (status == CONCURRENT_HALT_RETURN) { return CONCURRENT_HALT_RETURN; }
@@ -2341,6 +2347,26 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
     data.inv_diag.pairwise_product(Fu, data.x);
   }
 
+  // Guard against an absurd least-norm start (a near-singular initial system
+  // can return ~1/eps-magnitude points): any positive point is a valid
+  // start, and a saturated one keeps the first iterations' complementarity
+  // products representable. Healthy problems sit far below the cap.
+  {
+    constexpr f_t start_cap = 1e12;
+    f_t x_max               = 0.0;
+    for (size_t i = 0; i < data.x.size(); i++) {
+      x_max = std::max(x_max, std::abs(data.x[i]));
+    }
+    if (x_max > start_cap || !std::isfinite(x_max)) {
+      const f_t shrink = std::isfinite(x_max) ? start_cap / x_max : f_t(0);
+      for (size_t i = 0; i < data.x.size(); i++) {
+        const f_t v = data.x[i] * shrink;
+        data.x[i]   = std::isfinite(v) ? v : f_t(0);
+      }
+      settings.log.debug("Initial point primal magnitude capped (max %e)\n", x_max);
+    }
+  }
+
   // w <- E'*u - E'*x
   if (data.n_upper_bounds > 0) {
     for (i_t k = 0; k < data.n_upper_bounds; k++) {
@@ -2430,6 +2456,22 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
     }
     for (i_t k = 0; k < lp.num_rows; k++) {
       data.y[k] = py[lp.num_cols + k];
+    }
+
+    {
+      constexpr f_t start_cap = 1e12;
+      f_t z_max               = 0.0;
+      for (size_t i = 0; i < data.z.size(); i++) {
+        z_max = std::max(z_max, std::abs(data.z[i]));
+      }
+      if (z_max > start_cap || !std::isfinite(z_max)) {
+        const f_t shrink = std::isfinite(z_max) ? start_cap / z_max : f_t(0);
+        for (size_t i = 0; i < data.z.size(); i++) {
+          const f_t v = data.z[i] * shrink;
+          data.z[i]   = std::isfinite(v) ? v : f_t(0);
+        }
+        settings.log.debug("Initial point dual magnitude capped (max %e)\n", z_max);
+      }
     }
 
     // v = -E'*z
@@ -2848,6 +2890,24 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       RAFT_CHECK_CUDA(stream_view_);
     }
 
+    // Extreme iterates can push z/x (or v/w) past the representable range:
+    // a non-finite barrier diagonal poisons the whole factorization (the
+    // pivot becomes -inf/NaN), where a saturated one merely pins the
+    // variable for this iteration. Clamp to a large finite value.
+    {
+      constexpr f_t diag_clamp = 1e154;  // sqrt-overflow safe
+      cub::DeviceTransform::Transform(
+        data.d_diag_.data(),
+        data.d_diag_.data(),
+        data.d_diag_.size(),
+        [] HD(f_t d) {
+          if (!isfinite(d) || d > f_t(1e154)) { return f_t(1e154); }
+          return d;
+        },
+        stream_view_.value());
+      RAFT_CHECK_CUDA(stream_view_);
+    }
+
     raft::copy(data.diag.data(), data.d_diag_.data(), data.d_diag_.size(), stream_view_);
 
     // inv_diag and h = A*inv_diag*... are only used for the ADAT solve path.
@@ -2883,6 +2943,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
         return CONCURRENT_HALT_RETURN;
       }
+      data.chol->set_pivot_structure(lp.num_cols, data.dual_perturb, data.primal_perturb);
       status = data.chol->factorize(data.device_augmented);
 
 #ifdef CHOLESKY_DEBUG_CHECK
@@ -2898,6 +2959,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         return CONCURRENT_HALT_RETURN;
       }
       // factorize
+      data.chol->set_pivot_structure(0, 0, 0);
       status = data.chol->factorize(data.device_ADAT);
     }
     data.has_factorization = true;
@@ -3001,21 +3063,39 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         settings.log.printf("|| Aug (dx, dy) - aug_rhs || %e after IR\n", solve_err);
       }
 
-      // Adaptive regularization: increase/decrease based on IR quality.
-      // Only adapt on calls where we actually (re)factorized — the affine step.
-      if (did_factorize && data.has_cones()) {
-        constexpr f_t min_perturb = 1e-8;
-        constexpr f_t max_perturb = 1e-1;
-        if (solve_err > 1e-2) {
+      // Adaptive regularization, only on calls where we actually
+      // (re)factorized — the affine step. The IR operator multiplies by the
+      // *unregularized* KKT matrix, so solve_err >= perturb * ||soln|| even
+      // for a perfect factorization of the regularized system; solve_err is
+      // therefore only a meaningful instability signal for the cone path
+      // (which historically adapted on it with perturbations at 1e-8). For
+      // the linear/QP path, adapt on the factorization's expected-sign pivot
+      // corrections instead: an inertia error means the regularization sits
+      // below the factorization's noise floor. With a clean factorization the
+      // perturbations decay back, so healthy problems stay at the 1e-8/1e-6
+      // defaults and keep their original trajectory.
+      if (did_factorize) {
+        // Decay floors = the path's baseline perturbations (see the solve
+        // loop's initial values): healthy problems never leave them.
+        const f_t dual_floor       = 1e-8;
+        const f_t primal_floor     = data.has_cones() ? 1e-8 : 1e-6;
+        constexpr f_t max_perturb  = 1e-1;
+        const i_t sign_corrections = data.chol->pivot_corrections();
+        const bool unstable = sign_corrections > 0 || (data.has_cones() && solve_err > 1e-2);
+        const bool clean    = sign_corrections == 0 && (!data.has_cones() || solve_err < 1e-4);
+        if (unstable) {
           f_t old_dp     = dual_perturb;
-          dual_perturb   = std::min(max_perturb, std::max(min_perturb, dual_perturb * 10.0));
-          primal_perturb = std::min(max_perturb, std::max(min_perturb, primal_perturb * 10.0));
-          settings.log.debug(
-            "  reg UP: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
-        } else if (solve_err < 1e-4) {
+          dual_perturb   = std::min(max_perturb, std::max(dual_floor, dual_perturb * 10.0));
+          primal_perturb = std::min(max_perturb, std::max(primal_floor, primal_perturb * 10.0));
+          settings.log.debug("  reg UP: %e -> %e (solve_err=%e, sign corrections=%d)\n",
+                             old_dp,
+                             dual_perturb,
+                             solve_err,
+                             sign_corrections);
+        } else if (clean) {
           f_t old_dp     = dual_perturb;
-          dual_perturb   = std::max(min_perturb, dual_perturb / 10.0);
-          primal_perturb = std::max(min_perturb, primal_perturb / 10.0);
+          dual_perturb   = std::max(dual_floor, dual_perturb / 10.0);
+          primal_perturb = std::max(primal_floor, primal_perturb / 10.0);
           if (old_dp != dual_perturb) {
             settings.log.debug(
               "  reg DOWN: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);

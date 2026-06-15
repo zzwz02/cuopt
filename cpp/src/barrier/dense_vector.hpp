@@ -177,6 +177,13 @@ class dense_vector_t : public std::vector<f_t, Allocator> {
 
   void ensure_positive(f_t epsilon_adjust)
   {
+    // An extreme starting solve can leave non-finite entries; any positive
+    // finite value is a valid initial point, and a non-finite one poisons
+    // the shift below and every later complementarity product.
+    const i_t n = this->size();
+    for (i_t i = 0; i < n; i++) {
+      if (!std::isfinite((*this)[i])) { (*this)[i] = epsilon_adjust; }
+    }
     const f_t mix_x = minimum();
     if (mix_x <= 0.0) {
       const f_t delta_x = -mix_x + epsilon_adjust;
@@ -189,6 +196,7 @@ class dense_vector_t : public std::vector<f_t, Allocator> {
     f_t min_x   = inf;
     const i_t n = this->size();
     for (i_t i = 0; i < n; i++) {
+      if (mask[i] && !std::isfinite((*this)[i])) { (*this)[i] = epsilon_adjust; }
       if (mask[i]) { min_x = std::min(min_x, (*this)[i]); }
     }
     if (min_x <= 0.0) {
