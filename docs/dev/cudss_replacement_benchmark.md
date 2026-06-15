@@ -1,5 +1,7 @@
 # cuDSS 替换:功能/性能基准对比
 
+> 本文为 cuDSS 替换的 LP+QP 基准快照;QP 全集 138 题逐题数据见 [qp_performance_optimization.md](qp_performance_optimization.md)。
+
 对比对象:
 
 - **ours** — 本分支(自研 level 调度 LDLᵀ,系统 CUDA 12.1 工具链构建的
@@ -9,7 +11,7 @@
 
 硬件:NVIDIA A100-PCIE-40GB,驱动 CUDA 12.9;AMD EPYC 7543(64C/128T)。
 方法:`--method 3`=Barrier(受本工作影响的路径)、`2`=Dual Simplex、
-`1`=PDLP(后两者代码未变,作健全性对照)。`--time-limit 600`(QPS 180s)。
+`1`=PDLP(后两者代码未变,作对照)。`--time-limit 600`(QPS 180s)。
 `solver_t` 为求解器自报时间(秒),`wall` 为含解析/初始化的进程总耗时。
 
 ## LP(Mittelmann/PDLP 测试集子集)
@@ -23,18 +25,18 @@
 | woodlands09 | 114k 约束,3401 层消去树 | TimeLimit(残差稳定收敛中) | Optimal 4.13s | — |
 | scpm1 | 大规模 | TimeLimit 838s | Optimal 3.71s | — |
 
-对照组(不受影响路径,验证无意外回归):
+对照组(不受影响路径,验证无回归):
 
 - Dual Simplex(m2):六个实例双方状态/目标/耗时全部一致
   (如 nug08-3rd:ours 272.1s vs baseline 265.8s,目标同为 214.000000;
-  qap15/graph40-40/woodlands09/scpm1 双方同样 600s 时限)。
+  qap15/graph40-40/woodlands09/scpm1 双方同为 600s 时限)。
 - PDLP(m1):全部 Optimal,秒级。
 
 ## QP(QP_Test + Maros-Mészáros 最小 10 题)
 
-12/12 双方均 Optimal,目标值一致(差异 ≤1e-9,且 HS268/S268/HS51 上
-ours 残差略优);耗时 ours 0.04–0.09s vs baseline 0.07–0.14s
-(小问题上 cuDSS 初始化开销占主导,ours 反而略快)。
+12/12 双方均 Optimal,目标值一致(差异 ≤1e-9,HS268/S268/HS51 上
+ours 残差略优);耗时 ours 0.04–0.09s vs baseline 0.07–0.14s——小问题上
+cuDSS 初始化开销占主导,ours 略快。
 
 | 问题 | ours | baseline | 已知最优(文献) |
 |---|---|---|---|
@@ -51,7 +53,7 @@ ours 残差略优);耗时 ours 0.04–0.09s vs baseline 0.07–0.14s
 
 ## 性能优化后复测(2026-06-11)
 
-针对「达到 cuDSS 基准 50% 性能(≤2× 耗时)」的目标,对 LDLᵀ 实施了三项优化
+为达到「cuDSS 基准 50% 性能(≤2× 耗时)」目标,对 LDLᵀ 实施三项优化
 (稠密尾块分解 + 两段式原子 head 更新 + 符号分析尾块裁剪,详见实施记录 §9):
 
 | 实例 | ours(优化后) | baseline (cuDSS) | 比值 | 相对性能 |
@@ -65,20 +67,20 @@ ours 残差略优);耗时 ours 0.04–0.09s vs baseline 0.07–0.14s
 
 全部实例 Optimal、目标值与基准一致(scpm1/qap15 逐位相同,nug08/woodlands
 在 IPM 容差内),全部 **≥50% 目标性能**;QP(QP_Test 与 Maros-Mészáros 子集)
-不受影响且保持与基准一致。优化前这些大例为 13×–100×+。
+不受影响,与基准一致。优化前这些大例为 13×–100×+。
 
 分项数据(优化后,每次分解耗时):nug08-3rd 270ms(GEMM 主导)、scpm1 27ms、
-woodlands09 91ms、qap15 41ms;符号分析:nug08-3rd 5.9s→0.27s(尾-尾模式不再
+woodlands09 91ms、qap15 41ms;符号分析 nug08-3rd 5.9s→0.27s(尾-尾模式不再
 构建,存储因子条目 1.16 亿→302 万)。
 
 ## 结论
 
-- **功能**:双方都能解出的全部实例上,目标值一致(LP 逐位、QP ≤1e-9);
-  未受影响的方法(PDLP/Dual Simplex)双方行为一致 → 无回归。
+- **功能**:双方都能解出的全部实例上目标值一致(LP 逐位、QP ≤1e-9);
+  未受影响的方法(PDLP/Dual Simplex)双方行为一致,无回归。
 - **性能**:小/中型问题与全部测试 QP 上,自研实现与 cuDSS 同量级
   (部分更快);大型稀疏 LP(因子千万级非零、数千层消去树)上,cuDSS
   的 supernodal 分解为 1–4s,自研 level 调度实现在 600s 时限内未完成
-  (差距 100×+)。这正是计划中"先正确、后性能"的取舍;主要瓶颈是
+  (差距 100×+)。此为计划中"先正确、后性能"的取舍;主要瓶颈是
   逐层 kernel launch 与列级并行粒度,优化方向见实施记录 §9。
 
 ## 领域标准基准(参考)

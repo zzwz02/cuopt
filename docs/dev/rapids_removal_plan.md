@@ -1,6 +1,8 @@
 # cuOpt 去除 RMM / RAFT / RAPIDS 依赖：可行性评估与实施计划
 
-> 本文档为可行性评估与实施计划（尚未实施）。评估方法：7 个维度并行调研
+> 状态:本计划已实施。实施结果与全栈验证见 [rapids_removal_mvp_results.md](rapids_removal_mvp_results.md);本文保留作为依赖分析与架构设计参考。
+
+> 本文档为依赖分析与实施计划。评估方法：7 个维度并行调研
 > （RMM、RAFT core、RAFT primitives、构建基础设施、Python 层、替换架构设计、
 > 仓库上下文/cuDSS 先例）+ 综合 + 交叉审查，所有承重论断经过仓库实证抽查。
 > 基线分支：`feature/remove-cudss-custom-ldlt`（cuDSS 已移除，见
@@ -8,10 +10,10 @@
 
 ## 1. 结论
 
-**可行，且风险可控。** 与 cuDSS 移除不同，这次不需要发明任何新算法——cuOpt
-对 RAPIDS 的使用是「宽而浅」的：约 6,650 个 `rmm::`/`raft::` 调用点中超过 75%
+**可行，且风险可控。** 与 cuDSS 移除不同，本工作不需发明新算法——cuOpt
+对 RAPIDS 的使用「宽而浅」：约 6,650 个 `rmm::`/`raft::` 调用点中超过 75%
 集中在 5 个符号上（`device_uvector`、`device_span`、`raft::copy`、`handle_t`、
-`nvtx::range`）。本质上这是一个 **shim + 脚本化改名问题，不是算法问题**。
+`nvtx::range`）。本质上这是 **shim + 脚本化改名问题，而非算法问题**。
 
 工作量估算：
 
@@ -52,9 +54,9 @@
    移除后是否已死，死则一并删除。
 3. **CCCL 不是 RAPIDS，留在最终态。** 它是 NVIDIA/cccl 产品，目前经
    rapids-cmake 钉在 **3.4.0**；CTK 12.x 自带 CCCL 2.x、13.x 带 ~3.0/3.1，
-   toolkit 自带版本不能直接替代——继续以平凡 FetchContent 拉 v3.4.0，并保留
+   toolkit 自带版本不能直接替代——以平凡 FetchContent 拉 v3.4.0，并保留
    nvcc<12.4 的补丁（本机 CUDA 12.1 依赖它）。`cuda::std::span/mdspan`
-   已验证存在于 CCCL 3.4.0，正好接替 `raft::device_span` 与少量 mdspan 视图。
+   已验证存在于 CCCL 3.4.0，接替 `raft::device_span` 与少量 mdspan 视图。
 4. **handle_t 实际只被抽取很小且固定的资源集**：`get_stream()`（~2,630 处）、
    `get_thrust_policy()`（474）、`sync_stream()`（249）、
    `get_cusparse_handle()`、`get_cublas_handle()`、批量 solve 中
@@ -64,7 +66,7 @@
 5. **重型算法依赖为零**（已验证）：`raft::solver::LinearAssignmentProblem`、
    `raft::distance/matrix/cluster/neighbors/stats` 在 cuOpt 源码中零使用；
    cublas 实际只用 dot/nrm2/setpointermode 3 个函数；测试中无任何 raft matcher。
-   cuOpt **已 vendoring 了逐位等价的 PCG 随机数 CPU 副本**
+   cuOpt **已 vendoring 逐位等价的 PCG 随机数 CPU 副本**
    （`cpp/src/utilities/pcgenerator.hpp`），47 处设备端 `PCGenerator` 只需加
    `__host__ __device__` 标注 + 改名。
 6. **`thrust::device_vector` 不能替代 `device_uvector`**：构造/resize 会发
@@ -98,11 +100,11 @@
   `cuopt::out_of_memory` 并清除 sticky error。
 - **难度**：hard（体量）+ moderate（语义）。**风险**：stream-ordered 生命周期
   （批量 VRP 在 cython.cu:131-135 将 buffer 从已销毁的 pool stream 重新关联到
-  调用方 stream——复刻错了就是 use-after-free）；thrust 临时分配的性能回退；
+  调用方 stream，复刻错误即 use-after-free）；thrust 临时分配的性能回退；
   OOM 语义静默漂移。
 - ⚠️ **实施前需裁定**：`rmm::exec_policy` 的同步语义基座。源码中 `par_nosync`
-  出现 0 次，RMM 维度调研告诫不要拿 `par_nosync` 做整体替换；实现 Phase 2 前
-  必须对照 rmm 源码逐字确认后再定基座。
+  出现 0 次，RMM 维度调研告诫勿以 `par_nosync` 做整体替换；实现 Phase 2 前
+  须对照 rmm 源码逐字确认后再定基座。
 
 ### 4.2 RAFT core（handle/span/copy/nvtx/宏/设备工具）
 
@@ -181,10 +183,10 @@
 ## 5. 内存资源层专项：`cuda::mr::*` / `rmm::mr::*` 可以完全消失
 
 一个容易高估的点：`cuda::mr::*`（libcu++ 的 memory-resource 概念层，
-`async_resource_ref`、`any_resource`、property 机制等）看起来「重度使用」，
-但**重度使用发生在 RMM 自身的实现里**（rmm 自迁移到 cuda::mr 概念后，其
+`async_resource_ref`、`any_resource`、property 机制等）看似「重度使用」，
+但**重度使用发生在 RMM 自身实现内**（rmm 迁移到 cuda::mr 概念后，其
 resource_ref 机制建立在 libcu++ 之上）。cuOpt 自身的真实暴露面经穷举确认
-只有以下几处：
+仅以下几处：
 
 | 位置 | 内容 |
 |---|---|
@@ -195,8 +197,8 @@ resource_ref 机制建立在 libcu++ 之上）。cuOpt 自身的真实暴露面�
 | python/cuopt_server/.../routing/solver.py:123-125 | `isinstance` 内省 resource 类型（StatisticsResourceAdaptor / PoolMemoryResource，用于内存记账） |
 
 **库代码（cpp/src、cpp/include）零显式 memory-resource 使用**——所有
-`device_uvector` 分配都走隐式的「当前设备资源」。也就是说 cuda::mr 提供的
-可组合、可插拔抽象在 cuOpt 里实际只用到一种形态：**进程启动时选一次分配器**。
+`device_uvector` 分配都走隐式的「当前设备资源」。即 cuda::mr 提供的
+可组合、可插拔抽象在 cuOpt 中只用到一种形态：**进程启动时选一次分配器**。
 
 **结论：rmm 替换完成后，整个 cuda::mr 概念层自动消失，无需任何替代品。**
 （即使保留也不构成 RAPIDS 依赖——cuda::mr 属于 CCCL——但 shim 方案下它
@@ -225,11 +227,11 @@ resource_ref 机制建立在 libcu++ 之上）。cuOpt 自身的真实暴露面�
 ## 6. 推荐路线（混合策略 + Phase-0 别名技巧）
 
 **策略**：存储/handle/span/copy/nvtx/error 层做 API 镜像 shim，计算原语做
-惯用法替换；明确不推荐全惯用法重写（估 24–48 人周、高回归风险、终态无额外
+惯用法替换；不推荐全惯用法重写（估 24–48 人周、高回归风险、终态无额外
 收益）。核心是 **Phase 0 先落「纯别名头」**——`cuopt/cuda/*.hpp` 中
 `using device_uvector = rmm::device_uvector<T>;` 等，脚本化 sed 把 ~6,650 个
 调用点改成 `cuopt::` 拼写。**构建全程保持绿色**（rmm/raft 仍在链接），巨型
-diff 语义惰性、可按生成物审查；之后逐层换实现，最后一步才真正切断依赖。
+diff 语义惰性、可按生成物审查；随后逐层换实现，末步才切断依赖。
 
 | 阶段 | 内容 | 工期 |
 |---|---|---|
@@ -240,9 +242,9 @@ diff 语义惰性、可按生成物审查；之后逐层换实现，最后一步
 | **Phase 4** | 构建系统：删 rapids-cmake/rmm/raft/rapids-logger 拉取，平凡 CMake + 手写 cuopt-config，vendored logger，rapids-cython vendoring，build-backend 切换，dependencies.yaml/conda/wheel 清理 | 3–5 周 |
 | **Phase 5** | 验证战役（见 §9） | 1–2 周 |
 
-期间用 `CUOPT_USE_RAPIDS_SHIMS=ON/OFF` CMake 开关让两套后端在 Phase 1–3 都可
+期间用 `CUOPT_USE_RAPIDS_SHIMS=ON/OFF` CMake 开关让两套后端在 Phase 1–3 均可
 构建，便于二分定位。Python/Cython 严格排在 C++ 后继类型之后；cudf routing
-迁移和 CI 脱钩作为独立后续工作流。
+迁移与 CI 脱钩作为独立后续工作流。
 
 ## 7. 工作量汇总
 

@@ -1,16 +1,16 @@
 # cuOpt 源码构建与测试指南（MetaX C500 / NVIDIA A100）
 
-> 本文说明如何在**同一台机器**上从源码构建 cuOpt 并运行 `docs/dev/maca_c500_results.md` 第 1 节功能矩阵中的全部测试。
+> 本文说明在**同一台机器**上从源码构建 cuOpt,并运行 `docs/dev/maca_c500_results.md` 第 1 节功能矩阵的全部测试。
 > - **C500**:经 MACA / cu-bridge(warp64),构建目录 `cpp/build_maca`,开关 `-DCUOPT_MACA=ON`。
 > - **A100**:标准 NVIDIA CUDA 12.9 路径,构建目录 `cpp/build_cuda`,`CUOPT_MACA` 默认 `OFF`。
 >
-> 两个构建目录互不影响,可并行构建(本机 128 核 / 503 GB,实测同时编译无压力)。本文所有命令均在本仓库实测通过;命令默认从**仓库根目录**执行。
+> 两个构建目录互不影响,可并行构建(本机 128 核 / 503 GB,同时编译无压力)。所有命令均经实测,默认从**仓库根目录**执行。
 
 ---
 
 ## 0. 环境与依赖安装
 
-cuOpt 不依赖系统 RAPIDS;C++ 核心 / C API / CLI 通过 vendored rmm/raft/rapids_logger shim 构建。下列组件在本机已就绪;如需从零搭建,按各小节安装。
+cuOpt 不依赖系统 RAPIDS;C++ 核心 / C API / CLI 经 vendored rmm/raft/rapids_logger shim 构建。下列组件本机已就绪;从零搭建时按各小节安装。
 
 ### 0.1 硬件与驱动
 
@@ -21,7 +21,7 @@ cuOpt 不依赖系统 RAPIDS;C++ 核心 / C API / CLI 通过 vendored rmm/raft/r
 
 ### 0.2 MACA / cu-bridge(C500 必需)
 
-由 MetaX 提供,安装在 `/opt/maca`(含 `tools/cu-bridge` 的 `cmake_maca`/`ninja_maca`/`pre_make`、`mxgpu_llvm/bin/mxcc`、`lib/libmc*.so`)。`source maca_env.sh` 导出 `MACA_PATH`、cu-bridge `PATH`、`MACA_DIRECT_DISPATCH=1` 等。校验:`cmake_maca --version`、`command -v mxcc`。
+MetaX 提供,安装于 `/opt/maca`(含 `tools/cu-bridge` 的 `cmake_maca`/`ninja_maca`/`pre_make`、`mxgpu_llvm/bin/mxcc`、`lib/libmc*.so`)。`source maca_env.sh` 导出 `MACA_PATH`、cu-bridge `PATH`、`MACA_DIRECT_DISPATCH=1` 等。校验:`cmake_maca --version`、`command -v mxcc`。
 
 ### 0.3 NVIDIA CUDA Toolkit(A100 必需)
 
@@ -41,13 +41,13 @@ cuOpt 不依赖系统 RAPIDS;C++ 核心 / C API / CLI 通过 vendored rmm/raft/r
 
 ### 0.5 Python 环境与依赖
 
-基础:conda(`/opt/conda`,python 3.10)。构建 RAPIDS-free 扩展只需:
+基础:conda(`/opt/conda`,python 3.10)。构建 RAPIDS-free 扩展仅需:
 
 ```bash
 /opt/conda/bin/python -m pip install cython numpy          # 本机已装(cython 3.2.5 / numpy 1.26.4)
 ```
 
-**routing/distance 的 Python 路径(C500)** 另需 MetaX 的 mcdf 栈(cudf/cupy/numba 的 MACA 实现)。一键安装(详见 §5):
+**routing/distance 的 Python 路径(C500)** 另需 MetaX mcdf 栈(cudf/cupy/numba 的 MACA 实现)。一键安装(详见 §5):
 
 ```bash
 source maca_env.sh && export PATH=/opt/conda/bin:$PATH
@@ -57,11 +57,11 @@ bash python/cuopt/setup_maca_rapids.sh /home/maca-mcdf-3.7.0.3-linux-x86_64.tar.
 # 并写入 numba->numbax 垫片
 ```
 
-> ⚠️ **`/opt/conda` 里的 `cudf` 即 mcdf(`23.02.00+b3.7.0.37`,面向 C500/MACA)。** C500 的 routing/REST 用它;**A100 的 routing/REST 用原生 NVIDIA RAPIDS cudf,装进独立 venv**(见 §5.2,避免覆盖 `/opt/conda` 的 mcdf)。numpy-only 的 LP/MILP/QP Python 路径两平台均可、无需 cudf。
+> ⚠️ **`/opt/conda` 的 `cudf` 即 mcdf(`23.02.00+b3.7.0.37`,面向 C500/MACA)。** C500 的 routing/REST 用它;**A100 的 routing/REST 用原生 NVIDIA RAPIDS cudf,装入独立 venv**(见 §5.2,避免覆盖 `/opt/conda` 的 mcdf)。numpy-only 的 LP/MILP/QP Python 路径两平台均可,无需 cudf。
 
 ### 0.6 数据集
 
-`datasets/`(`RAPIDS_DATASET_ROOT_DIR`)。如需重新获取:`bash datasets/get_test_data.sh`(从 S3,需配置 `CUOPT_S3_URI` 与 AWS 凭据)。
+`datasets/`(`RAPIDS_DATASET_ROOT_DIR`)。重新获取:`bash datasets/get_test_data.sh`(从 S3,需配置 `CUOPT_S3_URI` 与 AWS 凭据)。
 
 ---
 
@@ -97,13 +97,13 @@ ninja_maca -C cpp/build_maca -j "$(nproc)"
 **注**
 1. `CMAKE_CUDA_ARCHITECTURES=80`:cu-bridge 经 `CUCC_TARGETS=xcore1000` 映射到 C500,沿用 sm_80 入口。
 2. `FindTBB.cmake` / `find_package(Boost)` 只认 **CMake cache 变量**,不读同名环境变量;故 `TBB_*` 与 `Boost_DIR` 必须以 `-D` 传入(即便 `maca_env.sh` 已 export)。
-3. 内存紧张时可降低 `-j`(`PARALLEL_LEVEL=1 ninja_maca -C cpp/build_maca -j1` 单线程);本机内存充裕,`-j $(nproc)` 即可。
+3. 内存紧张时降低 `-j`(`PARALLEL_LEVEL=1 ninja_maca -C cpp/build_maca -j1` 单线程);本机内存充裕,`-j $(nproc)` 即可。
 
 ---
 
 ## 2. A100 构建(`cpp/build_cuda`)
 
-A100 用标准 NVIDIA 工具链。**不要 `source maca_env.sh`**(它会把 cu-bridge 注入 PATH)。
+A100 用标准 NVIDIA 工具链。**勿 `source maca_env.sh`**(它会把 cu-bridge 注入 PATH)。
 
 ```bash
 cd <repo-root>
@@ -140,13 +140,13 @@ ninja -C cpp/build_cuda -j "$(nproc)"
 1. `BZIP2_ROOT=/opt/conda`:系统无 `libbz2` 开发库,libbz2 在 conda 内。
 2. **CCCL 必须用本地源**:`get_cccl.cmake` 固定 `GIT_TAG v3.4.0`,但公网 NVIDIA/cccl 仅有 `v3.4.0-rc0/-rc1/.dev` 标签、**无 `v3.4.0` 正式标签**,网络 `FetchContent` 必然 `Failed to checkout tag: 'v3.4.0'`。须用 `-DFETCHCONTENT_SOURCE_DIR_CCCL=` 指向本地 CCCL 3.4.0 源(本仓库已备 `.toolchain/cccl-3.4.0-src`)。
 3. `TBB_*` / `Boost_DIR` 同 §1 注 2,必须 `-D`。
-4. C500 build 用的是 MACA 自带 CCCL(`get_maca_cccl.cmake`,无 fetch),不受注 2 影响。
+4. C500 build 用 MACA 自带 CCCL(`get_maca_cccl.cmake`,无 fetch),不受注 2 影响。
 
 ---
 
 ## 3. 运行 C++ 测试(功能矩阵第 1 节)
 
-测试二进制位于 `cpp/build_<maca|cuda>/tests/<组>/<NAME>`,直接运行即可(顶层 `ctest` 未联动子目录;直接调用二进制最清晰)。每个二进制是一个 gtest 套件。
+测试二进制位于 `cpp/build_<maca|cuda>/tests/<组>/<NAME>`,直接运行即可(顶层 `ctest` 未联动子目录,直接调用二进制最清晰)。每个二进制为一个 gtest 套件。
 
 **运行环境**
 
@@ -161,7 +161,7 @@ export LD_LIBRARY_PATH="$PWD/cpp/build_cuda:$TC/oneapi-tbb-2021.13.0/lib/intel64
 export PATH="$PWD/cpp/build_cuda:$PATH"           # 同上,cuopt_cli 须在 PATH
 ```
 
-> **关键**:`CLI_TEST` 必须能在 `PATH` 找到 `cuopt_cli`,否则 `wrong_parameter_type` / `partial_solution_file` 等用例失败。
+> **关键**:`CLI_TEST` 须能在 `PATH` 找到 `cuopt_cli`,否则 `wrong_parameter_type` / `partial_solution_file` 等用例失败。
 
 **第 1 节对应的二进制**(`B` = `cpp/build_maca/tests` 或 `cpp/build_cuda/tests`):
 
@@ -202,19 +202,19 @@ for t in \
 done
 ```
 
-示例(examples)以主机端校验数据后求解,直接运行:
+示例(examples)在主机端校验数据后求解,直接运行:
 
 ```bash
 "$B/examples/cvrp_daily_deliveries"   # 等
 ```
 
-> **C_API_TEST 说明**:含若干 60s 墙钟时限用例,整体较慢;其中 128 线程时限可复现性用例在 C500 上偶发 1 例不复现(两次解均可行、4/8 线程可复现),属高并行时限项、非功能回归,详见 `maca_c500_results.md` §5。
+> **C_API_TEST 说明**:含若干 60s 墙钟时限用例,整体较慢;其中 128 线程时限可复现性用例在 C500 上偶发 1 例不复现(两次解均可行,4/8 线程可复现),属高并行时限项、非功能回归,详见 `maca_c500_results.md` §5。
 
 ---
 
 ## 4. Python:RAPIDS-free LP / MILP / QP / SOCP
 
-`build_lp_modules_rapids_free.sh` 针对已构建的 `libcuopt.so` 编译 8 个 Cython 扩展(LP + routing + distance),`.so` 落在源码树。其中 **LP/MILP/QP 路径为 numpy-only、无需 RAPIDS**(两平台均可);routing/distance 模块运行时另需 mcdf(§5,仅 C500)。
+`build_lp_modules_rapids_free.sh` 针对已构建的 `libcuopt.so` 编译 8 个 Cython 扩展(LP + routing + distance),`.so` 落在源码树。其中 **LP/MILP/QP 路径为 numpy-only,无需 RAPIDS**(两平台均可);routing/distance 模块运行时另需 mcdf(§5,仅 C500)。
 
 ```bash
 # C500:经 cu-bridge 编译,使 .pyx 里的 cudaMemcpy(D2H)在编译期改写为 MACA 运行时
@@ -237,17 +237,17 @@ PYTHONPATH=python/cuopt RAPIDS_DATASET_ROOT_DIR=$PWD/datasets \
   python -m pytest python/cuopt/cuopt/tests/linear_programming -q
 ```
 
-> **注**:`.so` 生成在源码树(`python/cuopt/cuopt/...`),C500 与 A100 版本会相互覆盖;切换平台测试前需用对应平台重建这些模块。
+> **注**:`.so` 生成在源码树(`python/cuopt/cuopt/...`),C500 与 A100 版本相互覆盖;切换平台测试前须用对应平台重建这些模块。
 
 ---
 
 ## 5. Python:routing + distance
 
-routing/distance 的 Python 路径需要 cudf/rmm/cupy/numba。**C500 用 MetaX 的 mcdf 栈;A100 用原生 NVIDIA RAPIDS(装进独立 venv)。**
+routing/distance 的 Python 路径需要 cudf/rmm/cupy/numba。**C500 用 MetaX mcdf 栈;A100 用原生 NVIDIA RAPIDS(装入独立 venv)。**
 
 ### 5.1 C500(mcdf)
 
-C500 用 MetaX 的 **mcdf** 栈(cudf/cupy 的 MACA 实现)。一键安装:
+C500 用 MetaX **mcdf** 栈(cudf/cupy 的 MACA 实现)。一键安装:
 
 ```bash
 source maca_env.sh
@@ -269,7 +269,7 @@ PYTHONPATH=python/cuopt RAPIDS_DATASET_ROOT_DIR=$PWD/datasets \
 
 ### 5.2 A100(原生 RAPIDS,隔离 venv)
 
-A100 用真正的 NVIDIA RAPIDS cudf。**装进独立 venv**(不继承 `/opt/conda` 的 site-packages),以免覆盖 C500 的 mcdf:
+A100 用真正的 NVIDIA RAPIDS cudf。**装入独立 venv**(不继承 `/opt/conda` 的 site-packages),以免覆盖 C500 的 mcdf:
 
 ```bash
 # 1) 建隔离 venv(python 3.10,与 cp310 模块 ABI 一致)
@@ -282,7 +282,7 @@ $VENV/bin/pip install pyyaml scipy networkx     # cuopt 纯 Python 依赖
 $VENV/bin/pip install fastapi uvicorn msgpack    # REST 需要(§6)
 ```
 
-> cuopt 的 pyproject 钉 `cudf-cu12==26.6.*`(随 26.06、公网未发布);routing 仅用 `cudf.DataFrame/Series/concat/from_pandas` 等稳定 API,24.12 即可。该 venv 是 numpy 2.x,须在 venv 内重建模块(numpy ABI)。
+> cuopt 的 pyproject 钉 `cudf-cu12==26.6.*`(随 26.06,公网未发布);routing 仅用 `cudf.DataFrame/Series/concat/from_pandas` 等稳定 API,24.12 即可。该 venv 为 numpy 2.x,须在 venv 内重建模块(numpy ABI)。
 
 构建模块并测试(全程用 venv 的 python):
 
@@ -341,9 +341,9 @@ curl --noproxy '*' -s -H "Accept: application/msgpack" \
   http://127.0.0.1:5000/cuopt/request/$ID -o /tmp/sol.msgpack
 ```
 
-本次实测:**C500** health 200、首次提交触发内核重编译后 `solve success / 10.2s`;**A100**(venv)health 200、`solve success / 10.2s`。结果均经 msgpack 取回。
+实测:**C500** health 200,首次提交触发内核重编译后 `solve success / 10.2s`;**A100**(venv)health 200,`solve success / 10.2s`。结果均经 msgpack 取回。
 
-> solver worker 在 `process_async_solve` 中以 `SIGCHLD=SIG_DFL`(而非 `SIG_IGN`)运行,确保 C500 运行期内核重编译的 `mxcc` 子进程 `wait()` 可用;此修复已在源码中(无需手动设置)。该重编译/`SIGCHLD` 问题仅 C500;A100 server 用原生 RAPIDS 无此问题。
+> solver worker 在 `process_async_solve` 中以 `SIGCHLD=SIG_DFL`(而非 `SIG_IGN`)运行,确保 C500 运行期内核重编译的 `mxcc` 子进程 `wait()` 可用;此修复已在源码中,无需手动设置。该重编译/`SIGCHLD` 问题仅 C500;A100 server 用原生 RAPIDS 无此问题。
 
 ---
 
@@ -360,7 +360,7 @@ CLI=cpp/build_maca/cuopt_cli            # A100 改 cpp/build_cuda/cuopt_cli
 "$CLI" --method 3 --time-limit 600 datasets/benchmarks/maros_meszaros/<instance>.QPS
 ```
 
-对标方法:同一 `.mps`/`.QPS` 在两平台跑,核对**目标值一致**、barrier 迭代数相近、耗时同量级。
+对标方法:同一 `.mps`/`.QPS` 在两平台运行,核对**目标值一致**、barrier 迭代数相近、耗时同量级。
 
 **routing(`docs/dev/route_bench.py`,C500;依赖 mcdf)**:
 
@@ -408,7 +408,7 @@ PYTHONPATH=python/cuopt python docs/dev/route_bench.py <name> cvrp datasets/cvrp
 | routing+distance `pytest tests/routing` | 43 passed / 0 fail | 42 passed / 1 fail | §5 |
 | REST server(routing 端到端) | health 200;solve success / 10.2s | health 200;solve success / 10.2s | §6 |
 
-> A100 的 routing/REST 依赖 cudf:经独立 venv 装原生 NVIDIA RAPIDS(§5.2,cudf 24.12)后**两平台均实跑通过**;C500 用 mcdf。C500 routing 的 1 例失败为 numpy 告警顺序(非功能,§5);A100 的 cudf 24.12 不触发该告警,故 43/43。LP/MILP/QP 为 numpy-only,两平台均可。
+> A100 的 routing/REST 依赖 cudf:经独立 venv 装原生 NVIDIA RAPIDS(§5.2,cudf 24.12)后**两平台均通过**;C500 用 mcdf。C500 routing 的 1 例失败为 numpy 告警顺序(非功能,§5);A100 的 cudf 24.12 不触发该告警,故 43/43。LP/MILP/QP 为 numpy-only,两平台均可。
 
 ### 8.3 性能基准(代表性对标)
 
@@ -418,7 +418,7 @@ PYTHONPATH=python/cuopt python docs/dev/route_bench.py <name> cvrp datasets/cvrp
 | QBRANDY QP(barrier) | 状态 / 迭代 / 时间 | Optimal / 19 / 0.185s | Optimal / 19 / 0.384s |
 | CVRP routing(route_bench, X-n106-k14, 15s) | cost / 车数 / wall | N/A | 26492 / 14 / 15.3s |
 
-> 目标值在两平台一致、barrier 迭代相近为通过判据;耗时同量级即可(A100 更快)。完整 600s 基准见 `maca_c500_results.md` §3。
+> 通过判据:两平台目标值一致、barrier 迭代相近,耗时同量级即可(A100 更快)。完整 600s 基准见 `maca_c500_results.md` §3。
 
 ---
 

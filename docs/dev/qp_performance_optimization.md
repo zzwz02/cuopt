@@ -1,5 +1,7 @@
 # QP 全集性能优化报告（vs 官方 cuDSS 版 cuOpt）
 
+> 关联文档:cuDSS 替换实施记录见 [cudss_replacement_plan.md](cudss_replacement_plan.md),LP+QP 基准快照见 [cudss_replacement_benchmark.md](cudss_replacement_benchmark.md)。
+
 > 分支 `feature/remove-cudss-custom-ldlt`。自研 LDLᵀ（`cpp/src/barrier/sparse_ldlt.cuh`）
 > 替代 cuDSS 后的 Maros-Mészáros 全集（138 题）逐题性能对账。
 > 协议：Barrier（`--method 3`），`--time-limit 180`，A100-PCIE-40GB（锁频 1410MHz）。
@@ -20,14 +22,14 @@
 
 ### 正确性结论：本版 ≥ cuDSS
 
-- **零回归**：不存在「本版未达 Optimal 而 cuDSS 达 Optimal」的题。
-- **零错解**：130 道双方 Optimal 题，目标值全部 rel ≤ 1e-4 一致。
+- **零回归**：无「本版未达 Optimal 而 cuDSS 达 Optimal」的题。
+- **零错解**：130 道双方 Optimal 题目标值全部 rel ≤ 1e-4 一致。
 - **三处优于 cuDSS**：
-  - `DPKLO1` / `QFORPLAN`：cuDSS 官方版解析失败（ParseError），本版正确解析并求得 Optimal
+  - `DPKLO1` / `QFORPLAN`：cuDSS 官方版 ParseError，本版正确解析并求得 Optimal
     （RHS 自由格式行 token 奇偶消歧 + MPS 固定格式自动回退，`cpp/src/io/`）。
   - `STADAT1`：cuDSS Suboptimal，本版 Optimal。
 - 本版所有未达 Optimal 的题（`CVXQP1_L` Suboptimal、`PRIMAL1-4` NumError、`UBH1` Suboptimal）
-  与 cuDSS **同状态**——为两侧共有的病态题，非本版缺陷。
+  与 cuDSS **同状态**，属两侧共有的病态题，非本版缺陷。
 
 ## 优化重点（按绝对耗时差 / 倍数差）
 
@@ -42,18 +44,18 @@
 ## 已落地的优化（累计，自 cuDSS 替换基线起）
 
 1. **结构化枢轴规则**（quasi-definite 符号下限 / SPD 仅丢弃微小正枢轴、保留消去型负枢轴 / 旧式
-   兼容初始点系统）——修复 ~15 题 IPM 迭代爆炸（314→20 级），目标值与 cuDSS 一致。
-2. **对称 Jacobi 缩放**（M'=SMS，仅 quasi-definite/旧式路径）——抑制无主元 LDLᵀ 在病态系统上的
+   兼容初始点系统）：修复 ~15 题 IPM 迭代爆炸（314→20 级），目标值与 cuDSS 一致。
+2. **对称 Jacobi 缩放**（M'=SMS，仅 quasi-definite/旧式路径）：抑制无主元 LDLᵀ 在病态系统上的
    元素增长（QSHELL 4.7→1.2s）。
-3. **精确列计数（Gilbert-Ng-Peyton）驱动的密集尾块**（边际密度窗口判据）——宽网格不再把近空区域
+3. **精确列计数（Gilbert-Ng-Peyton）驱动的密集尾块**（边际密度窗口判据）：宽网格不再把近空区域
    当稠密块分解（LISWET 9487²→0；CONT-300 尾 3117→1442）。
-4. **层捆绑 + 链窗口调度**——把数千个 per-level kernel 启动合为单块内 `__syncthreads` 屏障执行
+4. **层捆绑 + 链窗口调度**：数千个 per-level kernel 启动合为单块内 `__syncthreads` 屏障执行
    （链型/带状 etree）；factor 捆绑按 scatter 二分搜索深度计权，长列不入捆绑。
-5. **带状嵌套剖分排序**（自然或 RCM 序下带宽 ≤40 时，递归二分 + 带宽分隔符替代 AMD）——
+5. **带状嵌套剖分排序**（自然或 RCM 序下带宽 ≤40 时，递归二分 + 带宽分隔符替代 AMD）：
    etree 深度 O(n)→O(bw·log n)（LISWET 9999→54 层，7.0→0.42s）。
 6. **CUDA Graph 捕获**因式分解与三角求解 kernel 序列（缩放路径静态），消除逐次 launch 延迟。
-7. **极端初始点鲁棒化**——非有限 barrier 对角线钳制、初始解幅值封顶（QGROW15 从 NumError→Optimal）。
-8. **解析器修复**——RHS 自由格式消歧 + 固定格式回退（DPKLO1/QFORPLAN）。
+7. **极端初始点鲁棒化**：非有限 barrier 对角线钳制、初始解幅值封顶（QGROW15 NumError→Optimal）。
+8. **解析器修复**：RHS 自由格式消歧 + 固定格式回退（DPKLO1/QFORPLAN）。
 
 ## 逐题对照（全 138 题）
 

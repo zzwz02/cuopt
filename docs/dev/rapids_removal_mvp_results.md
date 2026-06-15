@@ -1,9 +1,11 @@
 # cuOpt RAPIDS 依赖移除——实施结果与全栈验证报告
 
+> 本报告是 [rapids_removal_plan.md](rapids_removal_plan.md) 所述计划的实施结果。
+
 > 分支 `feature/remove-cudss-custom-ldlt`(在 cuDSS 移除/自研 LDLᵀ 之上)。
 > 目标:以自研 cuda::mr-free 同名 shim 头文件树替换 rmm / raft / rapids_logger,
 > 使 cuOpt 全栈(C++ / C API / CLI / Python / REST server / gRPC)在零 RAPIDS
-> 运行时依赖下构建、与官方 conda/wheel 版功能持平;cudf 按产品决策保留为
+> 运行时依赖下构建,功能与官方 conda/wheel 版持平;cudf 按产品决策保留为
 > routing 的可选运行时依赖(MI100 等目标平台有对应 cudf 移植)。
 > 计划文档:`docs/dev/rapids_removal_plan.md`;
 > cuDSS 阶段基准:`docs/dev/cudss_replacement_benchmark.md`。
@@ -12,8 +14,8 @@
 ## 1. 结论
 
 - **运行时依赖**:`ldd libcuopt.so` 不再含 librmm / libraft / librapids_logger
-  / libcudss;体积 ~108 MB → ~106 MB。源码层面,cuopt 全部 C++/Python/server
-  代码中 `import rmm`/pylibraft 引用为零;rmm 仅作为 cudf 自身的内部依赖存在,
+  / libcudss;体积 ~108 MB → ~106 MB。源码层面 cuopt 全部 C++/Python/server
+  代码中 `import rmm`/pylibraft 引用为零;rmm 仅作为 cudf 内部依赖存在,
   与 cuopt 代码零接触,无须修改 cudf。
 - **功能**:与 cuDSS 期 conda 版全量验证门槛逐项持平(§4):C++ ctest 本地
   137/137、conda 配置(含 gRPC)139/140;Python 全树 108/108;server 94+7 skip;
@@ -55,12 +57,12 @@
 6. rapids_logger shim 补命名级别方法(error/warn/info 等,gRPC server 直调)。
 7. 设备查询改为非抛出(无 GPU 返回 -1,镜像 rmm 的 release 语义)——修复
    CPU-only 远程执行模式(`CUDA_VISIBLE_DEVICES=""`)。
-8. server 剥 rmm 时遗留一行引用已删变量的日志导致 worker 启动即崩,删除后
+8. server 剥 rmm 时遗留一行引用已删变量的日志致 worker 启动即崩,删除后
    server 全套复测通过。
 
 ## 3. 与 conda 版 cuOpt 的全栈功能对照
 
-“conda 版”指 cuDSS 期在 `cuopt-dev` conda 环境的全功能构建/官方 26.06 wheel
+“conda 版”指 cuDSS 期 `cuopt-dev` conda 环境的全功能构建/官方 26.06 wheel
 (真 RAPIDS + cuDSS)。
 
 | 功能面 | conda 版 | RAPIDS-free 版 | 验证 |
@@ -93,7 +95,7 @@
 | Python gRPC 远程(CPU-only/TLS/mTLS)| 含于上 | **11/11** |
 
 环境注意事项:测试目录需 `datasets` 符号链接;`PYTHONPATH` 须含
-`python/libcuopt`(否则命名空间包遮蔽);gRPC/server 测试须清除大小写
+`python/libcuopt`(否则命名空间包被遮蔽);gRPC/server 测试须清除大小写
 `http(s)_proxy` 并设 `no_proxy=localhost,127.0.0.1,0.0.0.0`;conda 构建产物
 运行时须 `LD_LIBRARY_PATH=$build`(conda LDFLAGS 将 env lib 前置于 RUNPATH,
 其中装有旧版全 RAPIDS libcuopt)。
@@ -102,7 +104,7 @@
 
 方法:与 `docs/dev/cudss_replacement_benchmark.md` 同协议——Barrier
 (`--method 3`),LP `--time-limit 600`、QP 180s,solver 自报时间;同一 A100。
-三方:**本版**(RAPIDS-free shim,本次实测)、**06-11 版**(cuDSS 移除+LDLᵀ
+三方:**本版**(RAPIDS-free shim,本次实测)、**06-11 版**(cuDSS 移除 + LDLᵀ
 优化后、RAPIDS 移除前)、**cuDSS 原版**(官方 26.06 wheel,cuDSS 0.7.1)。
 
 ### 5.1 LP(Mittelmann 子集,Barrier)
@@ -116,8 +118,8 @@
 | woodlands09 | **5.42 s** | 5.25 s | 4.13 s | 1.4e-07(≈0)|
 | scpm1 | **4.20 s** | 4.04 s | 3.71 s | 414.152071 |
 
-全部 Optimal。本版 vs 06-11 版:差异 ≤0.18 s(≤4%),在运行噪声内——
-**RAPIDS 移除对求解性能无可测回退**。本版 vs cuDSS 原版:维持 06-11 结论
+全部 Optimal。本版 vs 06-11 版差异 ≤0.18 s(≤4%),在运行噪声内——
+**RAPIDS 移除对求解性能无可测回退**。本版 vs cuDSS 原版维持 06-11 结论
 (afiro/graph40-40 同级或更快;填充重的 qap15/nug08/woodlands/scpm1 为
 1.1–1.7×,全部满足 ≥50% 性能目标)。
 
@@ -153,13 +155,13 @@
 | 单题时间比(本版/cuDSS) | 中位数 **1.44×**,均值 4.49× | 1× |
 
 3 题目标差 0.10–0.36%(QCAPRI / QSIERRA / UBH1,病态 QP 的 IPM 容差级差异,
-两侧均为可行驻点);时间差距源于自研 LDLᵀ 与 cuDSS supernodal 分解在
-填充重因子上的既有差距(与 §5.1 LP 结论一致),与 RAPIDS 移除无关。
+两侧均为可行驻点);时间差距源于自研 LDLᵀ 与 cuDSS supernodal 分解在填充重
+因子上的既有差距(与 §5.1 LP 结论一致),与 RAPIDS 移除无关。
 
 ### 5.4 Routing(CVRPLIB Set-X / Solomon / Homberger,固定时间预算)
 
 同一驱动脚本、同机两套构建(**shim** = 本版 wheel;**RAPIDS 基线** = 官方
-26.06 wheel,真 rmm/raft),每组合 2 次重复,报告目标值(均为 SUCCESS、
+26.06 wheel,真 rmm/raft),每组合 2 次重复,报告目标值(均 SUCCESS、
 车辆数一致):
 
 | 实例(规模,预算) | shim(2 次) | RAPIDS 基线(2 次) | 文献 BKS |
@@ -172,13 +174,13 @@
 
 结论:固定预算下两构建解质量**统计无差**(组间差小于组内重复方差,多处
 shim 略优);时间窗类双方逐位同解,C101 双方均达已证最优。eager-reset 与
-arena 池对 routing 求解质量与速度无可测影响。
+arena 池对 routing 求解质量与速度均无可测影响。
 
 ## 6. 构建与打包
 
 - **C++(本地)**:`.toolchain` cmake 3.30.8 + 系统 gcc11/CUDA12.1。
   **构建系统已完全去 rapids-cmake**(4b):版本/架构/构建类型/静态 cudart
-  为原生 CMake;CCCL(v3.4.0)/googletest/argparse/papilo 等经标准
+  均为原生 CMake;CCCL(v3.4.0)/googletest/argparse/papilo 等经标准
   `FetchContent`(支持 `-DFETCHCONTENT_SOURCE_DIR_*` 离线源覆盖);
   `cuopt-config.cmake` 改为手写(install + build 两套,自动为消费方提供
   CCCL 目标)。配置期**不再从 RAPIDS 仓库下载任何内容**。
@@ -196,7 +198,7 @@ arena 池对 routing 求解质量与速度无可测影响。
 
 - routing reset 的捕获重放 CUDA Graph 在 shim 下仍异常(默认 eager 全绿,
   开关保留),机制待独立定位。
-- MIP 实例集(MIPLIB)与 server 吞吐基准未例行化。
-- HIP/MACA 后端移植:本工作消除了 cuda::mr/RAPIDS 障碍(运行时与构建系统
+- MIP 实例集(MIPLIB)与 server 吞吐基准尚未例行化。
+- HIP/MACA 后端移植:本工作已消除 cuda::mr/RAPIDS 障碍(运行时与构建系统
   均不再触及 RAPIDS),后续主要工作为 warp64/平台运行时适配;routing
   Python 依赖目标平台的 cudf 移植版。

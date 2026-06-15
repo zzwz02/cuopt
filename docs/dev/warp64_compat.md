@@ -1,8 +1,8 @@
 # warp64（AMD MI100/CDNA）兼容性改造
 
-> HIP 移植准备工作之一:消除代码中对 warp size = 32 的硬编码假设,使全部
-> warp 级算法以**编译期常量**参数化(NVIDIA 32 / AMD wave64 64),零运行时
-> 开销。本次改造在 CUDA 上验证零回归;wave64 行为待 HIP 工具链可用后实测。
+> HIP 移植准备:消除对 warp size = 32 的硬编码假设,使全部 warp 级算法以
+> **编译期常量**参数化(NVIDIA 32 / AMD wave64 64),零运行时开销。CUDA 上
+> 已验证零回归;wave64 行为待 HIP 工具链可用后实测。
 
 ## 1. 中央抽象(全部 constexpr)
 
@@ -19,13 +19,13 @@
 `lane_popc` / `lane_ffs` / `lane_fls`(掩码位运算,自动选 `__popc`/`__popcll`
 等 64 位变体)、`activemask()`(HIP 下为 `__ballot(1)`)、`laneId()` HIP 分支。
 cuopt 侧 `routing/utilities/constants.hpp` 的 `warp_size` 改为
-`raft::WarpSize` 别名,二者恒等。
+`raft::WarpSize` 别名。
 
 ## 2. 修复类别与位点
 
-经穷尽审计(204 个 warp 相关位点,4 类并行扫描):88 处既有 `raft::WarpSize`
-用法验证为常量翻转后即正确(含全部 blockReduce/blockRankedReduce 的
-shared 边界、`block_random_sample`、`block_inclusive_scan`);其余修复:
+穷尽审计 204 个 warp 相关位点(4 类并行扫描):88 处既有 `raft::WarpSize`
+用法在常量翻转后即正确(含全部 blockReduce/blockRankedReduce 的 shared
+边界、`block_random_sample`、`block_inclusive_scan`);其余修复如下:
 
 | 类别 | 位点 | 修复 |
 |---|---|---|
@@ -46,14 +46,14 @@ execute_insertion ×1;route.cuh 5 处原本正确,统一迁移到
 
 ## 3. 设计取舍
 
-- 一切 warp 相关量保持 `constexpr`:数组边界、循环次数、移位、掩码在两个
+- 所有 warp 相关量保持 `constexpr`:数组边界、循环次数、移位、掩码在两个
   平台均编译期折叠,无运行时分支。
-- 块尺寸桶(32/64/128/256 的 per-block 变体)中的 32 是普通块大小而非
+- 块尺寸桶(32/64/128/256 的 per-block 变体)中的 32 是普通块大小,非
   warp 语义,保留不动。
-- 本次只解决 **warp 大小**假设;CUDA 专属 API 的 HIP 映射(`__shfl_*_sync`
+- 本次仅解决 **warp 大小**假设。CUDA 专属 API 的 HIP 映射(`__shfl_*_sync`
   的 `_sync`/mask 形态、`__syncwarp`、cooperative groups)属于 HIP 移植
-  本体,届时在同一批包装点(warp_primitives/cuopt_utils 两套包装已收口)
-  做平台分支即可。
+  本体,届时在已收口的包装点(warp_primitives/cuopt_utils 两套包装)做
+  平台分支即可。
 - load_balanced presolve 的 1/2/4/…/threads-per-item 分桶方案与 warp 大小
   解耦(host 端公式已用 `raft::WarpSize`,device 端经
   `WarpSizeLog2 - seg` 自适应):wave64 下每 warp 自动承载 2× 项。
@@ -61,6 +61,6 @@ execute_insertion ×1;route.cuh 5 处原本正确,统一迁移到
 ## 4. 验证
 
 - CUDA(A100):全量重编零错误;全量 ctest **137/137**;afiro barrier
-  目标值与基线**逐位一致**(-4.64753135e+02)→ 改造零数值影响。
-- wave64 正确性经静态推演(掩码宽度、数组边界、归约树、bin 公式),
+  目标值与基线**逐位一致**(-4.64753135e+02),即改造零数值影响。
+- wave64 正确性经静态推演验证(掩码宽度、数组边界、归约树、bin 公式),
   待 MI100/HIP 工具链就绪后实测。

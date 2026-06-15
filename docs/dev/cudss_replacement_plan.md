@@ -1,6 +1,8 @@
 # cuOpt 去除 cuDSS:自研 GPU 稀疏 LDLᵀ 求解器(实施记录)
 
-> 本文档最初是实施计划,现已按实际完成的工作修订为设计与实施记录。
+> 关联文档:功能/性能基准见 [cudss_replacement_benchmark.md](cudss_replacement_benchmark.md) 与 [qp_performance_optimization.md](qp_performance_optimization.md)。
+
+> 本文档由实施计划修订为设计与实施记录。
 > 实施分支:`feature/remove-cudss-custom-ldlt`(基于 `release/26.06`)。
 
 ## 1. 背景与目标
@@ -10,12 +12,12 @@ cuDSS 闭源库做稀疏对称线性系统的直接分解与求解。目标:**�
 用自研 CUDA kernel 实现等价功能,先保证正确性,暂不追求性能。
 
 约束(实施中确认):
-1. AMD 重排序用开源实现 —— 最终方案:**链接系统 SuiteSparse 的 `libamd`**
+1. AMD 重排序用开源实现,最终方案为**链接系统 SuiteSparse 的 `libamd`**
    (apt `libsuitesparse-dev` / conda `suitesparse` / dnf `suitesparse-devel`),
    不内嵌源码、不自研。
-2. 保持 CUDA 12.1 工具链(系统 nvcc;A100 驱动 12.9 运行 12.1 产物),代码库中
-   与 12.1 不兼容之处一并修复(带版本门控,不影响新工具链)。
-3. 尽量保持 cmake 3.30 系列 —— rapids-cmake 26.06 实际要求 ≥3.30.4(而非 4.0),
+2. 保持 CUDA 12.1 工具链(系统 nvcc;A100 驱动 12.9 运行 12.1 产物),并修复代码库中
+   与 12.1 不兼容之处(带版本门控,不影响新工具链)。
+3. 尽量保持 cmake 3.30 系列;rapids-cmake 26.06 实际要求 ≥3.30.4(而非 4.0),
    仓库内 3 处 `cmake_minimum_required` 降为 3.30,本容器用工作区免安装
    cmake 3.30.8(见 §5)。
 
@@ -34,7 +36,7 @@ cuDSS 闭源库做稀疏对称线性系统的直接分解与求解。目标:**�
 - 每次 IPM 迭代 1 次 factorize(模式不变)+ 2 次 solve(predictor/corrector);
   外层有 GMRES 迭代精化(`iterative_refinement.hpp`)与自适应正则化兜底。
 - 公开参数 `cudss_deterministic`(constants.h / gRPC field 21 / REST 字段)与
-  `ordering` 为兼容保留;新实现按构造即确定。
+  `ordering` 仅为兼容保留;新实现按构造即确定。
 
 ## 3. 替代实现:`sparse_cholesky_ldlt_t`(cpp/src/barrier/sparse_ldlt.cuh)
 
@@ -46,7 +48,7 @@ cuDSS 闭源库做稀疏对称线性系统的直接分解与求解。目标:**�
    (排列只影响填充量,不影响正确性)。
 2. 消去树(Liu,路径压缩)→ 行模式(etree reach,Davis)→ L 的 CSC 模式
    (列内行索引升序)+ CSR 行视图(`rp_ptr/rp_col/rp_pos`,带值位置)。
-3. **Level 调度**:`level(j)=1+max(level(children))`;依据 L(j,k)≠0 ⟹ j 是 k
+3. **Level 调度**:`level(j)=1+max(level(children))`;由 L(j,k)≠0 ⟹ j 是 k
    的 etree 祖先,同层列互相独立。同一层数组同时服务分解与前代/回代。
 4. A→因子散射映射 `a2l_`:对称重复条目映射到同一槽位(赋值写,幂等);
    对角条目编码为负数。
@@ -54,9 +56,9 @@ cuDSS 闭源库做稀疏对称线性系统的直接分解与求解。目标:**�
 **GPU 数值分解**(逐层启动,块↔列):
 - 块内对行模式中的 k **顺序**循环(与 host 参考累加次序一致 ⇒ 确定性),
   线程并行处理 L(:,k) 条目,经列内二分查找散射到列 j;层间天然同步。
-- 主元规则:NaN/Inf(或要求 SPD 时 ≤0)→ 置失败 flag,factorize 返回 -1
-  (语义同 cuDSS info≠0);|d| < τ = 1e-14·max|diag(PAPᵀ)| → **静态选主元**
-  (替换为 ±τ 继续,PARDISO/MA57 风格,扰动由上层 GMRES 精化吸收)——
+- 主元规则:NaN/Inf(或要求 SPD 时 ≤0)置失败 flag,factorize 返回 -1
+  (语义同 cuDSS info≠0);|d| < τ = 1e-14·max|diag(PAPᵀ)| 触发**静态选主元**
+  (替换为 ±τ 继续,PARDISO/MA57 风格,扰动由上层 GMRES 精化吸收),
   处理 ADAT 秩亏(冗余/空行)等数学上真奇异的情形。
 - 层间检查 `concurrent_halt`(Concurrent 模式可中断)。
 
@@ -69,8 +71,8 @@ cuDSS 闭源库做稀疏对称线性系统的直接分解与求解。目标:**�
 
 **barrier.cu 配套修改**:
 - 实例化新类与显式模板实例化;
-- 非 SOC 的增广路径 `dual_perturb` 从 0 改为 1e-8:Q 对角缺失 + 初始障碍项为 0
-  时增广 (1,1) 块对角恰为 0,矩阵非拟正定,无选主元 LDLᵀ 必然零主元
+- 非 SOC 的增广路径 `dual_perturb` 从 0 改为 1e-8:Q 对角缺失且初始障碍项为 0
+  时,增广 (1,1) 块对角恰为 0,矩阵非拟正定,无选主元 LDLᵀ 必出零主元
   (cuDSS 靠数值选主元掩盖了这一点);自适应正则化的增长改为可从 0 起步。
 
 ## 4. 移除与打包
@@ -83,12 +85,12 @@ cuDSS 闭源库做稀疏对称线性系统的直接分解与求解。目标:**�
   auditwheel 不再排除 libcudss(改为自动捆绑 libamd);
   `python/libcuopt/pyproject.toml` 去掉 nvidia-cudss;rpath 去掉 cudss 目录。
 - 兼容:`cudss_deterministic` 参数与 gRPC/REST 字段保留(no-op,实现天然确定);
-  `ordering` 保留(0/-1/1 现均为 AMD);相关注释改写。
+  `ordering` 保留(0/-1/1 现均为 AMD);改写相关注释。
 
 ## 5. CUDA 12.1 / gcc 11 / cmake 3.30 兼容修复
 
 工作区 `.toolchain/`(不进版本库)提供:cmake 3.30.8、oneTBB 2021.13、
-Boost 1.84(b2 最小安装);bzip2 用 /opt/conda 的。构建命令:
+Boost 1.84(b2 最小安装);bzip2 用 /opt/conda 的。构建命令如下。
 
 ```bash
 export PATH=$PWD/.toolchain/cmake-3.30.8-linux-x86_64/bin:$PATH
@@ -109,8 +111,8 @@ cmake --build cpp/build -j48
 - **CCCL `[[no_unique_address]]`**:nvcc<12.4 cudafe++ ICE("internal error
   during structure layout")→ configure 时对拉取的 CCCL 打补丁。
   ⚠ 补丁必须**对所有编译器一致**禁用:`cuda::mr::any_resource` 等类型跨越
-  gcc 编译的 librmm 与 nvcc 编译的 .cu TU 的 ABI 边界,按编译器门控会导致
-  同进程两种布局 → 堆损坏(已踩坑并修复)。
+  gcc 编译的 librmm 与 nvcc 编译的 .cu TU 的 ABI 边界,按编译器门控会使
+  同进程出现两种布局 → 堆损坏(已踩坑并修复)。
 - raft `nvtx_range_stack.hpp` 的 NSDMI 被旧 cudafe++ 误解析 → configure 补丁
   改写为显式构造函数。
 - 扩展 `__device__` lambda 用于返回类型查询上下文(transform_iterator /
@@ -130,7 +132,7 @@ cmake --build cpp/build -j48
   目标被翻号(cuts.test_cuts_1 把 min -7x1-2x2 当最大化解出 -18 而非 -28)。
   `optimization_problem_t` 等同类成员均有 `{false}`,此处补齐。
 - LP-only + tests 构建(`--build-lp-only`)本身链接不过:`branch_and_bound.cpp`
-  无条件编入却引用被排除的 `fj_cpu.cu` 符号;改用完整构建绕开,未修
+  无条件编入却引用被排除的 `fj_cpu.cu` 符号;改用完整构建绕开,未修复
   (上游问题,与本工作无关)。
 
 ## 7. 实际提交序列
@@ -155,7 +157,7 @@ cmake --build cpp/build -j48
 libgrpc 未构建)**
 
 - 全量 `ctest`(无标签过滤)**137 项:136 通过**;唯一失败
-  `WAYPOINT_MATRIXTEST` 是上游测试硬编码相对路径 `datasets/...`(ctest 的
+  `WAYPOINT_MATRIXTEST` 因上游测试硬编码相对路径 `datasets/...`(ctest 的
   cwd 在构建目录)所致,与本工作无关——在测试 cwd 放置 datasets 符号链接后
   通过,即实际 **137/137**。
 - sparse_ldlt 单测 6 个:SPD;拟正定 KKT;device 路径 + 同模式重分解;
@@ -171,7 +173,7 @@ libgrpc 未构建)**
 - `python/cuopt/cuopt/tests`:**108/108 通过**(LP/MILP/QP/SOCP/routing/
   gRPC 远程执行;需 `no_proxy=localhost,127.0.0.1,0.0.0.0`——容器代理会劫持
   localhost gRPC/HTTP 连接,与代码无关)。
-- `python/cuopt_server`:**94 通过 + 7 跳过**;7 个跳过全部是上游因
+- `python/cuopt_server`:**94 通过 + 7 跳过**;7 个跳过均为上游因
   NVIDIA/cuopt#519 主动禁用的 `test_barrier_solver_options`——临时去掉
   skip 实跑 **7/7 通过**(新实现下该上游问题不复现)。
 - `python/cuopt_self_hosted`:**3/3 通过**(需先启动 cuopt_server)。
@@ -182,12 +184,12 @@ libgrpc 未构建)**
 详见 `docs/dev/cudss_replacement_benchmark.md`。摘要:双方都解出的实例
 目标值一致(LP 逐位、QP ≤1e-9;afiro 双方同为 12 次迭代);QP 12/12 双方
 最优且 ours 略快;大型稀疏 LP 上 cuDSS 1–4s vs ours 600s 时限
-(性能取舍,见 §9)。Dual Simplex/PDLP 双方行为一致(无意外回归)。
+(性能取舍,见 §9)。Dual Simplex/PDLP 双方行为一致,无意外回归。
 
 ## 9. 性能优化(2026-06-11,达成 cuDSS 50% 性能目标)
 
 初版 level 调度实现与 cuDSS 差 13×–100×+(woodlands09 约 78s/迭代)。
-nsys 剖析驱动的三项优化后,LP 基准集全部进入 cuDSS 的 2× 以内
+经 nsys 剖析驱动的三项优化后,LP 基准集全部进入 cuDSS 的 2× 以内
 (0.77×–1.67×,见 benchmark 文档):
 
 1. **稠密尾块**:AMD 排序因子的消去树顶部退化为数千列的顺序链
@@ -212,7 +214,7 @@ kernel(无尾块),语义与 cuDSS 一致(确定性换性能)。
 
 剩余限制:
 - 无数值选主元:依赖拟正定性 + 静态选主元 + 调用方自适应正则化与 GMRES 精化;
-  极端病态问题可能比 cuDSS 早进入 suboptimal 终止。
+  极端病态问题可能比 cuDSS 更早进入 suboptimal 终止。
 - 进一步优化方向:头部 supernodal 化、求解阶段批量 RHS、CUDA Graph 化
   launch 序列。
 - gRPC 组件在系统 CUDA 12.1 构建中跳过(容器系统层无 libgrpc/protobuf);
