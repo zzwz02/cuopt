@@ -19,7 +19,7 @@
 | cuopt_cli | ✅ | ✅ | CLI_TEST 7 / 0（需 `cuopt_cli` 在 PATH） |
 | routing C++ | ✅ | ✅ | ROUTING_UNIT_TEST 57 / 0；修复 span<bool>、自旋锁、cycle-finder（§2.1） |
 | 距离引擎 | ✅ | ✅ | WAYPOINT_MATRIXTEST 6 / 0 |
-| examples（cvrp/pdptw/service） | ✅ | ✅ | service/pdptw 修过时示例数据;cvrp 私有内存降级（§2.2、§5） |
+| examples（cvrp/pdptw/service） | ✅ | ✅ | 三例均 SUCCESS;service/pdptw 修过时示例数据;cvrp 修上游 main() 退出码逻辑反置（§2.2） |
 | Python LP/MILP/QP/SOCP | ✅ | ✅ | `tests/linear_programming` 51 passed / 9 skip / 0 fail（§2.3） |
 | Python routing + distance | ✅ | ✅ | `tests/routing` 42 passed（含 distance 8/8）;修复 cross-move 自旋锁（§2.4） |
 | REST server / self-hosted | ✅ | ✅ | LP + routing via REST 端到端通过;一行修 SIGCHLD（§2.6） |
@@ -43,7 +43,11 @@
 
 ### 2.2 examples（cvrp / pdptw / service）
 
-三例均编译通过。service_team_routing、pdptw_mixed_fleet 的失败为**过时示例数据**(主机端校验,A100 现版同样失败):前者 `break_locations` 非唯一,后者混合车队未按车型注册 cost matrix;均已修。cvrp_daily_deliveries 求解 SUCCESS,但某 local-search 内核请求 20 KB/thread 私有内存 > C500 上限 16 KB（`pri_mem_sz`,只读)→ 该内核降级、进程退出码 1。属 C500 私有内存硬限（见 §5)。
+三例均编译通过、三个场景全部求解 SUCCESS。service_team_routing、pdptw_mixed_fleet 的失败为**过时示例数据**(主机端校验,A100 现版同样失败):前者 `break_locations` 非唯一,后者混合车队未按车型注册 cost matrix;均已修。
+
+cvrp_daily_deliveries 此前的"退出码 1"曾被误判为私有内存降级,实为**上游 `main()` 退出码逻辑反置**(初始 OSS 提交 b833f7a1 即有):该例写成 `if (status) { exit_code = 1; }`(status 为 true 即 Success),三场景全成功反而返回 1;同目录 pdptw/service 两例都是正确的 `if (!status)`。此 bug 在 A100 上同样返回 1。**已修**为 `if (!status)`,现退出码 0。
+
+关于私有内存:在系统侧将 `pri_mem_sz` 由只读 16 KB 提高到 24 KB(`sudo modprobe metax pri_mem_sz=24`)后,某 local-search 内核曾需 20 KB/thread 的请求不再触发降级——MXLOG 无 private/spill/降级告警、`trapInfo.*` 无新 trap、三场景均 SUCCESS。即 C500 私有内存硬限可由内核参数放宽,而非代码所致的退出码问题。
 
 ### 2.3 Python LP/MILP/QP/SOCP（RAPIDS-free）:全绿
 
@@ -143,7 +147,7 @@ LP via REST 端到端通过（afiro Optimal / -464.7531 / X01=80）。routing vi
 
 | 项 | 说明 |
 |---|---|
-| cvrp 私有内存 | 某 local-search 内核请求 20 KB/thread > C500 上限 16 KB,降级求解(仍 SUCCESS,退出码 1)。需系统侧 `pri_mem_sz≥20`（root,重置 GPU）或削减内核 local 内存。 |
+| ~~cvrp 私有内存~~（已解决） | 此前判为私有内存降级,实为上游 `main()` 退出码逻辑反置(已修,见 §2.2)。私有内存侧:`sudo modprobe metax pri_mem_sz=24`(>20 KB)后某 local-search 内核 20 KB/thread 请求不再降级,无告警、无新 trap、三场景 SUCCESS、退出码 0。 |
 | C_API 128 线程可复现性 | `deterministic_reproducibility/1`（gen-ip054,128 线程,受 60 s wall-clock 约束）在 C500 高并发下计时抖动致截断落在不同 node 数,两次均为**合法可行解**但目标值不同（6922 vs 6910）;4/8 线程可复现。非功能/正确性回归。 |
 | routing 解质量 | 固定预算下较 A100 高 +1.8~15%（§3.3），随 C500 单迭代变慢。可用更长预算,或给 1024-thread 核加 `__launch_bounds__` / 降 launch ≤512 以消除运行期重编译开销来对齐。 |
 | scpm1 LP | 14× 慢离群（§3.1),仍 Optimal。 |

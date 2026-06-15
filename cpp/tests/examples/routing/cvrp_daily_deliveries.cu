@@ -189,7 +189,7 @@ int main()
     int status = example_functions[i]();
     std::cout << "Example: " << example_names[i]
               << " - Status: " << (status ? "Success" : "Failure") << std::endl;
-    if (status) { exit_code = 1; }
+    if (!status) { exit_code = 1; }
   }
 
   return exit_code;
