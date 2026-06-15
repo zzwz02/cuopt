@@ -17,6 +17,7 @@
 
 #include <raft/core/device_setter.hpp>
 #include <raft/core/handle.hpp>
+#include <raft/core/nvtx.hpp>
 
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
@@ -138,7 +139,10 @@ int run_single_file(const std::string& file_path,
       std::make_unique<cuopt::linear_programming::cpu_optimization_problem_t<int, double>>();
   }
 
-  cuopt::linear_programming::populate_from_mps_data_model(problem_interface.get(), mps_data_model);
+  {
+    raft::common::nvtx::range h2d_scope("H2D: upload problem to device");
+    cuopt::linear_programming::populate_from_mps_data_model(problem_interface.get(), mps_data_model);
+  }
 
   const bool is_mip = (problem_interface->get_problem_category() ==
                          cuopt::linear_programming::problem_category_t::MIP ||
@@ -215,7 +219,11 @@ std::string param_name_to_arg_name(const std::string& input)
 int set_cuda_module_loading(int argc, char* argv[])
 {
   // Parse method_int from argv
-  int method_int = 0;  // Default value
+  int method_int   = 0;  // Default value
+  bool force_eager = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--eager-module-loading") { force_eager = true; }
+  }
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if ((arg == "--method" || arg == "-m") && i + 1 < argc) {
@@ -240,7 +248,7 @@ int set_cuda_module_loading(int argc, char* argv[])
   }
 
   char* env_val = getenv("CUDA_MODULE_LOADING");
-  if (method_int == 0 && (!env_val || env_val[0] == '\0')) {
+  if ((method_int == 0 || force_eager) && (!env_val || env_val[0] == '\0')) {
     CUOPT_LOG_INFO("Setting CUDA_MODULE_LOADING to EAGER");
     putenv(cuda_module_loading_env);
   }
@@ -296,6 +304,13 @@ int main(int argc, char* argv[])
 
   program.add_argument("--relaxation")
     .help("solve the LP relaxation of the MIP")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--eager-module-loading")
+    .help(
+      "force CUDA_MODULE_LOADING=EAGER for any --method (handled before CUDA init); "
+      "avoids 'Runtime Triggered Module Loading' entries when profiling")
     .default_value(false)
     .implicit_value(true);
 

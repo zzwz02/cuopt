@@ -4257,6 +4257,8 @@ lp_status_t barrier_solver_t<i_t, f_t>::check_for_suboptimal_solution(
     settings.log.printf("\n");
     settings.log.printf(
       "Suboptimal solution found in %d iterations and %.2f seconds\n", iter, toc(start_time));
+    settings.log.printf("Barrier iterations total time: %.3fs\n",
+                        toc(start_time) - barrier_iter_loop_start_);
     settings.log.printf("Objective %+.8e\n", compute_user_objective(lp, primal_objective));
     settings.log.printf("Primal infeasibility (abs/rel): %8.2e/%8.2e\n",
                         primal_residual_norm,
@@ -4296,6 +4298,8 @@ lp_status_t barrier_solver_t<i_t, f_t>::check_for_suboptimal_solution(
     settings.log.printf("\n");
     settings.log.printf(
       "Suboptimal solution found in %d iterations and %.2f seconds\n", iter, toc(start_time));
+    settings.log.printf("Barrier iterations total time: %.3fs\n",
+                        toc(start_time) - barrier_iter_loop_start_);
     settings.log.printf("Objective %+.8e\n", compute_user_objective(lp, primal_objective_save));
     settings.log.printf("Primal infeasibility (abs/rel): %8.2e/%8.2e\n",
                         data.primal_residual_norm_save,
@@ -4503,6 +4507,10 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time, lp_solution_t<i_t,
     f_t dual_perturb   = data.use_augmented ? 1e-8 : 0;
     f_t primal_perturb = data.has_cones() ? 1e-8 : 1e-6;
 
+    // Wall time at iteration-loop entry; the "Barrier: iteration" ranges are
+    // contiguous, so (now - this) is the sum of all barrier iterations. Stored as
+    // a member so check_for_suboptimal_solution() can report it too.
+    barrier_iter_loop_start_ = toc(start_time);
     while (iter < iteration_limit) {
       raft::common::nvtx::range fun_scope("Barrier: iteration");
 
@@ -4700,6 +4708,8 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time, lp_solution_t<i_t,
         settings.log.printf("\n");
         settings.log.printf(
           "Optimal solution found in %d iterations and %.3fs\n", iter, toc(start_time));
+        settings.log.printf("Barrier iterations total time: %.3fs\n",
+                            toc(start_time) - barrier_iter_loop_start_);
         settings.log.printf("Objective %+.8e\n", compute_user_objective(lp, primal_objective));
         settings.log.printf("Primal infeasibility (abs/rel): %8.2e/%8.2e\n",
                             primal_residual_norm,

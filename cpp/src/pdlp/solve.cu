@@ -823,6 +823,9 @@ optimization_problem_solution_t<i_t, f_t> run_pdlp(detail::problem_t<i_t, f_t>& 
                                sol.get_objective_value(),
                                sol.get_additional_termination_information().number_of_steps_taken,
                                sol.get_solve_time());
+    CUOPT_LOG_CONDITIONAL_INFO(!settings.inside_mip,
+                               "PDLP solve phase time (excl. presolve/build): %.3fs",
+                               pdlp_solve_time);
   }
 
   if constexpr (std::is_same_v<f_t, double>) {
@@ -1898,6 +1901,14 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
 
     raft::common::nvtx::range fun_scope("Running solver");
 
+    // Back-to-back phase markers for profiling (no-op unless CUOPT_ENABLE_NVTX).
+    // One reused range: emplace at a phase start, reset at its end -> sibling ranges
+    // that lay out contiguously on the timeline (check -> build -> presolve ->
+    // PDLP solve -> postsolve). Sum of build+presolve+PDLP solve ~= reported
+    // solve_time (lp_timer); PDLP solve alone is the pure-solver window.
+    std::optional<raft::common::nvtx::range<>> phase;
+
+    phase.emplace("LP phase: problem check");
     if (problem_checking) {
       raft::common::nvtx::range fun_scope("Check problem representation");
       // This is required as user might forget to set some fields
@@ -1925,9 +1936,12 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
                                                        op_problem.get_handle_ptr()->get_stream());
     }
     validate_new_bounds(op_problem, settings);
+    phase.reset();  // end: problem check
 
     auto lp_timer = cuopt::timer_t(settings.time_limit);
+    phase.emplace("LP phase: problem build");
     detail::problem_t<i_t, f_t> problem(op_problem);
+    phase.reset();  // end: problem build (initial)
     // handle default presolve
     if (settings.presolver == presolver_t::Default) {
       constexpr i_t presolve_nnz_threshold = 8000;
@@ -1956,6 +1970,7 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
     // referenced by problem.original_problem_ptr) remains alive through the solve.
     std::optional<detail::third_party_presolve_result_t<i_t, f_t>> result;
 
+    phase.emplace("LP phase: presolve");
     if (run_presolve) {
       detail::sort_csr(op_problem);
       // allocate no more than 10% of the time limit to presolve.
@@ -2042,6 +2057,7 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
                      settings.presolver == presolver_t::PSLP ? "PSLP" : "Papilo",
                      presolve_time);
     }
+    phase.reset();  // end: presolve
 
     if (!settings_const.inside_mip) {
       CUOPT_LOG_INFO("Objective offset %f scaling_factor %f",
@@ -2061,8 +2077,11 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
     // Set the hyper-parameters based on the solver_settings
     if (use_pdlp_solver_mode) { set_pdlp_solver_mode(settings); }
 
+    phase.emplace("LP phase: PDLP solve");
     auto solution = solve_lp_with_method(problem, settings, lp_timer, is_batch_mode);
+    phase.reset();  // end: PDLP solve (~= reported solve_time minus presolve+build)
 
+    phase.emplace("LP phase: postsolve");
     if (run_presolve) {
       auto primal_solution = cuopt::device_copy(solution.get_primal_solution(),
                                                 op_problem.get_handle_ptr()->get_stream());
@@ -2097,8 +2116,10 @@ optimization_problem_solution_t<i_t, f_t> solve_lp(
                                                   std::move(term_vec),
                                                   std::move(status_vec));
     }
+    phase.reset();  // end: postsolve
 
     if (settings.sol_file != "") {
+      raft::common::nvtx::range d2h_scope("D2H: solution to host + write .sol");
       CUOPT_LOG_INFO("Writing solution to file %s", settings.sol_file.c_str());
       solution.write_to_sol_file(settings.sol_file, op_problem.get_handle_ptr()->get_stream());
     }

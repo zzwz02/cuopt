@@ -127,6 +127,9 @@ class barrier_solver_t {
   const simplex_solver_settings_t<i_t, f_t>& settings;
   const presolve_info_t<i_t, f_t>& presolve_info;
   rmm::cuda_stream_view stream_view_;
+  // Wall time (toc) at iteration-loop entry, so summaries can report the sum of
+  // all barrier iterations = toc(start_time) - this.
+  f_t barrier_iter_loop_start_ = 0;
 };
 
 }  // namespace cuopt::linear_programming::dual_simplex
