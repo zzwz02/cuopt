@@ -1,0 +1,4 @@
+# Nsight Systems capture artifacts (large, regenerate via run_profiles.sh)
+*.nsys-rep
+*.sqlite
+*.sol
